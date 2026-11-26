@@ -1098,6 +1098,16 @@ pub trait Kernel: Send + KernelType {
         Ok(())
     }
 
+    /// Bind mutable execution state scoped to this node in this executor.
+    /// The callback retains the initial state across shape specialization and
+    /// eviction; kernels without per-node state must not call it.
+    fn bind_node_run_state(
+        &mut self,
+        _bind: &mut dyn FnMut(Arc<dyn Any + Send + Sync>) -> Arc<dyn Any + Send + Sync>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Share immutable preparation across shape-specialized variants of the
     /// same session node. The executor's kernel cache is node-scoped, so this
     /// state never crosses sessions or graph nodes.

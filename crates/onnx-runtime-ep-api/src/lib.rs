@@ -45,6 +45,7 @@ pub mod kernel;
 pub mod mean_variance_normalization;
 pub mod packed_routed;
 pub mod provider;
+pub mod random;
 pub mod registry;
 pub mod rnn;
 pub mod standard_activation;

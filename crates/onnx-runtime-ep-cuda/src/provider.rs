@@ -4337,6 +4337,19 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
+            onnx_runtime_ep_api::random::unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if onnx_runtime_ep_api::random::is_native_only(&op.op_type, &op.domain)
+            && input_dtypes.first() == Some(&DataType::String)
+        {
+            deny!(
+                "{}: managed string tensors have no CUDA representation; use a native CPU session or supply a numeric tensor with the same shape",
+                op.op_type
+            );
+        }
+        if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);

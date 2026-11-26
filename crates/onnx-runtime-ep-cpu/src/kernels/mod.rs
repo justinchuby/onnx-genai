@@ -670,6 +670,7 @@ pub mod gelu;
 pub mod gemm;
 pub mod group_query_attention;
 mod half_gemm;
+mod random;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
@@ -884,6 +885,10 @@ pub const PHASE1_OPS: &[&str] = &[
     "Unique",
     "Pad",
     "ConstantOfShape",
+    "RandomNormal",
+    "RandomNormalLike",
+    "RandomUniform",
+    "RandomUniformLike",
     "Size",
     "Trilu",
     "GatherElements",
@@ -1756,6 +1761,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(constant_of_shape::ConstantOfShapeFactory),
     );
+    for op in onnx_runtime_ep_api::random::OPS {
+        for version in onnx_runtime_ep_api::random::VERSIONS {
+            rec.register(
+                OpKey::new(op, "", version),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(random::RandomFactory(version)),
+            );
+        }
+    }
     rec.register(
         OpKey::new("Constant", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3726,10 +3740,11 @@ mod tests {
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
         // Opset-29 LinearAttention adds one standalone registration.
         // RNN has separate opset-14-through-21 and opset-22 registrations.
+        // The four random generators each have a second (opset-22) revision.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 132
+                + 136
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
