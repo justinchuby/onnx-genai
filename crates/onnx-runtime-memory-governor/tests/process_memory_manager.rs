@@ -2303,3 +2303,241 @@ fn external_capacity_honors_delegation_and_checks_arithmetic_before_grant() {
     assert_eq!(wide.manager.process_used(Tier::Host), 1);
     drop(first);
 }
+
+#[derive(Debug)]
+struct ExternalAdmissionPause {
+    manager: ProcessMemoryManager,
+    authority: RegisteredMemoryAuthority,
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    resume: Arc<Barrier>,
+}
+impl onnx_runtime_memory_governor::PressureResponder for ExternalAdmissionPause {
+    fn on_pressure(&self, tier: Tier, _want: u64) -> Result<u64, MemoryError> {
+        assert_eq!(tier, Tier::Host);
+        // Positive reentrancy control: admission must hold neither registration
+        // nor state locks while it asks the actual governor to reclaim bytes.
+        let temporary = self
+            .manager
+            .register_holder(&self.authority, "reentrant pressure owner", None)
+            .expect("registration callback must be reentrant");
+        self.manager
+            .unregister_holder(&temporary)
+            .expect("closing callback must be reentrant");
+        self.manager
+            .snapshot()
+            .expect("snapshot callback must be reentrant");
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        self.resume.wait();
+        // The controlling thread released a real eight-byte ledger lease.
+        Ok(8)
+    }
+}
+
+#[test]
+fn external_capacity_close_wins_during_reentrant_pressure_and_refunds_before_retry() {
+    for registration in ["holder", "authority"] {
+        let manager = ProcessMemoryManager::with_limits(ProcessMemoryLimits {
+            host_bytes: 64,
+            ..ProcessMemoryLimits::UNLIMITED
+        })
+        .unwrap();
+        let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            8,
+            0,
+        )));
+        let authority = manager
+            .register_authority(
+                DeviceKey::HOST,
+                "external close race",
+                Arc::new(Pin),
+                books.clone(),
+            )
+            .unwrap();
+        let blocker = books
+            .reserve(Tier::Host, 8, MemoryRole::Weights, HolderId::new(991))
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let resume = Arc::new(Barrier::new(2));
+        let callback = Arc::new(ExternalAdmissionPause {
+            manager: manager.clone(),
+            authority: authority.clone(),
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Arc::clone(&resume),
+        });
+        let holder = manager
+            .register_holder(&authority, "external admitting owner", Some(callback))
+            .unwrap();
+        let task = {
+            let manager = manager.clone();
+            let authority = authority.clone();
+            let holder = holder.clone();
+            thread::spawn(move || {
+                manager.reserve_external_capacity(
+                    &authority,
+                    &holder,
+                    Tier::Host,
+                    MemoryRole::Weights,
+                    1,
+                )
+            })
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("real pressure callback must enter without registration/state locks");
+        assert_eq!(
+            manager.process_used(Tier::Host),
+            1,
+            "process grant is provisional while authority admission pauses"
+        );
+        if registration == "holder" {
+            manager
+                .unregister_holder(&holder)
+                .expect("close wins before publication");
+        } else {
+            manager
+                .remove_authority(&authority)
+                .expect("close wins before publication");
+        }
+        drop(blocker);
+        resume.wait();
+        let error = task
+            .join()
+            .unwrap()
+            .expect_err("closed registrations must prevent owner publication");
+        assert!(
+            matches!(error,AllocationTransactionError::ExternalRegistrationClosed {registration:closed,..} if closed==registration),
+            "{error}"
+        );
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+        assert!(manager.snapshot().unwrap().external_capacities.is_empty());
+        // Retry on the same real books/process policy with fresh registrations.
+        if registration == "authority" {
+            manager.unregister_holder(&holder).unwrap();
+        }
+        let authority = if registration == "authority" {
+            manager
+                .register_authority(
+                    DeviceKey::HOST,
+                    "retry external authority",
+                    Arc::new(Pin),
+                    books.clone(),
+                )
+                .unwrap()
+        } else {
+            authority
+        };
+        let retry_holder = manager
+            .register_holder(&authority, "retry external owner", None)
+            .unwrap();
+        let retry = manager
+            .reserve_external_capacity(
+                &authority,
+                &retry_holder,
+                Tier::Host,
+                MemoryRole::Weights,
+                1,
+            )
+            .unwrap();
+        assert_eq!(books.used(Tier::Host), 1);
+        assert_eq!(manager.process_used(Tier::Host), 1);
+        drop(retry);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+    }
+}
+
+#[test]
+fn external_capacity_publication_wins_and_blocks_registration_close_until_owner_drop() {
+    let manager = ProcessMemoryManager::new().unwrap();
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        DeviceKey::HOST,
+        0,
+        8,
+        0,
+    )));
+    let authority = manager
+        .register_authority(
+            DeviceKey::HOST,
+            "published external authority",
+            Arc::new(Pin),
+            books.clone(),
+        )
+        .unwrap();
+    let holder = manager
+        .register_holder(&authority, "published external owner", None)
+        .unwrap();
+    let owner = manager
+        .reserve_external_capacity(&authority, &holder, Tier::Host, MemoryRole::Weights, 8)
+        .unwrap();
+    assert!(matches!(
+        manager.unregister_holder(&holder),
+        Err(AllocationTransactionError::HolderInUse(_))
+    ));
+    assert!(matches!(
+        manager.remove_authority(&authority),
+        Err(AllocationTransactionError::Binding(_))
+    ));
+    assert_eq!(books.used(Tier::Host), 8);
+    assert_eq!(manager.process_used(Tier::Host), 8);
+    assert_eq!(manager.snapshot().unwrap().external_capacities.len(), 1);
+    drop(owner);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+    manager.unregister_holder(&holder).unwrap();
+    manager.remove_authority(&authority).unwrap();
+}
+
+#[test]
+fn external_capacity_quota_refusal_preserves_concrete_memory_error_source() {
+    use std::error::Error;
+    let fixture = Fixture::new(
+        DeviceKey::HOST,
+        8,
+        ProcessMemoryLimits {
+            host_bytes: 0,
+            ..ProcessMemoryLimits::UNLIMITED
+        },
+    );
+    let error = fixture
+        .manager
+        .reserve_external_capacity(
+            &fixture.authority,
+            &fixture.holder,
+            Tier::Host,
+            MemoryRole::Weights,
+            1,
+        )
+        .expect_err("real process quota must refuse");
+    let cause = error
+        .source()
+        .expect("transaction error must retain its typed capacity cause");
+    assert!(
+        matches!(
+            cause.downcast_ref::<MemoryError>(),
+            Some(MemoryError::TierExhausted {
+                tier: "host",
+                requested: 1,
+                limit: 0,
+                ..
+            })
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("memory capacity admission failed"),
+        "{message}"
+    );
+    assert!(message.contains("raise the host limit"), "{message}");
+    assert_eq!(fixture.manager.process_used(Tier::Host), 0);
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+}

@@ -611,10 +611,41 @@ impl ProcessMemoryManager {
             bytes,
             process_reserved_bytes: request.process_reserve_bytes,
         };
-        self.inner
-            .lock_state()
-            .external_capacities
-            .insert(id, record);
+        // Pressure/admission callbacks above run without registration/state
+        // locks. Closing a registration may win there; no backing has been
+        // acquired yet because this API has not returned its owner.
+        let registration = self
+            .inner
+            .registration_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let published = {
+            let mut state = self.inner.lock_state();
+            let closed = if !state
+                .authority_views
+                .contains_key(&authority.binding_identity())
+            {
+                Some("authority")
+            } else if !state.holders.contains_key(&holder.id()) {
+                Some("holder")
+            } else {
+                None
+            };
+            if let Some(registration) = closed {
+                Err(AllocationTransactionError::ExternalRegistrationClosed {
+                    authority: authority.identity(),
+                    holder: holder.id(),
+                    registration,
+                })
+            } else {
+                state.external_capacities.insert(id, record);
+                Ok(())
+            }
+        };
+        // A rejected publication refunds both local grants after every lock
+        // is released, including for reentrant governor settlement callbacks.
+        drop(registration);
+        published?;
         Ok(ExternalCapacityReservation {
             id,
             bytes,
@@ -1164,6 +1195,11 @@ impl ProcessMemoryManager {
         holder: &RegisteredMemoryHolder,
     ) -> Result<(), AllocationTransactionError> {
         self.ensure_manager(holder.manager, "holder")?;
+        let _registration = self
+            .inner
+            .registration_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self
             .inner
             .book
@@ -2475,6 +2511,14 @@ pub enum AllocationTransactionError {
     },
     #[error("{0} still owns a manager-published allocation")]
     HolderInUse(HolderId),
+    #[error(
+        "cannot publish external capacity for authority {authority:?}, holder {holder}: {registration} registration closed during admission; keep registrations live through payload acquisition or register again and retry"
+    )]
+    ExternalRegistrationClosed {
+        authority: ProcessAuthorityId,
+        holder: HolderId,
+        registration: &'static str,
+    },
     #[error("authority is registered for {actual:?}, not {expected:?}")]
     AuthorityDeviceMismatch {
         expected: DeviceKey,
@@ -2570,7 +2614,7 @@ pub enum AllocationTransactionError {
     },
     #[error(transparent)]
     Binding(#[from] BindingError),
-    #[error(transparent)]
+    #[error("memory capacity admission failed: {0}")]
     Memory(#[from] MemoryError),
 }
 
