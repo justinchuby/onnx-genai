@@ -150,8 +150,31 @@ an explicit client cancellation uses `status: cancelled`. Both preserve the
 connection for later turns. An unfinished tool envelope at either intentional
 stop is not admitted as a completed tool call. Complete calls still pass name
 and parameter validation, and a natural model stop must satisfy required-tool
-postconditions. Raw partial function-call fragments are not yet projected onto
-wire call items; completed batches retain atomic admission.
+postconditions. Function names and viable argument prefixes now produce
+`response.output_item.added` and `response.function_call_arguments.delta` while
+the native response is still active. Raw argument spelling is retained: joining
+the deltas gives the exact `arguments` in the completed item and
+`response.function_call_arguments.done`, including escapes and object-key order.
+
+The entire quantum's prefixes pass declared-name and schema-prefix admission
+before any of its provisional items are emitted. The independent generation
+boundary still validates the whole complete batch before argument-done events
+or harness-result admission. A token-limited unfinished item has `status:
+incomplete`; cancellation uses `cancelled`. Neither emits argument-done nor
+accepts a `function_call_output` for that unfinished call.
+
+Known model call IDs are preserved. If a name appears before its optional model
+ID, the transport assigns an opaque stable wire ID; a late model ID cannot
+rename an item already sent to the client. External results use that wire ID,
+while the model-authored `tool_result` prompt receives the original complete
+model call ID. These mappings expire with the same pending-call ownership as
+ordinary calls.
+
+Tagged JSON streams object prefixes after their function name is known. The
+`parameters` alias is held until a later higher-priority `arguments` field can
+be ruled out. Atem XML streams completed parameters before the invoke closes;
+an open parameter is held because its eventual JSON-or-text type is not yet
+known. Neither projection guesses a scalar type or emits a reformatted suffix.
 
 `response.cancel` is idempotent: without an active response it emits no error
 or acknowledgement, including before the first turn and after completion. An
@@ -175,8 +198,11 @@ Turn-based tagged-json tool forcing is connected for workflows declaring
 Profiles without that binding retain protocol/parameter postconditions; native
 forcing for other protocols and duplex tool responses remains open. Tool
 parameter schemas compile through the shared llguidance byte-grammar backend
-before configuration is installed, and complete call arguments must match that
-grammar before publication. This uses the backend's supported schema language,
+before configuration is installed. Provisional prefixes and the actual raw
+completed argument spelling must match that grammar; completed protocol parsing
+must describe the same JSON values before completion is published. Forced tagged
+JSON envelopes admit every ordering of `name`, optional `id`, and `arguments`,
+while retaining required fields, ID limits and rejection of extra fields. This uses the backend's supported schema language,
 not a claim of general JSON Schema validation. Protocol parsing, parameter
 admission and required-call postconditions do not substitute for
 constraint-guided sampling.
@@ -237,6 +263,10 @@ A Native CPU WebSocket regression covers two tool-call rounds with an external
 regression requires a schema-invalid model call to produce an error immediately
 after response creation, with no call item or argument delta sent to the harness. Its scripted
 fixture verifies protocol/data flow rather than model tool-selection quality.
-A completed call batch is checked against declared function names and fully
-rendered within its resource budget before any call in that batch is sent to
-the harness. A late invalid call cannot publish an earlier partial batch.
+A complete call batch is checked against declared function names and retained
+raw argument spellings within its resource budget before any completed call is
+published or registered for external results. Provisional items remain explicitly
+in progress; a late invalid call cannot authorize an earlier completed batch.
+Native CPU regressions also pause a real workflow mid-argument to observe a delta
+before cancellation, and round-trip a late model ID through an opaque wire ID.
+The latter model template rejects any result conditioned with the wrong ID.

@@ -2556,3 +2556,50 @@ compilation, formatting and whitespace checks passed. The offline route audit
 remains 51 present / four external-harness contracts, without claiming that
 registration establishes semantic parity. Evidence is functional macOS ARM64
 CPU only, with no Linux/GPU execution or performance claims.
+
+
+## Realtime provisional function argument projection
+
+The declared shared tool parser now exposes bounded cumulative call prefixes.
+Tagged JSON uses the same JSON-aware envelope scan for full parsing and prefix
+projection, so marker strings inside argument data do not terminate a call.
+Duplicate top-level call fields and impossible argument-object starts fail
+before provisional publication. Atem XML shares its complete/provisional scanner, retains an open parameter until
+its JSON-or-text type is known, then streams fields without waiting for invoke
+end. Quoted tag boundaries and exact, unique attributes are resolved before a
+prefix is published; incompatible XML text cannot become invented empty args.
+
+Realtime parameter-prefix admission returns a borrowed proof consumed by the
+wire renderer. Prefixes can only append, repeated snapshots emit no duplicates,
+and completed batch admission checks the raw streamed JSON representation and
+its value-equivalence to the authoritative protocol parse before argument-done
+or pending harness-call registration. Raw spelling survives canonical parse
+reordering/escape normalization. The existing raw byte, call-count, identity and
+response-text bounds remain enforced.
+
+The response owns stable wire/model call identity bindings. Early explicit IDs
+stay unchanged; a late model ID cannot rename an already published item. The
+conversation owns pending wire-ID to complete model-call mappings, so an external
+result uses its wire ID while the authored tool-result prompt receives the model
+ID. Cancellation/limits do not register unfinished calls. Unfinished limit items
+are incomplete and omit argument-done events, while response-level token-limit
+status remains completed. Tool execution stays exclusively in the harness.
+
+Forced tagged JSON schemas admit every ordering of the envelope's name, optional
+ID and arguments fields, preserving required fields, ID limits and rejection of
+extra fields. Parameter validation still uses the backend's supported schema
+language rather than claiming a general JSON Schema validator. Broader realtime
+forcing, pressure/overlap and device wire acceptance remain open.
+
+
+Final CPU validation on the #2757 provider/ORT-constructor baseline: metadata
+library 106 passed; engine library 1112 passed (1 inherited ignore); realtime
+server selection 42 passed; full server library 621 passed (2 inherited ignores).
+The Native wire cases include mid-argument waiting/cancellation, late model-ID
+round trip with a template assertion, XML parameters before invoke close, and
+all six envelope-field orders plus the absent-ID form under actual native masks.
+Strict all-target metadata/engine/server Clippy passed with defaults, as did
+strict server Clippy with `--no-default-features --features metrics,cuda-13000`.
+Formatting/diff checks passed. These are CPU functional checks; device wire
+acceptance and performance remain unclaimed. Broader acceptance rows above stay
+open; this increment does not complete the overall compatibility objective.
