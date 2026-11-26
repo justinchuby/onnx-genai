@@ -1301,16 +1301,6 @@ mod tests {
         assert_eq!(int2.bytes, vec![0x34, 0x03]);
         assert_eq!(int2.bytes[1] & 0xfc, 0, "unused tail bits must be zero");
 
-        let strided = input.with_view(&[3], &[2]);
-        let mut unpacked = Owned::zeros(DataType::Int8, &[3]);
-        CastKernel {
-            to: Some(DataType::Int8),
-            float6: false,
-        }
-        .execute(&[strided.view()], &mut [unpacked.view_mut()])
-        .unwrap();
-        assert_eq!(unpacked.bytes, vec![0, 7, 15]);
-
         let shape = [3];
         let negative_stride = [-1];
         let negative_input = TensorView::new(
@@ -1328,6 +1318,16 @@ mod tests {
         .execute(&[negative_input], &mut [reversed.view_mut()])
         .unwrap();
         assert_eq!(reversed.bytes, vec![7, 1, 0]);
+
+        let strided = input.with_view(&[3], &[2]);
+        let mut unpacked = Owned::zeros(DataType::Int8, &[3]);
+        CastKernel {
+            to: Some(DataType::Int8),
+            float6: false,
+        }
+        .execute(&[strided.view()], &mut [unpacked.view_mut()])
+        .unwrap();
+        assert_eq!(unpacked.bytes, vec![0, 7, 15]);
 
         let source = Owned::u8(&shape, &[4, 5, 6]);
         let mut negative_output_bytes = [0xaa, 0xaa];
