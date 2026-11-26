@@ -88,12 +88,40 @@ pub const fn packed_cast_peer_supported(dtype: DataType) -> bool {
     )
 }
 
-/// Explain why a Cast/CastLike dtype pair is unsupported by the packed kernel.
+/// Explain why a Cast/CastLike dtype pair is unsupported.
+///
+/// Packed integer support is capability-based rather than tied to the schema
+/// revision that first listed each dtype. FLOAT6 widening is different: its
+/// representation and conversion behavior belong to standard Cast revision 28.
 pub fn cast_unsupported_reason(
     op: &str,
+    opset: u64,
+    float6_widening: bool,
     source: Option<DataType>,
     target: Option<DataType>,
 ) -> Option<String> {
+    if target.is_some_and(|dtype| dtype.is_float6()) {
+        return Some(format!(
+            "{op}: FLOAT6 target dtype is unsupported; FLOAT6 is currently supported only as a source widened by standard Cast at opset 28 or newer"
+        ));
+    }
+    if source.is_some_and(|dtype| dtype.is_float6()) {
+        if op != "Cast" || opset < 28 || !float6_widening {
+            return Some(format!(
+                "{op}: FLOAT6 source requires standard Cast at opset 28 or newer; use Cast-28 to widen it to f16, bf16, f32, or f64"
+            ));
+        }
+        if !target.is_some_and(|dtype| {
+            matches!(
+                dtype,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+            )
+        }) {
+            return Some(format!(
+                "{op}: FLOAT6 source supports only f16, bf16, f32, or f64 targets, got {target:?}; widen to a supported float dtype first"
+            ));
+        }
+    }
     if source.is_some_and(|dtype| packed_integer(dtype).is_some())
         || target.is_some_and(|dtype| packed_integer(dtype).is_some())
     {
@@ -133,19 +161,85 @@ mod tests {
 
     #[test]
     fn cast_dtype_admission_is_capability_based() {
-        assert!(cast_unsupported_reason("Cast", Some(DataType::Uint4), None).is_none());
-        assert!(cast_unsupported_reason("CastLike", None, Some(DataType::Int2)).is_none());
+        assert!(
+            cast_unsupported_reason("Cast", 1, false, Some(DataType::Uint4), None).is_none()
+        );
+        assert!(
+            cast_unsupported_reason("CastLike", 15, false, None, Some(DataType::Int2)).is_none()
+        );
         assert!(
             cast_unsupported_reason(
                 "Cast",
+                1,
+                false,
                 Some(DataType::Uint4),
                 Some(DataType::Float8E4M3FN)
             )
             .is_some()
         );
         assert!(
-            cast_unsupported_reason("Cast", Some(DataType::Float4E2M1), Some(DataType::Int2))
-                .is_some()
+            cast_unsupported_reason(
+                "Cast",
+                1,
+                false,
+                Some(DataType::Float4E2M1),
+                Some(DataType::Int2)
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn float6_admission_follows_real_cast_revision_semantics() {
+        assert!(
+            cast_unsupported_reason(
+                "Cast",
+                27,
+                false,
+                Some(DataType::Float6E2M3),
+                Some(DataType::Float32)
+            )
+            .is_some()
+        );
+        assert!(
+            cast_unsupported_reason(
+                "CastLike",
+                28,
+                false,
+                Some(DataType::Float6E2M3),
+                Some(DataType::Float32)
+            )
+            .is_some()
+        );
+        assert!(
+            cast_unsupported_reason(
+                "Cast",
+                28,
+                true,
+                Some(DataType::Float6E2M3),
+                Some(DataType::Float32)
+            )
+            .is_none()
+        );
+        assert!(
+            cast_unsupported_reason(
+                "Cast",
+                28,
+                true,
+                Some(DataType::Float6E2M3),
+                Some(DataType::Int32)
+            )
+            .is_some()
+        );
+        assert!(
+            cast_unsupported_reason(
+                "Cast",
+                28,
+                true,
+                Some(DataType::Float32),
+                Some(DataType::Float6E2M3)
+            )
+            .is_some()
         );
     }
 }

@@ -316,7 +316,13 @@ impl KernelFactory for CastFactory {
         } else {
             input_dtypes.get(1).copied()
         };
-        cast_unsupported_reason(&node.op_type, input_dtypes.first().copied(), target)
+        cast_unsupported_reason(
+            &node.op_type,
+            opset,
+            self.float6,
+            input_dtypes.first().copied(),
+            target,
+        )
     }
 
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {

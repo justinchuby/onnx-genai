@@ -155,6 +155,57 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         .is_some_and(|reason| reason.contains("does not support source dtype"))
     );
 
+    node.attributes.insert(
+        "to".into(),
+        Attribute::Int(DataType::Float32 as i64),
+    );
+    assert!(
+        ep.supports_op(
+            &node,
+            27,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("opset 28"))
+    );
+    assert!(
+        ep.supports_op(
+            &node,
+            28,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .is_supported()
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Int32 as i64));
+    assert!(
+        ep.supports_op(
+            &node,
+            28,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("supports only"))
+    );
+    let cast_like = Node::new(NodeId(1), "CastLike", vec![], vec![]);
+    assert!(
+        ep.supports_op(
+            &cast_like,
+            15,
+            &[static_shape([3]), static_shape([3])],
+            &[DataType::Float6E2M3, DataType::Float32],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("standard Cast"))
+    );
+
     let cases = [
         (
             "uint8-to-uint4-codes-and-zero-points",

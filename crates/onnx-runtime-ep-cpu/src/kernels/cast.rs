@@ -117,7 +117,7 @@ impl KernelFactory for CastFactory {
     fn unsupported_reason(
         &self,
         node: &Node,
-        _opset: u64,
+        opset: u64,
         _input_shapes: &[Shape],
         input_dtypes: &[DataType],
     ) -> Option<String> {
@@ -125,7 +125,13 @@ impl KernelFactory for CastFactory {
             .attr("to")
             .and_then(|a| a.as_int())
             .and_then(|raw| DataType::from_onnx(raw as i32));
-        cast_unsupported_reason("Cast", input_dtypes.first().copied(), target)
+        cast_unsupported_reason(
+            "Cast",
+            opset,
+            self.float6,
+            input_dtypes.first().copied(),
+            target,
+        )
     }
 
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -162,6 +168,8 @@ impl KernelFactory for CastLikeFactory {
         }
         cast_unsupported_reason(
             "CastLike",
+            opset,
+            false,
             input_dtypes.first().copied(),
             input_dtypes.get(1).copied(),
         )
@@ -239,7 +247,9 @@ fn cast_to(
         )));
     }
     if packed_integer(input.dtype).is_some() || packed_integer(to).is_some() {
-        if let Some(reason) = cast_unsupported_reason(op, Some(input.dtype), Some(to)) {
+        if let Some(reason) =
+            cast_unsupported_reason(op, 28, float6, Some(input.dtype), Some(to))
+        {
             return Err(EpError::KernelFailed(reason));
         }
         return cast_packed_integer(input, output, to);
@@ -1236,6 +1246,68 @@ mod tests {
                 )
                 .reason()
                 .is_some_and(|reason| reason.contains("does not support source dtype"))
+        );
+    }
+
+    #[test]
+    fn float6_claims_follow_cast_28_widening_semantics() {
+        let provider = crate::CpuExecutionProvider::new();
+        let shape = static_shape([3]);
+        let mut cast = Node::new(NodeId(0), "Cast", vec![], vec![]);
+        cast.attributes.insert(
+            "to".into(),
+            Attribute::Int(DataType::Float32 as i64),
+        );
+        assert!(
+            provider
+                .supports_op(
+                    &cast,
+                    27,
+                    &[shape.clone()],
+                    &[DataType::Float6E2M3],
+                    &[],
+                )
+                .reason()
+                .is_some_and(|reason| reason.contains("opset 28"))
+        );
+        assert!(
+            provider
+                .supports_op(
+                    &cast,
+                    28,
+                    &[shape.clone()],
+                    &[DataType::Float6E2M3],
+                    &[],
+                )
+                .is_supported()
+        );
+        cast.attributes
+            .insert("to".into(), Attribute::Int(DataType::Int32 as i64));
+        assert!(
+            provider
+                .supports_op(
+                    &cast,
+                    28,
+                    &[shape.clone()],
+                    &[DataType::Float6E2M3],
+                    &[],
+                )
+                .reason()
+                .is_some_and(|reason| reason.contains("supports only"))
+        );
+
+        let cast_like = Node::new(NodeId(1), "CastLike", vec![], vec![]);
+        assert!(
+            provider
+                .supports_op(
+                    &cast_like,
+                    15,
+                    &[shape.clone(), shape],
+                    &[DataType::Float6E2M3, DataType::Float32],
+                    &[],
+                )
+                .reason()
+                .is_some_and(|reason| reason.contains("standard Cast"))
         );
     }
 
