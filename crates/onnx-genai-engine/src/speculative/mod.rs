@@ -387,14 +387,16 @@ pub(crate) fn load_target_initializer_adapters(
     lm_head_name: &str,
     hidden_size: usize,
     projection: Option<DraftProjectionDevice>,
+    keyed_weight_files: &[onnx_runtime_loader::KeyedWeightFile],
 ) -> anyhow::Result<(MtpEmbedder, MtpLmHead, usize)> {
     let (graph, store) =
-        onnx_runtime_loader::load_model_with_weights(model_path).with_context(|| {
-            format!(
-                "Failed to load target initializers from '{}'",
-                model_path.display()
-            )
-        })?;
+        onnx_runtime_loader::load_model_with_keyed_weights(model_path, keyed_weight_files)
+            .with_context(|| {
+                format!(
+                    "Failed to load target initializers from '{}'",
+                    model_path.display()
+                )
+            })?;
     let find_weight = |name: &str| -> anyhow::Result<WeightRef> {
         graph
             .initializers
@@ -3085,6 +3087,7 @@ mod tests {
             "lm_head.weight_t",
             16,
             None,
+            &[],
         )?;
         assert_eq!(vocab_size, 32);
 
