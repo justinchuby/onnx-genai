@@ -521,56 +521,35 @@ fn dtype_boundary_graph(op: &str, opset: u64, dtype: DataType) -> (Graph, ValueI
 }
 
 #[test]
-fn control_flow_dtype_boundaries_match_onnx_ir_revisions() {
-    let boundaries = [
-        (DataType::Float8E4M3FN, 19),
-        (DataType::Float8E4M3FNUZ, 19),
-        (DataType::Float8E5M2, 19),
-        (DataType::Float8E5M2FNUZ, 19),
-        (DataType::Uint4, 21),
-        (DataType::Int4, 21),
-        (DataType::Float4E2M1, 23),
-        (DataType::Float8E8M0, 24),
-        (DataType::Uint2, 25),
-        (DataType::Int2, 25),
+fn control_flow_tensor_dtypes_are_not_schema_opset_gated() {
+    let dtypes = [
+        DataType::Float8E4M3FN,
+        DataType::Float8E4M3FNUZ,
+        DataType::Float8E5M2,
+        DataType::Float8E5M2FNUZ,
+        DataType::Uint4,
+        DataType::Int4,
+        DataType::Float4E2M1,
+        DataType::Float8E8M0,
+        DataType::Uint2,
+        DataType::Int2,
+        DataType::Float6E2M3,
+        DataType::Float6E3M2,
     ];
     let registry = InferenceRegistry::default_registry();
 
     for op in ["If", "Loop", "Scan"] {
-        for (dtype, first_opset) in boundaries {
-            let (mut prior, _) = dtype_boundary_graph(op, first_opset - 1, dtype);
-            let imports = prior.opset_imports.clone();
-            let error = registry
-                .infer_graph(&mut prior, &imports, MergePolicy::Permissive)
-                .expect_err("the prior opset must reject the newly introduced dtype");
-            let message = error.to_string();
-            assert!(
-                message.contains(&format!("opset {}", first_opset - 1))
-                    && message.contains(&format!("first admitted at opset {first_opset}")),
-                "{op} {dtype:?} rejection must explain the exact boundary: {message}"
-            );
-
-            let (mut legal, output) = dtype_boundary_graph(op, first_opset, dtype);
-            let imports = legal.opset_imports.clone();
+        for dtype in dtypes {
+            let (mut graph, output) = dtype_boundary_graph(op, 18, dtype);
+            let imports = graph.opset_imports.clone();
             registry
-                .infer_graph(&mut legal, &imports, MergePolicy::Permissive)
+                .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
                 .unwrap_or_else(|error| {
-                    panic!("{op} {dtype:?} must be legal at opset {first_opset}: {error}")
+                    panic!("{op}-18 must admit implemented {dtype:?}: {error}")
                 });
-            assert_eq!(legal.value(output).dtype, dtype);
+            assert_eq!(graph.value(output).dtype, dtype);
         }
     }
-}
-
-#[test]
-fn control_flow_dtype_gate_uses_node_local_opset() {
-    let (mut graph, output) = dtype_boundary_graph("If", 18, DataType::Float8E4M3FN);
-    graph.node_mut(NodeId(0)).version = Some(19);
-    let imports = graph.opset_imports.clone();
-    InferenceRegistry::default_registry()
-        .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
-        .expect("the containing If node's local opset admits float8");
-    assert_eq!(graph.value(output).dtype, DataType::Float8E4M3FN);
 }
 
 #[test]
@@ -599,7 +578,7 @@ fn unresolved_if_branch_outputs_remain_deferred() {
 }
 
 #[test]
-fn unresolved_if_output_still_checks_a_known_declared_dtype() {
+fn unresolved_if_output_preserves_a_known_declared_dtype() {
     fn unresolved_branch() -> Graph {
         let mut branch = Graph::new();
         let output = branch.create_named_value(
@@ -628,14 +607,11 @@ fn unresolved_if_output_still_checks_a_known_declared_dtype() {
     graph.opset_imports.insert(String::new(), 18);
 
     let imports = graph.opset_imports.clone();
-    let message = InferenceRegistry::default_registry()
+    let report = InferenceRegistry::default_registry()
         .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
-        .expect_err("a known parent output dtype must be checked even when branches are unresolved")
-        .to_string();
-    assert!(
-        message.contains("output #0") && message.contains("first admitted at opset 19"),
-        "the declared output rejection must identify the boundary: {message}"
-    );
+        .expect("an implemented declared dtype remains valid while branches are unresolved");
+    assert!(report.unresolved.contains(&output));
+    assert_eq!(graph.value(output).dtype, DataType::Float8E4M3FN);
 }
 
 /// Build a small graph exercising symbolic-batch propagation through
@@ -1795,8 +1771,8 @@ fn if_unifies_matching_sequence_branch_outputs() {
 }
 
 #[test]
-fn if_sequence_dtype_uses_the_same_opset_boundary_as_tensor_values() {
-    for (opset, accepted) in [(20, false), (21, true)] {
+fn if_sequence_tensor_dtype_is_not_opset_gated() {
+    for opset in [18, 20, 21] {
         let (mut graph, output) = if_graph(
             sequence_construct_branch(DataType::Int4, vec![Dim::Static(8)]),
             sequence_construct_branch(DataType::Int4, vec![Dim::Static(8)]),
@@ -1808,21 +1784,12 @@ fn if_sequence_dtype_uses_the_same_opset_boundary_as_tensor_values() {
             &imports,
             MergePolicy::Permissive,
         );
-        if accepted {
-            let report = result.expect("If-21 must admit Sequence<Tensor<int4>>");
-            assert_eq!(
-                sequence_tensor(report.containers.get(&output).expect("sequence output")).dtype,
-                DataType::Int4
-            );
-        } else {
-            let message = result
-                .expect_err("If-20 must reject Sequence<Tensor<int4>>")
-                .to_string();
-            assert!(
-                message.contains("first admitted at opset 21"),
-                "rejection must name the first legal opset: {message}"
-            );
-        }
+        let report =
+            result.unwrap_or_else(|error| panic!("standalone If-{opset} admits int4: {error}"));
+        assert_eq!(
+            sequence_tensor(report.containers.get(&output).expect("sequence output")).dtype,
+            DataType::Int4
+        );
     }
 }
 
