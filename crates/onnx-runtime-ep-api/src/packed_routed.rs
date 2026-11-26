@@ -807,7 +807,10 @@ mod native_metadata_tests {
                     }
                     let strides = x
                         .iter()
-                        .map(|v| onnx_runtime_ir::compute_contiguous_strides(v.shape))
+                        .map(|v| {
+                            onnx_runtime_ir::compute_contiguous_strides(v.shape)
+                                .expect("fixture shape has representable contiguous strides")
+                        })
                         .collect::<Vec<_>>();
                     let views = x
                         .iter()

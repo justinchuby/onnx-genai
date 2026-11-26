@@ -1930,7 +1930,8 @@ mod vectorized_tests {
         let in_ptr = shared.as_ptr() as *const std::ffi::c_void;
         let out_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
         let shape = [rows, cols];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let f32c = DataType::Float32;
         let cpu = DeviceId::cpu();
         let x = TensorView::new(DevicePtr(in_ptr), f32c, &shape, &strides, cpu);

@@ -2,7 +2,8 @@
 use onnx_genai_llguidance::{
     api::{ParserLimits, TopLevelGrammar},
     toktrie::{ApproximateTokEnv, InferenceCapabilities, TokEnv, TokRxInfo, TokTrie},
-    GrammarBuilder, JsonCompileOptions, Matcher, ParserFactory, UnsatisfiableSchemaError,
+    GrammarBuilder, JsonCompileOptions, Matcher, ParserFactory, RootObjectKeyPolicy,
+    RootObjectKeyPolicyError, UnsatisfiableSchemaError,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -63,4 +64,44 @@ fn registry_compiler_preserves_known_key_lexeme_ownership() {
     assert!(!accepts(schema.clone(), &known(2)));
     assert!(accepts(schema.clone(), r#"{"other":2}"#));
     assert!(!accepts(schema, r#"{"other":1}"#));
+}
+
+#[test]
+fn registry_root_key_policy_keeps_semantic_and_encoding_failures_distinct() {
+    let limited = JsonCompileOptions {
+        root_object_key_policy: Some(RootObjectKeyPolicy { min: 1, max: 256 }),
+        ..Default::default()
+    };
+    let compile = |options: &JsonCompileOptions, schema| {
+        options.json_to_llg(GrammarBuilder::new(None, ParserLimits::default()), schema)
+    };
+    let unencodable = json!({"const":{"":1}});
+    assert!(compile(&JsonCompileOptions::default(), unencodable.clone()).is_ok());
+    let error = compile(&limited, unencodable)
+        .err()
+        .expect("XML name encoding must fail");
+    assert!(error.is::<RootObjectKeyPolicyError>());
+    assert!(!error.is::<UnsatisfiableSchemaError>());
+    let error = compile(
+        &limited,
+        json!({"type":"object","additionalProperties":false,"minProperties":1}),
+    )
+    .err()
+    .expect("the original schema has no instances");
+    assert!(error.is::<UnsatisfiableSchemaError>());
+    assert!(!error.is::<RootObjectKeyPolicyError>());
+    let error = compile(&limited, json!({"type":"object","properties":{"":{"oneOf":[{"type":"number"},{"type":"integer"}]}},"required":[""],"additionalProperties":false}))
+        .err().expect("unsupported original constraints must remain errors");
+    assert!(!error.is::<UnsatisfiableSchemaError>());
+    assert!(!error.is::<RootObjectKeyPolicyError>());
+    assert!(compile(&limited, json!({"const":{"x":{"":1}}})).is_ok());
+    let invalid = JsonCompileOptions {
+        root_object_key_policy: Some(RootObjectKeyPolicy { min: 2, max: 1 }),
+        ..limited
+    };
+    let error = compile(&invalid, json!(false))
+        .err()
+        .expect("invalid options precede schema emptiness");
+    assert!(!error.is::<UnsatisfiableSchemaError>());
+    assert!(!error.is::<RootObjectKeyPolicyError>());
 }

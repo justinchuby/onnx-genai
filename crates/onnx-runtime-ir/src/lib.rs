@@ -67,6 +67,7 @@ mod node;
 pub mod onnx;
 pub mod opset26;
 pub mod packed_integer;
+pub mod packed_arithmetic;
 pub mod packed_matmul;
 pub mod packed_routed;
 pub mod pattern;
@@ -114,8 +115,8 @@ pub use error::{GraphError, IrError, Result};
 pub use graph::{Graph, GraphAttribute, ModelFunction, ModelFunctionKey};
 pub use graph_view::{ConsumerUse, FrozenGraph, GraphView, GraphViewCache, NodeIndex, ValueIndex};
 pub use layout::{
-    MemoryFormat, TensorLayout, broadcast_shapes, compute_contiguous_strides, is_contiguous,
-    is_dense,
+    ContiguousStridePlan, MemoryFormat, TensorLayout, broadcast_shapes, compute_contiguous_strides,
+    is_contiguous, is_dense,
 };
 pub use node::{Attribute, Node, NodeId, RUNTIME_DOMAIN};
 pub use scan_inline::inline_single_trip_scan_bodies;

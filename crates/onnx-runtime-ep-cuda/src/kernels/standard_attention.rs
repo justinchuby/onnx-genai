@@ -2814,14 +2814,22 @@ mod alias_tests {
             let presv_sh = [1usize, heads, total, vdim];
             let y_sh = [1usize, heads, qlen, vdim];
 
-            let q_st = compute_contiguous_strides(&q_sh);
-            let kcur_st = compute_contiguous_strides(&kcur_sh);
-            let vcur_st = compute_contiguous_strides(&vcur_sh);
-            let pastk_st = compute_contiguous_strides(&pastk_sh);
-            let pastv_st = compute_contiguous_strides(&pastv_sh);
-            let presk_st = compute_contiguous_strides(&presk_sh);
-            let presv_st = compute_contiguous_strides(&presv_sh);
-            let y_st = compute_contiguous_strides(&y_sh);
+            let q_st = compute_contiguous_strides(&q_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let kcur_st = compute_contiguous_strides(&kcur_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let vcur_st = compute_contiguous_strides(&vcur_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let pastk_st = compute_contiguous_strides(&pastk_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let pastv_st = compute_contiguous_strides(&pastv_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let presk_st = compute_contiguous_strides(&presk_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let presv_st = compute_contiguous_strides(&presv_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let y_st = compute_contiguous_strides(&y_sh)
+                .expect("fixture shape has representable contiguous strides");
 
             // Cache buffers sized for the grown (total) length.
             let key_cap = heads * total * kdim * 4;
@@ -3000,14 +3008,22 @@ mod alias_tests {
             let presv_sh = [1usize, heads, cap, vdim];
             let y_sh = [1usize, heads, qlen, vdim];
 
-            let q_st = compute_contiguous_strides(&q_sh);
-            let kcur_st = compute_contiguous_strides(&kcur_sh);
-            let vcur_st = compute_contiguous_strides(&vcur_sh);
-            let pastk_st = compute_contiguous_strides(&pastk_sh);
-            let pastv_st = compute_contiguous_strides(&pastv_sh);
-            let presk_st = compute_contiguous_strides(&presk_sh);
-            let presv_st = compute_contiguous_strides(&presv_sh);
-            let y_st = compute_contiguous_strides(&y_sh);
+            let q_st = compute_contiguous_strides(&q_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let kcur_st = compute_contiguous_strides(&kcur_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let vcur_st = compute_contiguous_strides(&vcur_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let pastk_st = compute_contiguous_strides(&pastk_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let pastv_st = compute_contiguous_strides(&pastv_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let presk_st = compute_contiguous_strides(&presk_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let presv_st = compute_contiguous_strides(&presv_sh)
+                .expect("fixture shape has representable contiguous strides");
+            let y_st = compute_contiguous_strides(&y_sh)
+                .expect("fixture shape has representable contiguous strides");
 
             let key_cap_bytes = heads * cap * kdim * 4;
             let val_cap_bytes = heads * cap * vdim * 4;
@@ -3371,9 +3387,12 @@ mod alias_tests {
             let current = [1, 1, 1, 2];
             let old = [1, 1, past, 2];
             let present = [1, 1, past + 1, 2];
-            let current_st = compute_contiguous_strides(&current);
-            let old_st = compute_contiguous_strides(&old);
-            let present_st = compute_contiguous_strides(&present);
+            let current_st = compute_contiguous_strides(&current)
+                .expect("fixture shape has representable contiguous strides");
+            let old_st = compute_contiguous_strides(&old)
+                .expect("fixture shape has representable contiguous strides");
+            let present_st = compute_contiguous_strides(&present)
+                .expect("fixture shape has representable contiguous strides");
             let device = ep.device_id();
             let dp = |ptr| DevicePtr(ptr as *const c_void);
             let dpm = |ptr| DevicePtrMut(ptr as *mut c_void);

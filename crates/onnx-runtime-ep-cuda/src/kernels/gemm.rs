@@ -667,9 +667,12 @@ mod tests {
             let a_shape = if empty { [0, 2, 0] } else { [2, 2, 0] };
             let b_shape = [0, 2];
             let y_shape = if empty { [0, 2, 2] } else { [2, 2, 2] };
-            let a_strides = compute_contiguous_strides(&a_shape);
-            let b_strides = compute_contiguous_strides(&b_shape);
-            let y_strides = compute_contiguous_strides(&y_shape);
+            let a_strides = compute_contiguous_strides(&a_shape)
+                .expect("fixture shape has representable contiguous strides");
+            let b_strides = compute_contiguous_strides(&b_shape)
+                .expect("fixture shape has representable contiguous strides");
+            let y_strides = compute_contiguous_strides(&y_shape)
+                .expect("fixture shape has representable contiguous strides");
             // A and B contain no elements and are never read. Their pointer
             // borrows live backing rather than inventing a device address.
             let mut inputs = vec![
@@ -688,7 +691,10 @@ mod tests {
                     ep.device_id(),
                 ),
             ];
-            let c_strides = c_shape.map(compute_contiguous_strides);
+            let c_strides = c_shape.map(|shape| {
+                compute_contiguous_strides(shape)
+                    .expect("fixture shape has representable contiguous strides")
+            });
             if let Some(shape) = c_shape {
                 inputs.push(TensorView::new(
                     DevicePtr(bias.as_ptr()),

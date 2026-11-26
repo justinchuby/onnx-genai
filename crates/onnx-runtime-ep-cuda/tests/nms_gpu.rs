@@ -108,7 +108,10 @@ fn run_nms(ep: &CudaExecutionProvider, inputs: &[Tensor], attrs: &[(&str, Attrib
         .collect::<Vec<_>>();
     let strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let views = inputs
         .iter()
@@ -152,7 +155,8 @@ fn run_nms(ep: &CudaExecutionProvider, inputs: &[Tensor], attrs: &[(&str, Attrib
             256,
         )
         .unwrap();
-    let output_strides = compute_contiguous_strides(&output_metadata.shape);
+    let output_strides = compute_contiguous_strides(&output_metadata.shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         output_metadata.dtype,

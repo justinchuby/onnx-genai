@@ -53,7 +53,8 @@ fn run_release_probe() {
         node.attributes.insert("axes".into(), Attribute::Ints(axes));
         let kernel = ep.get_kernel(&node, &[shape.to_vec()], 29).unwrap();
         let n = shape.iter().product::<usize>();
-        let strides = compute_contiguous_strides(shape);
+        let strides = compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides");
         let data: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { -2. } else { 2. }).collect();
         let x = rt.stream().clone_htod(&data).unwrap();
         let mut y = rt.stream().alloc_zeros::<f32>(n).unwrap();

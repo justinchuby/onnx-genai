@@ -491,14 +491,32 @@ impl AudioProgram {
         }
         NonZeroUsize::new(lower).map(Some).ok_or_else(||invalid(format!("audio trimming windows cannot admit even one source sample at {source_rate} Hz without discarding valid audio; enlarge the authored window or change its resampling/padding order")))
     }
-    pub fn run(&self, encoded: &[&[u8]]) -> Result<Vec<NamedAudioTensor>, AudioPreprocessError> {
+    pub fn run(
+        &self,
+        encoded: &[&[u8]],
+        limits: AudioDecodeLimits,
+    ) -> Result<Vec<NamedAudioTensor>, AudioPreprocessError> {
         if encoded.is_empty() {
             return Err(invalid("audio preprocessing requires at least one clip"));
         }
+        let decodes = self
+            .steps
+            .iter()
+            .filter(|step| matches!(step.op, Op::Decode))
+            .count()
+            .checked_mul(encoded.len())
+            .ok_or_else(|| {
+                invalid(
+                    "audio decode invocation count overflows; reduce batch size or decode steps",
+                )
+            })?;
+        let limits = AudioDecodeLimits {
+            max_decoded_bytes: NonZeroUsize::new(limits.max_decoded_bytes.get()/decodes.max(1)).ok_or_else(||invalid(format!("audio preprocessing's {decodes} decode invocations exceed max_decoded_bytes={}; reduce the batch/decode steps or raise the caller PCM budget",limits.max_decoded_bytes)))?,
+        };
         let mut values = Vec::with_capacity(self.steps.len());
         for step in &self.steps {
             let input = step.input.map(|id| &values[id.0]);
-            let result = execute(&step.op, input, encoded).map_err(|e| {
+            let result = execute(&step.op, input, encoded, limits).map_err(|e| {
                 invalid(format!(
                     "{}: {e}; check the encoded clip and declared input/parameters",
                     step.context
@@ -529,12 +547,17 @@ fn epsilon(t: &AudioTransform) -> Result<f64, AudioPreprocessError> {
     }
     Ok(v)
 }
-fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, AudioPreprocessError> {
+fn execute(
+    op: &Op,
+    input: Option<&Data>,
+    encoded: &[&[u8]],
+    limits: AudioDecodeLimits,
+) -> Result<Data, AudioPreprocessError> {
     if matches!(op, Op::Decode) {
         return encoded
             .iter()
             .map(|bytes| {
-                let audio = decode_audio(bytes)?;
+                let audio = decode_audio(bytes, limits)?;
                 let len = audio.samples.len();
                 Ok(Wave {
                     samples: audio.samples,

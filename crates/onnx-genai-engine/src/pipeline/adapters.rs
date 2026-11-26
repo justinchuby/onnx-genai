@@ -1,3 +1,4 @@
+mod peft;
 use super::row_state::{RowScopedState, gather_rows};
 use crate::engine::memory_plan::Holder;
 use anyhow::Context;
@@ -257,6 +258,7 @@ pub(super) struct AdapterTargetWeights {
 struct LoadedAdapter {
     targets: HashMap<(String, String), Vec<AdapterTargetWeights>>,
     _lease: MemoryLease,
+    peft_config_identity: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,7 +423,13 @@ impl AdapterCache {
                         activation.adapter
                     );
                 }
-                row_key.push((activation.adapter.clone(), scale.to_bits()));
+                row_key.push((
+                    activation.adapter.clone(),
+                    scale.to_bits(),
+                    self.entries
+                        .get(&activation.adapter)
+                        .and_then(|entry| entry.peft_config_identity),
+                ));
                 resolved.push((activation.adapter, scale));
             }
             plan_parts.push(row_key);
@@ -449,7 +457,28 @@ impl AdapterCache {
         name: &str,
         artifact: &AdapterArtifact,
     ) -> anyhow::Result<()> {
-        if self.entries.contains_key(name) {
+        if let Some(loaded) = self.entries.get(name) {
+            if let Some(expected) = loaded.peft_config_identity {
+                let weight = artifact
+                    .weights
+                    .iter()
+                    .find(|weight| {
+                        matches!(
+                            weight.format,
+                            AdapterWeightFormat::Json | AdapterWeightFormat::HfPeft
+                        )
+                    })
+                    .context("cached adapter source disappeared")?;
+                let authority = self
+                    .authority
+                    .as_deref()
+                    .context("PEFT cache requires host-memory authority")?;
+                let (configuration, _lease) = peft::configuration(root, weight, authority)?;
+                anyhow::ensure!(
+                    peft::identity(&configuration) == expected,
+                    "PEFT adapter {name:?} configuration changed after loading; restore its immutable config or reload the package with a new adapter version before selecting it"
+                );
+            }
             self.diagnostic.cache_hits += 1;
             self.touch(name);
             return Ok(());
@@ -586,7 +615,7 @@ fn load_adapter(
 ) -> anyhow::Result<LoadedAdapter> {
     anyhow::ensure!(
         matches!(artifact.dtype.as_str(), "float32" | "fp32"),
-        "portable JSON adapter fallback requires float32, but {}@{} declares {}",
+        "portable adapter normalization requires float32, but {}@{} declares {}",
         artifact.identity,
         artifact.version,
         artifact.dtype
@@ -594,10 +623,10 @@ fn load_adapter(
     let weight = artifact
         .weights
         .iter()
-        .find(|weight| weight.format == AdapterWeightFormat::Json)
+        .find(|weight| matches!(weight.format, AdapterWeightFormat::Json | AdapterWeightFormat::HfPeft))
         .with_context(|| {
             format!(
-                "portable adapter fallback has no JSON artifact for {}@{}; use an execution provider with '{}' support",
+                "portable adapter fallback has no JSON or HF PEFT artifact for {}@{}; use an execution provider with '{}' support",
                 artifact.identity, artifact.version, service.application_capability
             )
         })?;
@@ -633,7 +662,7 @@ fn load_adapter(
     let length = metadata.len();
     let transient = length
         .checked_mul(16)
-        .context("adapter JSON staging size overflow; reduce the artifact")?;
+        .context("adapter container staging size overflow; reduce the artifact")?;
     let _staging = authority
         .reserve(
             onnx_runtime_memory_api::Tier::Host,
@@ -643,7 +672,7 @@ fn load_adapter(
         )
         .with_context(|| {
             format!(
-                "reserve adapter JSON parsing memory for '{}'",
+                "reserve adapter container parsing memory for '{}'",
                 path.display()
             )
         })?;
@@ -701,7 +730,7 @@ fn load_adapter(
                 .checked_add(1)
                 .context("adapter file length overflow")?,
         )
-        .context("allocate bounded adapter JSON input; free host memory and retry")?;
+        .context("allocate bounded adapter container input; free host memory and retry")?;
     file.take(
         length
             .checked_add(1)
@@ -714,9 +743,20 @@ fn load_adapter(
         "adapter artifact '{}' changed size while loading; replace model artifacts atomically between loads",
         path.display()
     );
-    let bundle: JsonBundle = serde_json::from_slice(&bytes)
-        .with_context(|| format!("adapter artifact '{}' is invalid JSON", path.display()))?;
-    let bundles = bundle.targets;
+    let (bundles, peft_config_identity) = match weight.format {
+        AdapterWeightFormat::Json => {
+            let bundle: JsonBundle = serde_json::from_slice(&bytes).with_context(|| {
+                format!("adapter artifact '{}' is invalid JSON", path.display())
+            })?;
+            (bundle.targets, None)
+        }
+        AdapterWeightFormat::HfPeft => {
+            let (targets, identity) =
+                peft::load(root, weight, artifact, service, &bytes, authority)?;
+            (targets, Some(identity))
+        }
+        _ => unreachable!("supported artifact format selected above"),
+    };
     let mut targets = HashMap::new();
     for binding in &artifact.bindings {
         let target = service
@@ -791,6 +831,7 @@ fn load_adapter(
     Ok(LoadedAdapter {
         targets,
         _lease: lease,
+        peft_config_identity,
     })
 }
 

@@ -102,9 +102,9 @@ fn native_conv_im2col_buffer_is_optional_and_reused_across_batches_and_groups() 
                     let x_shape = [batch, group * 2, height, width];
                     let w_shape = [group * 3, 2, kh, kw];
                     let y_shape = [batch, group * 3, oh, ow];
-                    let xs = compute_contiguous_strides(&x_shape);
-                    let ws = compute_contiguous_strides(&w_shape);
-                    let ys = compute_contiguous_strides(&y_shape);
+                    let xs = compute_contiguous_strides(&x_shape).expect("fixture shape has representable contiguous strides");
+                    let ws = compute_contiguous_strides(&w_shape).expect("fixture shape has representable contiguous strides");
+                    let ys = compute_contiguous_strides(&y_shape).expect("fixture shape has representable contiguous strides");
                     let x = vec![1f32; x_shape.iter().product()];
                     let w = vec![1f32; w_shape.iter().product()];
                     let mut y = vec![f32::NAN; y_shape.iter().product()];

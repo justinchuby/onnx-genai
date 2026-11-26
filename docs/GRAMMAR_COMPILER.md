@@ -69,8 +69,8 @@ must be new and outside the repository. This script:
    read crates.io and fetch registry dependencies; it does not publish anything.
 4. Inspects Cargo's resolved graph to require this exact maintained package from
    the local registry, reject path/git/unpatched compiler substitution, then runs
-   both public API/key-ownership regressions with `--locked --offline`.
-5. Requires exactly two passed, zero failed/ignored tests and retains commands,
+   all three public API/key-ownership/policy regressions with `--locked --offline`.
+5. Requires exactly three passed, zero failed/ignored tests and retains commands,
    logs, the resolved lockfile, package checksum and effective Cargo-input context.
    Timeout/interruption uses the same owned process-group containment as the
    behavioral conformance runner; no detached/remote-process guarantee is made.

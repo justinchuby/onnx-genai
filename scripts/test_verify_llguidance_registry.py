@@ -56,10 +56,10 @@ class RegistryTests(unittest.TestCase):
                 audit.verify_cached_contents(package, root / "home", archive)
 
     def test_positive_counts_and_both_patch_regressions_are_required(self):
-        names = ["public_unsatisfiability_remains_distinct_from_invalid_schema_errors", "registry_compiler_preserves_known_key_lexeme_ownership"]
-        output = "".join(f"test {name} ... ok\n" for name in names) + "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n"
+        names = ["public_unsatisfiability_remains_distinct_from_invalid_schema_errors", "registry_compiler_preserves_known_key_lexeme_ownership", "registry_root_key_policy_keeps_semantic_and_encoding_failures_distinct"]
+        output = "".join(f"test {name} ... ok\n" for name in names) + "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n"
         audit.positive_tests(output)
-        for changed in [output.replace("2 passed", "0 passed"), output.replace(names[1], "wrong_test"), output + output]:
+        for changed in [output.replace("3 passed", "0 passed"), output.replace(names[1], "wrong_test"), output + output]:
             with self.assertRaises(ValueError):
                 audit.positive_tests(changed)
 

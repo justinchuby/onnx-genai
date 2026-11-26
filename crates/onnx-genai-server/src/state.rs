@@ -438,6 +438,8 @@ pub struct ServerConfig {
     pub max_transcription_prompt_bytes: std::num::NonZeroUsize,
     pub max_transcription_template_operations: std::num::NonZeroU64,
     pub max_transcription_frames: std::num::NonZeroUsize,
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio decode.
+    pub max_decoded_audio_bytes: std::num::NonZeroUsize,
     pub max_transcription_text_bytes: std::num::NonZeroUsize,
     pub realtime: crate::realtime::RealtimeLimits,
     /// Enable the upstream POST /props acknowledgement; no mutation schema exists upstream.
@@ -451,6 +453,10 @@ pub struct ServerConfig {
 
     /// Maximum completion prompts admitted by one native or OpenAI request.
     pub max_completion_prompts: std::num::NonZeroUsize,
+    pub max_infill_files: std::num::NonZeroUsize,
+    pub max_infill_filename_bytes: std::num::NonZeroUsize,
+    pub max_infill_context_bytes: std::num::NonZeroUsize,
+    pub max_infill_template_operations: std::num::NonZeroU64,
     /// Per query/document pair input budget for non-generative scoring.
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
@@ -535,6 +541,13 @@ impl Default for ServerConfig {
             model_downloads: std::num::NonZeroUsize::new(2).unwrap(),
             max_completion_prompts: std::num::NonZeroUsize::new(128)
                 .expect("positive native prompt budget"),
+            max_infill_files: std::num::NonZeroUsize::new(128).expect("positive infill file limit"),
+            max_infill_filename_bytes: std::num::NonZeroUsize::new(4096)
+                .expect("positive infill filename limit"),
+            max_infill_context_bytes: std::num::NonZeroUsize::new(8 * 1024 * 1024)
+                .expect("positive infill context limit"),
+            max_infill_template_operations: std::num::NonZeroU64::new(100_000)
+                .expect("positive infill operation limit"),
             max_rerank_input_tokens: std::num::NonZeroUsize::new(8192)
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)
@@ -552,6 +565,9 @@ impl Default for ServerConfig {
                 onnx_genai_engine::transcription::generative::PromptLimits::default()
                     .template
                     .max_operations,
+            max_decoded_audio_bytes:
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY
+                    .max_decoded_bytes,
             max_transcription_frames:
                 onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames,
             max_transcription_text_bytes:
@@ -589,6 +605,9 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(mut self) -> anyhow::Result<Self> {
+        self.engine_config.audio_decode_limits = onnx_genai_preprocess::audio::AudioDecodeLimits {
+            max_decoded_bytes: self.max_decoded_audio_bytes,
+        };
         anyhow::ensure!(
             self.model_downloads.get() <= tokio::sync::Semaphore::MAX_PERMITS,
             "--model-downloads exceeds the supported concurrency bound {}; choose a smaller positive value",

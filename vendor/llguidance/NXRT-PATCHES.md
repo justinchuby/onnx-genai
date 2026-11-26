@@ -48,6 +48,34 @@ is validated using the exact packaged archive and a temporary local registry;
 see [verification instructions](https://github.com/justinchuby/onnx-genai/blob/main/docs/GRAMMAR_COMPILER.md). This does not
 claim that a release has already been uploaded.
 
-Remove the fork only when a published upstream version supplies both required
-behaviors and the key-escape/typed-satisfiability regressions pass against it;
+Remove the fork only when a published upstream version supplies all required
+behaviors and the key-escape, typed-satisfiability and root-key encoding regressions pass against it;
 update every caller and release edge together without compatibility shims.
+
+### Third patch: root named-key generation policy
+
+The XML generation followup adds the opt-in typed `RootObjectKeyPolicy`.
+It generates only names explicitly declared in the normalized root object's
+`properties` or `required`, with decoded UTF-8 bytes inside the configured
+bounds. Values still use the original property/pattern/additional intersection;
+dynamic root-name generation is disabled by this explicit generation policy.
+A separate normalized-root reference cache leaves nested JSON objects, default
+compilation, URI scopes and anchors unchanged. Named-field min/maxProperties
+combinations use a bounded, iterative grammar construction, not subset
+enumeration or a new JSON Schema solver. Backend-proven absence of values under
+this policy uses the distinct typed `RootObjectKeyPolicyError`; callers must
+not classify it as semantic `UnsatisfiableSchemaError` or silently prune tools.
+It does not assert that the original unrestricted schema is unsatisfiable.
+Original value schemas, including dynamic values and pending referenced
+schemas, retain their invalid/unsupported/resource errors before any policy-only
+capability error is returned. Default options serialize unchanged.
+This is independent of the initial package-publication fork.
+
+Before applying the policy, the original compiler fully compiles the same
+normalized root and all pending definitions on the same builder. Original
+empty-language, unsupported, invalid and resource errors retain their original
+types. Only after that succeeds can restricted generation fail with the policy
+error. This reuses normalized URI resolution and caches, does not re-fetch schema
+references, and consumes the caller's actual builder/fuel limits. No second
+byte-token parser is constructed. Unsupported original cardinality combinations
+remain unsupported rather than being enabled by the policy.

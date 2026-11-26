@@ -193,7 +193,10 @@ fn run_node(
         .collect::<Result<Vec<_>>>()?;
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -213,7 +216,8 @@ fn run_node(
     let out_elems: usize = out_shape.iter().product();
     let out_bytes = out_dtype.storage_bytes(out_elems);
     let mut output_buffer = ep.allocate(out_bytes.max(1), 256)?;
-    let output_strides = compute_contiguous_strides(&out_shape);
+    let output_strides = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         out_dtype,
