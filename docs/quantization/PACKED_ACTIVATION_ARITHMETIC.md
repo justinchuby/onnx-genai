@@ -73,7 +73,12 @@ rounded tail; every exposed activation block is overwritten before use.
 
 Contiguous, aligned F32 input, router logits, optional router weights and FC
 biases in BlockQuantizedMoE are borrowed through their final read. Strided or
-unaligned sources still materialize. Runtime metadata validation retains the
+unaligned sources convert into six disjoint regions of the same whole-operation
+workspace. Only non-borrowable present sources consume conversion capacity;
+optional holes consume none. These inputs can coexist across all serial experts,
+so their capacities add to the projection/FC/accumulator/packed regions. Eleven
+internal regions still use one owner and one admission, with no per-input quota
+operations or floating payload Vec. Runtime metadata validation retains the
 op's F32-only interface; reuse of the widening helper does not enable half or
 F64 MoE inputs. Projection banks and the final accumulator keep publication
 after every source read and successful expert, including when Y overlaps one of
