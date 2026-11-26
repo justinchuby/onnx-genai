@@ -2225,13 +2225,6 @@ async fn submit_completion(
     }
 }
 
-fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiError> {
-    tokenizer
-        .encode(prompt)
-        .map(|tokens| tokens.len())
-        .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
-}
-
 /// The text spelling of this model's image placeholder, if it declares one.
 ///
 /// Decoded from the declared token id rather than hardcoded, so the prompt
