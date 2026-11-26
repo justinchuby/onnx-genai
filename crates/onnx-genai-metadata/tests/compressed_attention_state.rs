@@ -251,13 +251,13 @@ fn compressed_state_has_an_exact_v1_8_schema_floor() {
         "{reported}"
     );
 
-    let future = current.replacen("schema_version: v1.8", "schema_version: v1.19", 1);
+    let future = current.replacen("schema_version: v1.8", "schema_version: v1.20", 1);
     let error =
         parse_metadata(&future, Some("yaml")).expect_err("unknown future versions fail closed");
     let reported = error.to_string();
     assert!(
-        reported.contains("schema version v1.19")
-            && reported.contains("reads up to v1.18")
+        reported.contains("schema version v1.20")
+            && reported.contains("reads up to v1.19")
             && !reported.contains("unknown variant"),
         "{reported}"
     );

@@ -1,6 +1,6 @@
-use super::{Entries, Entry, byte_len};
+use super::{Entries, Entry, GgufMetadataValue, byte_len};
 use onnx_runtime_ir::DataType;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 struct Reader<'a> {
     rest: &'a [u8],
@@ -73,6 +73,12 @@ fn scalar_width(kind: u32) -> Option<usize> {
 }
 
 pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
+    parse_with_metadata(data).map(|(entries, _)| entries)
+}
+pub(super) fn parse_with_metadata(
+    data: &[u8],
+) -> Result<(Entries, BTreeMap<&str, GgufMetadataValue<'_>>), String> {
+    let mut adapter_metadata = BTreeMap::new();
     let mut reader = Reader { rest: data };
     match reader.take(4)? {
         b"GGUF" => {}
@@ -116,6 +122,28 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
                 return Err("GGUF general.quantization_version must be UINT32".into());
             }
             quantization_version = Some(reader.u32()?);
+        } else if key == "general.type" || key.starts_with("adapter.") {
+            let value = match kind {
+                8 => GgufMetadataValue::String(
+                    reader
+                        .string()
+                        .map_err(|error| format!("GGUF metadata {key:?}: {error}"))?,
+                ),
+                6 => GgufMetadataValue::Float32(f32::from_le_bytes(
+                    reader
+                        .take(4)
+                        .map_err(|error| format!("GGUF metadata {key:?}: {error}"))?
+                        .try_into()
+                        .unwrap(),
+                )),
+                _ => {
+                    reader
+                        .metadata(kind, true)
+                        .map_err(|error| format!("GGUF metadata {key:?}: {error}"))?;
+                    GgufMetadataValue::Other { kind }
+                }
+            };
+            adapter_metadata.insert(key, value);
         } else {
             reader.metadata(kind, true)?;
         }
@@ -190,7 +218,7 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
         )?;
     }
     if entries.is_empty() {
-        return Ok(entries);
+        return Ok((entries, adapter_metadata));
     }
     let header = data.len() - reader.rest.len();
     let base = header
@@ -258,7 +286,7 @@ pub(super) fn parse(data: &[u8]) -> Result<Entries, String> {
             _ => return None,
         })
     }
-    Ok(entries)
+    Ok((entries, adapter_metadata))
 }
 
 fn insert(entries: &mut Entries, key: &str, entry: Entry) -> Result<(), String> {

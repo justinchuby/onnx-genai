@@ -3,12 +3,59 @@ use super::{JsonTarget, MemoryGovernor, MemoryLease};
 use anyhow::{Context, ensure};
 use onnx_genai_metadata::{AdapterArtifact, AdapterServiceContract, AdapterWeightArtifact};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
     path::Path,
 };
+
+/// Admitted saved factor storage; all portable arithmetic remains F32.
+#[derive(Clone, Copy)]
+enum FactorStorage {
+    F32,
+    F16,
+    Bf16,
+}
+impl FactorStorage {
+    fn declared(artifact: &AdapterArtifact) -> anyhow::Result<Self> {
+        match artifact.dtype.as_str() {
+            "float32" | "fp32" => Ok(Self::F32),
+            "float16" | "fp16" => Ok(Self::F16),
+            "bfloat16" | "bf16" => Ok(Self::Bf16),
+            dtype => anyhow::bail!(
+                "PEFT adapter {}@{} storage dtype {dtype:?} is unsupported; declare F32, F16 or BF16 ordinary linear factors",
+                artifact.identity,
+                artifact.version
+            ),
+        }
+    }
+    fn dtype(self) -> onnx_runtime_ir::DataType {
+        match self {
+            Self::F32 => onnx_runtime_ir::DataType::Float32,
+            Self::F16 => onnx_runtime_ir::DataType::Float16,
+            Self::Bf16 => onnx_runtime_ir::DataType::BFloat16,
+        }
+    }
+    fn width(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+    fn decode(self, bytes: &[u8]) -> f32 {
+        match self {
+            Self::F32 => f32::from_le_bytes(bytes.try_into().expect("validated F32 element width")),
+            Self::F16 => half::f16::from_bits(u16::from_le_bytes(
+                bytes.try_into().expect("validated F16 element width"),
+            ))
+            .to_f32(),
+            Self::Bf16 => half::bf16::from_bits(u16::from_le_bytes(
+                bytes.try_into().expect("validated BF16 element width"),
+            ))
+            .to_f32(),
+        }
+    }
+}
 
 pub(super) fn configuration(
     root: &Path,
@@ -73,9 +120,6 @@ pub(super) fn configuration(
     );
     Ok((bytes, lease))
 }
-pub(super) fn identity(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
 
 pub(super) fn load(
     root: &Path,
@@ -92,6 +136,7 @@ pub(super) fn load(
         ),
         "HF PEFT ordinary saved factors require scale_encoding alpha_over_rank; baked scales are a different artifact format and cannot be inferred"
     );
+    let storage = FactorStorage::declared(artifact)?;
     let (config_bytes, _config_lease) = configuration(root, weight, authority)?;
     let config: Value = serde_json::from_slice(&config_bytes).with_context(|| {
         format!(
@@ -224,9 +269,12 @@ pub(super) fn load(
             );
             let view=views.get(&name).with_context(||format!("PEFT tensor {name:?} is missing; embedding/Conv or named-adapter tensor spellings are not supported"))?;
             ensure!(
-                view.dtype == onnx_runtime_ir::DataType::Float32,
-                "PEFT tensor {name:?} dtype {:?} is unsupported; export F32 ordinary LoRA factors",
-                view.dtype
+                view.dtype == storage.dtype(),
+                "PEFT tensor {name:?} storage dtype {:?} disagrees with adapter {}@{} declared dtype {:?}; export both A/B in the declared F32/F16/BF16 storage dtype or correct the manifest",
+                view.dtype,
+                artifact.identity,
+                artifact.version,
+                storage.dtype()
             );
             ensure!(
                 view.shape == shape,
@@ -235,13 +283,14 @@ pub(super) fn load(
             );
             let mut factor = Vec::new();
             factor
-                .try_reserve_exact(view.data.len() / 4)
+                .try_reserve_exact(view.data.len() / storage.width())
                 .context("allocate governed normalized PEFT factor")?;
-            for value in view.data.chunks_exact(4) {
-                let value = f32::from_le_bytes(value.try_into().unwrap());
+            for value in view.data.chunks_exact(storage.width()) {
+                let value = storage.decode(value);
                 ensure!(
                     value.is_finite(),
-                    "PEFT tensor {name:?} contains nonfinite F32 values"
+                    "PEFT tensor {name:?} contains nonfinite {:?} factors after F32 normalization; export finite ordinary linear factors",
+                    storage.dtype()
                 );
                 factor.push(value);
             }
@@ -255,5 +304,5 @@ pub(super) fn load(
         views.keys().all(|name| used.contains(name)),
         "PEFT safetensors contains tensors without exact manifest bindings; map every saved linear module and reject modules_to_save/embedding/unknown tensor semantics"
     );
-    Ok((targets, identity(&config_bytes)))
+    Ok((targets, super::content_digest(&config_bytes)))
 }

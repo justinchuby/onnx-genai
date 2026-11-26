@@ -46,7 +46,9 @@ mod tool_protocol;
 mod turn_transaction;
 mod workflow;
 
-pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
+pub use adapters::{
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, select_portable_adapter_source,
+};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use audio::{
     AudioOutputFormat, EncodedAudio, StreamingResampler, encode_pcm16_wav, resample_planar,
