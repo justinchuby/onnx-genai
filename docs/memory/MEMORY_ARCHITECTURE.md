@@ -170,6 +170,15 @@ into its own reclaimable pool, whereas that capability requires actual backing
 retirement. The executor's generic pressure-parked lane must not be mistaken for
 an enabled CPU fast path. Each fitting CPU checkout/return still locks the pool,
 and each kernel still performs live execution refinement and backing validation.
+The provider-context transaction gate uses one atomic word for lifecycle and
+in-flight count. Normal Active entry/exit takes no context wait mutex; closure
+updates the same word to reject new entrants while preserving admitted guards.
+Only a closing context's last guard and quiescence waiters coordinate through a
+mutex/condition variable. This removes the two context-gate mutex acquisitions
+from a fitting checkout, not the pool mutex, atomic contention, owner validation
+or execution refinement. It is a structural cost reduction, not a measured
+latency claim. Completed CPU storage remains globally reclaimable in its pool;
+no new cross-run lease or untracked retained owner is introduced.
 
 The `cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant`
 regression wraps the real CPU provider only to count boundary calls. After one
@@ -206,6 +215,23 @@ contiguous/strided packed input layouts through the same compiled kernel and
 cached Deferred answer, and checks the precise changed staging demand each time.
 These counts establish avoided queries, not a measured latency improvement.
 
+CPU `BlockQuantizedMatMul` likewise admits projection scratch, final output staging
+and strided compressed-weight staging as one composite, together with any
+activation/bias conversion storage. Contiguous aligned F32 inputs need no
+conversion region; half, strided or unaligned inputs convert directly into
+separate admitted f32 regions while preserving bulk conversion implementations.
+Nonempty metadata is Deferred; live refinement resolves actual source layouts
+on every launch. The
+packed region is zero for contiguous weights and otherwise one logical packed
+payload rounded to f32 alignment. Dense-cache hits do not copy or initialize
+that region; retaining its admitted capacity permits a streamed fallback without
+another request. Hashing walks the source directly and payload copying starts
+only after complete backing binding. Input conversion has the same full-binding
+guard. Empty output validates source descriptors without reading any payload.
+This removes the former execution-time packed and input payload Vecs without
+adding pool or issuer
+calls; it establishes ownership/accounting, not a latency improvement.
+
 CPU `BlockQuantizedMoE` includes strided compressed-weight staging in the
 same whole-operation workspace as decode scratch, FC activation banks and the
 output accumulator. One serial byte lane holds the maximum non-borrowable FC
@@ -213,6 +239,70 @@ payload for a single expert, rounded to f32 storage alignment. It is additive to
 the other live regions, never the sum of FC payloads or an expert/top-k multiple.
 Contiguous expert tails borrow their original bytes even when the outer expert
 stride has padding or is negative; these layouts require no packed copy lane.
+
+The same composite includes conversion regions for input, router logits,
+optional router weights and the three optional FC biases. Their actual views
+select direct aligned F32 borrowing or an exact logical f32 snapshot. All six
+can remain live across experts; capacity is the sum of non-borrowable present
+sources, without a top-k multiplier. Absent optional sources use no region.
+A shared private descriptor serves MatMul and MoE storage validation/borrowing;
+MoE still rejects non-F32 sources. Full binding precedes conversion, routing,
+hashing and compute. A twelfth outer region contains the private typed routing
+arena, so internal partitioning adds no independent owner, pool or quota call.
+
+The routing arena holds `rows * min(k, experts)` decisions and stable bucket
+indices, expert cursors/prefixes, TopK indices/selected weights, and softmax
+storage only without aggregation weights. Checked typed layouts preserve their
+maximum alignment, including padding in whole-operation admission. Decisions and
+bucket indices stay uninitialized until every logical entry is written; a
+published plan borrows immutable typed slices through the dispatch. Counts and
+prefixes group routes in O(experts + routes), preserving expert order and each
+expert's token order. TopK comparisons, special float handling and normalization
+retain one shared slice-based numerical implementation; grouping starts only
+after score-order denominators are complete. The existing owned routing helper
+for other CPU MoE paths delegates to that same checked implementation.
+
+BlockQuantizedMoE no longer creates routing payload Vecs or per-expert task Vecs.
+Rank/index conversion metadata and the plain MoE operator's owned grouping plan
+remain.
+Counts/prefix initialization and index indirection have costs; this proves
+ownership and accounting, not zero mallocs or a measured latency improvement.
+
+Plain floating `MoE` includes eight named source regions beside its two FC
+banks and output accumulator in one eleven-region operation workspace. Aligned
+contiguous F32 sources borrow their original storage; half, strided and unaligned
+sources snapshot to exact f32 regions, including expert weights and optional
+biases. Shape-only nonempty preparation is Deferred because strides and addresses
+are not metadata facts; live refinement computes the current bound without
+repeating the metadata hook. Complete binding precedes every floating payload
+read, including bias conversion. All source snapshots remain live until final
+output publication, preserving input/output overlap. Empty output still validates
+source descriptors and shapes but reads no payload and reserves no conversions.
+Plain MoE's owned routing/grouping plan and optional MLAS batch metadata remain;
+this change removes floating source payload Vecs, not every allocation.
+
+ONNX integer `QMoE` now uses the same arena and immutable task views. Its two FC
+banks, score-order contribution storage, decoder scratch and routing arena form
+one five-region operation workspace. Shape-only bounds include FC2's expert axis
+and aggregation presence; the existing Ready memo path remains reusable. X/router
+copies and routing follow complete binding. Other quantized input materialization
+and weight-admission metadata retain their existing paths.
+
+Routing decisions preserve original score order and retain that decision index
+as the contribution slot. Stable expert bucketing never renumbers slots; QMoE's
+final +0, row-major, score-order `+=` scatter remains unchanged. After routing,
+dead TopK index storage becomes the ascending active-expert list. After bucket
+writes complete, dead cursors become counts derived from immutable prefixes.
+A private-field `ExpertGroupCounts` view publishes unique membership and counts
+without another map, mapping closure or raw-iterator uniqueness contract. Metrics
+retain their zero-count membership semantics in checked fixtures and preserve
+lock order, atomics and saturated accumulated fields.
+
+Prefetch still checks eligibility before consuming selected IDs, taking payload
+locks, pinning entries or requesting grants. Only expert IDs and weight loading
+cross to the worker; borrowed task views and workspace remain on the main thread
+through scope join, including failures. Zero-row execution uses an empty immutable
+plan and retains the prior metrics path without reserving routing storage.
 
 For nonempty output, shape-only preparation returns `Deferred`: it cannot know
 strides, and a conservative reservation would retain unused high-water capacity.

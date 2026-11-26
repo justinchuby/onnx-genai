@@ -65,7 +65,7 @@ impl<'a> ProjectionScratch<'a> {
         let capacity = std::mem::size_of_val(self.storage);
         if bytes > capacity {
             return Err(EpError::KernelFailed(format!(
-                "packed byte lane needs {bytes} bytes, but its admitted region has {capacity}; prepare and admit the complete projection workspace before reading packed weights"
+                "projection byte storage needs {bytes} bytes, but its admitted region has {capacity}; prepare and admit the complete operation workspace before accessing payloads"
             )));
         }
         self.initialized_prefix = 0;

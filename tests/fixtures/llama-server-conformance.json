@@ -56,7 +56,9 @@
       "requirement": "Byte-exact replay, cancellation, replacement, bounded retention/expiry and frontend reload",
       "evidence": [
         "replay",
-        "browser"
+        "browser",
+        "literal_native_rollback",
+        "literal_native_cancel"
       ],
       "remaining": [
         "Finish destructive native-cache rollback audit for device-owned state; refresh full expiry/pressure/cancellation acceptance."
@@ -89,7 +91,8 @@
         "aliases_stream",
         "alternate_protocols",
         "messages_errors",
-        "tool_roundtrip"
+        "tool_roundtrip",
+        "literal_http_tool_lark"
       ],
       "remaining": [
         "Cross-protocol tools/reasoning/cancellation event conformance; chat-only assertions cannot close alternate-protocol rows."
@@ -103,10 +106,34 @@
         "grammar_native",
         "progress",
         "cli_native_generation_runtime",
-        "cli_native_trace_runtime"
+        "cli_native_trace_runtime",
+        "literal_canonical_splits",
+        "literal_composition",
+        "literal_byte_boundaries",
+        "literal_atomic_pipeline",
+        "literal_work_budget",
+        "literal_spec_budget",
+        "literal_typed_buffer",
+        "literal_frontier",
+        "literal_error_classification",
+        "literal_native_rollback",
+        "literal_native_admission",
+        "literal_native_cancel",
+        "literal_http_decoded",
+        "literal_http_raw",
+        "literal_http_byte_eof",
+        "literal_http_quota",
+        "literal_http_preflight",
+        "literal_ws_empty_priority",
+        "literal_ws_transfer",
+        "literal_native_regex",
+        "literal_native_lark",
+        "literal_http_tool_lark"
       ],
       "remaining": [
-        "Remaining contextual decoder/DFA assertions; continuous batching progress; full control/default/reporting cross-product."
+        "Bounded nonempty literal Replace after proven fused byte decoders is source-linked; Regex/empty contextual Replace, other unproved decoder chains and general contextual DFA/model/device coverage remain open or explicitly unsupported. Raw grammar retains vocabulary-byte semantics. State/frontier/work/specification limits are explicit capability bounds, not universal compatibility.",
+        "Continuous batching progress and the full control/default/reporting cross-product remain open. These source definitions do not claim fresh complete-cohort execution.",
+        "Source-linked decoded Regex/Lark Native Engine goldens and HTTP tool-Lark goldens do not add a public arbitrary Regex/decoded-Lark wire field; HTTP grammar deliberately retains raw-byte semantics. Broader combinations and fresh final-source execution remain required."
       ]
     },
     {
@@ -159,7 +186,9 @@
         "cli_native_transcription_mp3",
         "cli_native_transcription_prompt",
         "cli_native_audio_pcm_policy",
-        "native_opus_workflow"
+        "native_opus_workflow",
+        "literal_ws_empty_priority",
+        "literal_ws_transfer"
       ],
       "remaining": [
         "Bare GGUF import, filename quantization, selective sidecars; broader codec/Opus encoding and DSP permutations, video/joint decision heads; realtime forcing/pressure/device acceptance. CLI policy and Opus Native-head links are synthetic fixture evidence, not all-format or HTTP media acceptance."
@@ -1239,6 +1268,248 @@
       "execution_contract": "Actual synthetic Native CPU generation and raw embedding through in-process HTTP with explicitly Baked GGUF-only F32/F16/BF16 sources and zero/missing source alpha; no installed launcher or device-fused proof",
       "assertions": "Catalogue/default/request scale flows change actual generated tokens and independently expected raw embedding coordinates without applying deliberately nonunity manifest alpha. Signed/zero scales preserve base projection, request overrides leave defaults intact, and invalid IDs preserve subsequent generation. F32 +/-10000 and independently authored half +/-8192 embedding coordinates distinguish incorrect static scaling.",
       "source_markers": []
+    },
+    "literal_canonical_splits": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/byte_stream.rs",
+      "target": "lib",
+      "test": "byte_stream::tests::fused_literal_replace_matches_canonical_decoder_at_every_byte_split",
+      "execution_contract": "Pure bounded decoder state with independent canonical tokenizers oracle; no Native inference or HTTP claim",
+      "assertions": "Nonempty literal replacements match canonical decoding across split Unicode, overlap, deletion and EOF.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_composition": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/byte_stream.rs",
+      "target": "lib",
+      "test": "byte_stream::tests::literal_replace_composes_in_order_and_rejects_expansion_before_mutation",
+      "execution_contract": "Pure bounded decoder state with independent canonical tokenizers oracle; no Native inference or HTTP claim",
+      "assertions": "Ordered literal composition and expansion refusal preserve the previous state.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_byte_boundaries": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/byte_stream.rs",
+      "target": "lib",
+      "test": "byte_stream::tests::literal_stream_preserves_canonical_byte_groups_and_special_boundaries",
+      "execution_contract": "Pure bounded decoder state with independent canonical tokenizers oracle; no Native inference or HTTP claim",
+      "assertions": "ByteFallback and ByteLevel use their distinct canonical invalid-byte, ordinary-token and special-token boundaries.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_atomic_pipeline": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/byte_stream.rs",
+      "target": "lib",
+      "test": "byte_stream::tests::replacement_second_stage_failure_preserves_the_entire_fork",
+      "execution_contract": "Pure bounded decoder state with independent canonical tokenizers oracle; no Native inference or HTTP claim",
+      "assertions": "Failure in the second replacement leaves the entire pipeline unchanged and a funded retry succeeds.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_work_budget": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/byte_stream.rs",
+      "target": "lib",
+      "test": "byte_stream::tests::literal_work_budget_counts_intermediate_expansion_before_later_deletion",
+      "execution_contract": "Pure bounded decoder state with independent canonical tokenizers oracle; no Native inference or HTTP claim",
+      "assertions": "Work accounting includes intermediate expansion before deletion, refuses a small budget and preserves retry state.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_spec_budget": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/byte_stream.rs",
+      "target": "lib",
+      "test": "byte_stream::tests::literal_spec_preflight_bounds_each_stage_and_composed_borrowed_sizes",
+      "execution_contract": "Pure bounded decoder state with independent canonical tokenizers oracle; no Native inference or HTTP claim",
+      "assertions": "Borrowed metadata preflight accepts bounded composition and rejects individual or cumulative oversized specifications at the exact stage.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_typed_buffer": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/byte_stream.rs",
+      "target": "lib",
+      "test": "byte_stream::tests::oversized_identity_and_transformed_deltas_keep_typed_buffer_rejection",
+      "execution_contract": "Pure bounded decoder state with independent canonical tokenizers oracle; no Native inference or HTTP claim",
+      "assertions": "Identity and transformed raw deltas retain exact typed buffer limits without mutation, allowing candidate rejection instead of internal failure.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_frontier": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/response_constraint.rs",
+      "target": "lib",
+      "test": "response_constraint::tests::literal_frontier_deduplicates_large_equivalent_vocab_without_losing_distinct_tokens",
+      "execution_contract": "Actual tagged-token constraint frontier over an authored 50k-piece vocabulary; no Native inference claim",
+      "assertions": "Equivalent effects deduplicate while distinct viable/impossible tokens and EOS retain their own predicates.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_error_classification": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/config.rs",
+      "target": "lib",
+      "test": "config::processor_error_classification_tests::allocation_failure_retains_its_type_instead_of_becoming_invalid_configuration",
+      "execution_contract": "Typed processor-error classification; deterministic allocator capacity refusal, not physical OOM",
+      "assertions": "Allocator errors preserve their downcast type and ordinary unsupported configuration retains its request-error marker.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_native_rollback": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/src/engine/runtime.rs",
+      "target": "lib",
+      "test": "engine::runtime::literal_rollback_tests::native_literal_active_budget_failure_restores_kv_and_same_session_retry",
+      "execution_contract": "Actual Native CPU fixture with decoder-forward checkpoints and same EngineSession retry",
+      "assertions": "Active expansion/run-budget failures after Native KV advance restore actual cache contents, logical state and resource counters, publish no partial output and permit exact same-session retry.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_native_admission": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/tests/literal_decoder.rs",
+      "target": "test:literal_decoder",
+      "test": "native_literal_decoder_governor_denies_before_generation_and_independent_retry_recovers",
+      "execution_contract": "Actual Native CPU graph/KV fixture through Engine, not HTTP",
+      "assertions": "Actual host governor refuses before admission callback; failed compilation releases its workspace and the same Engine generates canonical JSON7 on independent valid retries.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_native_cancel": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/tests/literal_decoder.rs",
+      "target": "test:literal_decoder",
+      "test": "native_literal_byte_group_cancellation_discards_pending_state_and_retries",
+      "execution_contract": "Actual Native CPU graph/KV fixture through Engine, not HTTP",
+      "assertions": "Real per-forward cancellation interrupts pending byte groups before cold turn commit, publishes no staged callbacks and independently retries to canonical output.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_http_decoded": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/literal_replace_http.rs",
+      "target": "test:literal_replace_http",
+      "test": "native_literal_replace_masks_decoded_content_and_streams_canonical_output",
+      "execution_contract": "Actual Native CPU fixture through in-process HTTP router; buffered/SSE as asserted",
+      "assertions": "Decoded-content JSON-schema sampling follows canonical literal replacement for whole/split source tokens, with exact buffered/SSE output and completion usage.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "literal_http_raw": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/literal_replace_http.rs",
+      "target": "test:literal_replace_http",
+      "test": "native_literal_replace_preserves_raw_grammar_input_bytes",
+      "execution_contract": "Actual Native CPU fixture through in-process HTTP router; buffered/SSE as asserted",
+      "assertions": "Raw grammar continues to constrain model vocabulary bytes while publication uses canonical literal decoding.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "literal_http_byte_eof": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/literal_replace_http.rs",
+      "target": "test:literal_replace_http",
+      "test": "native_literal_byte_runs_match_canonical_replacement_at_eof_in_buffered_and_sse",
+      "execution_contract": "Actual Native CPU fixture through in-process HTTP router; buffered/SSE as asserted",
+      "assertions": "Actual invalid byte-group generation follows distinct canonical ByteFallback/ByteLevel EOF semantics in buffered and SSE responses.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "literal_http_quota": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/literal_replace_http.rs",
+      "target": "test:literal_replace_http",
+      "test": "native_literal_workspace_denial_is_json_before_sse_and_valid_independent_request_recovers",
+      "execution_contract": "Actual Native CPU fixture through in-process HTTP router; buffered/SSE as asserted",
+      "assertions": "Host quota refusal is sanitized JSON429 with Retry-After1 before SSE; a sufficiently funded independent request generates normally.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "literal_http_preflight": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/literal_replace_http.rs",
+      "target": "test:literal_replace_http",
+      "test": "native_literal_deferred_semantic_errors_precede_sse_and_valid_retry_remains_usable",
+      "execution_contract": "Actual Native CPU fixture through in-process HTTP router; buffered/SSE as asserted",
+      "assertions": "Invalid schema and unsupported contextual decoder fail before SSE; unforced Regex publication stays canonical and valid independent requests recover.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "literal_ws_empty_priority": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/realtime/websocket.rs",
+      "target": "lib",
+      "test": "realtime::websocket::tests::websocket_empty_transcription_commit_precedes_denied_literal_decoder_grant",
+      "execution_contract": "Actual Native CPU workflow through real TCP WebSocket; no mock inference",
+      "assertions": "Empty transcription commit preserves its typed protocol error before denied workspace admission; nonempty commit reaches the real governor refusal.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "literal_ws_transfer": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/realtime/websocket.rs",
+      "target": "lib",
+      "test": "realtime::websocket::tests::websocket_native_literal_prepared_transfer_flushes_eof_and_releases_custom_budget",
+      "execution_contract": "Actual Native CPU workflow through real TCP WebSocket; no mock inference",
+      "assertions": "Actual Native response transfers the prepared literal decoder, flushes held canonical JSON7 at EOF with usage1 under a one-byte limit; overflow publishes no text, closes fatally by existing policy, releases host workspace and independent same-Engine connection retries.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "literal_native_regex": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/tests/literal_decoder.rs",
+      "target": "test:literal_decoder",
+      "test": "native_literal_decoded_regex_masks_real_tokens_rejects_unreachable_output_and_retries",
+      "execution_contract": "Actual Native CPU Engine with whole/split authored source tokens, decoder-forward checkpoints and cold callbacks",
+      "assertions": "Decoded Regex masks a higher-biased incompatible token, emits canonical7 with exact token IDs, rejects unreachable output after real Native forward without publication, and permits same-Engine independent retry.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_native_lark": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-engine/tests/literal_decoder.rs",
+      "target": "test:literal_decoder",
+      "test": "native_literal_decoded_lark_masks_real_tokens_rejects_unreachable_output_and_retries",
+      "execution_contract": "Actual Native CPU Engine with whole/split authored source tokens, decoder-forward checkpoints and cold callbacks",
+      "assertions": "Decoded Lark masks a higher-biased incompatible token, emits canonical7 with exact token IDs, rejects unreachable output after real Native forward without publication, and permits same-Engine independent retry.",
+      "source_markers": [],
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml"
+    },
+    "literal_http_tool_lark": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/literal_replace_http.rs",
+      "target": "test:literal_replace_http",
+      "test": "native_literal_tool_lark_masks_decoded_envelope_before_http_and_sse_publication",
+      "execution_contract": "Actual Native CPU through in-process HTTP router using declared tagged-json tool-protocol Lark; buffered and SSE",
+      "assertions": "Literal-decoded weather/Paris tool envelope masks a higher-biased bad token before generation, yields exact typed tool fragments and usage1 without raw text leakage, rejects invalid schema before SSE and retries on the same router.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     }
   },
   "routes": [
@@ -1773,7 +2044,13 @@
       "evidence": [
         "chat",
         "tool_roundtrip",
-        "grammar_native"
+        "grammar_native",
+        "literal_http_decoded",
+        "literal_http_raw",
+        "literal_http_byte_eof",
+        "literal_http_quota",
+        "literal_http_preflight",
+        "literal_http_tool_lark"
       ],
       "assertions": "Actual streamed generation/usage, tools and raw constrained output.",
       "remaining": [
@@ -1940,7 +2217,9 @@
       "scope": "server",
       "evidence": [
         "realtime",
-        "realtime_duplex"
+        "realtime_duplex",
+        "literal_ws_empty_priority",
+        "literal_ws_transfer"
       ],
       "assertions": "Real Native websocket text/duplex cancellation and budget behavior.",
       "remaining": [

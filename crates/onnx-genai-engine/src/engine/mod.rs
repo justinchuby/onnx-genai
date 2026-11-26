@@ -1598,7 +1598,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![42])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert_eq!(
             chain.names(),
             vec![
@@ -1640,7 +1640,7 @@ mod tests {
             ..Default::default()
         };
 
-        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None)?;
 
         assert_eq!(
             chain.names(),
@@ -1665,7 +1665,7 @@ mod tests {
             top_k: 2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         assert_eq!(
@@ -1680,7 +1680,7 @@ mod tests {
             greedy: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 0.0];
         assert_eq!(
@@ -1709,7 +1709,7 @@ mod tests {
         };
         // A custom sampler is not necessarily greedy, so it keeps the warpers
         // even on these (greedy-by-default) options.
-        let chain = build_processor_chain(&options, None, true).unwrap();
+        let chain = build_processor_chain(&options, None, true, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         let mut sampler = LastTokenSampler;
@@ -1725,7 +1725,7 @@ mod tests {
     #[test]
     fn default_processor_chain_is_empty_for_unchanged_defaults() {
         let options = GenerateOptions::default();
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert!(chain.names().is_empty());
     }
 
@@ -1736,7 +1736,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![7])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![7],
             ..Default::default()
@@ -1753,7 +1753,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![2, 3])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![1, 2, 3],
             ..Default::default()
@@ -1780,6 +1780,7 @@ mod tests {
             },
             None,
             false,
+            None,
         )
         .unwrap();
         let context = ProcessorContext {

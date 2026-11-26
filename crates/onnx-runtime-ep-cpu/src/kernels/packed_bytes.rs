@@ -15,6 +15,7 @@ pub(super) struct PackedByteDigest {
 /// by the owning EP, just as for other CPU tensor readers.
 #[derive(Debug)]
 pub(super) struct PackedByteSource<'a> {
+    #[cfg(test)]
     op: &'static str,
     origin: *const u8,
     shape: &'a [usize],
@@ -27,6 +28,7 @@ impl<'a> PackedByteSource<'a> {
     pub(super) fn full(op: &'static str, view: &'a TensorView<'_>) -> Result<Self> {
         let len = validate_host_storage::<u8>(op, "packed bytes", view)?;
         Ok(Self {
+            #[cfg(test)]
             op,
             // Empty geometry must not perform origin/offset pointer arithmetic.
             origin: if len == 0 {
@@ -80,6 +82,7 @@ impl<'a> PackedByteSource<'a> {
             unsafe { view.data_ptr::<u8>().offset(offset) }
         };
         Ok(Self {
+            #[cfg(test)]
             op,
             origin,
             shape,
@@ -100,6 +103,11 @@ impl<'a> PackedByteSource<'a> {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Descriptor-only sizing: no payload slice or read before admission.
+    pub(super) fn copy_bytes(&self) -> usize {
+        if self.dense { 0 } else { self.len }
     }
 
     pub(super) fn borrowed(&self) -> Option<&'a [u8]> {
@@ -161,8 +169,8 @@ impl<'a> PackedByteSource<'a> {
         Ok(unsafe { std::slice::from_raw_parts(target.as_ptr().cast::<u8>(), self.len) })
     }
 
-    /// Standalone MatMul fallback; reserve explicitly before initializing any
-    /// element so allocation failure is reported instead of an OOM-capacity panic.
+    /// Test-only materialization oracle; execution always uses an admitted lane.
+    #[cfg(test)]
     pub(super) fn owned(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(self.len).map_err(|source| {

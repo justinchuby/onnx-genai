@@ -4056,4 +4056,6 @@ mod tests {
 mod decoded_projection;
 mod packed_bytes;
 mod packed_projection;
+mod projection_input;
+pub(crate) mod routing_workspace;
 pub(crate) mod weight_cache;

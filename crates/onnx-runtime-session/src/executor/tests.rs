@@ -16848,7 +16848,7 @@ fn zero_retention_cpu() -> CpuExecutionProvider {
 }
 
 #[test]
-fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() {
+fn streamed_projection_deferred_prepare_and_run_use_the_declared_step_workspace() {
     use onnx_runtime_memory_api::{DeviceKey, Tier};
     use onnx_runtime_memory_governor::{
         HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
@@ -16900,14 +16900,13 @@ fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() 
             &[0.25f32.to_le_bytes(); 35].repeat(rows).concat(),
         )
         .unwrap();
-        let requirement = executor
+        let report = executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
-            .unwrap()
-            .require_complete()
             .unwrap();
-        assert!(requirement.step().bytes > 0);
-        assert_eq!(requirement.step().lifetime, WorkspaceLifetime::StepScoped);
-        assert!(manager.process_used(Tier::Host) >= requirement.step().bytes);
+        assert!(
+            report.require_complete().is_err(),
+            "packed strides require live refinement"
+        );
         let output = executor.run(&[("a", &input)]).unwrap();
         assert_eq!(output[0].shape, [rows, 13]);
         assert_eq!(
@@ -16918,6 +16917,10 @@ fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() 
             books.used(Tier::Host),
             manager.process_used(Tier::Host),
             "zero retention must fund only physical workspace backing"
+        );
+        assert!(
+            manager.process_used(Tier::Host) > 0,
+            "live refinement must admit real workspace"
         );
     }
     drop(executor);
@@ -17214,15 +17217,12 @@ fn symbolic_capability_decline_cannot_become_a_no_workspace_promise() {
         &[0.25f32.to_le_bytes(); 105].concat(),
     )
     .unwrap();
+    let report = executor
+        .prepare_with_device_bindings(&[("a", &input)], &mut [])
+        .unwrap();
     assert!(
-        executor
-            .prepare_with_device_bindings(&[("a", &input)], &mut [])
-            .unwrap()
-            .require_complete()
-            .unwrap()
-            .step()
-            .bytes
-            > 0
+        report.require_complete().is_err(),
+        "a metadata declaration may defer live demand, never promise zero workspace"
     );
     assert_eq!(
         executor.run(&[("a", &input)]).unwrap()[0].to_vec_f32(),
