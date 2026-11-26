@@ -3076,3 +3076,43 @@ outputs and direct f32 outputs with real allocation positive controls. Existing
 4096 warm iterations also execute a widened source within the same retained
 allocation identity without issuer callbacks, including zero-byte callbacks.
 Rank-sized metadata can still allocate. No CUDA-runtime or latency claim is made.
+
+
+### BatchNormalization uses one storage snapshot and read-only channel parameters
+
+Inference BatchNormalization now has its own ops-cnn module and Metadata
+workspace registration. It replaces the separate storage/Acc copies of five
+inputs and the Acc/storage output Vecs with one StepScoped
+`numel(X) * sizeof(storage T)` lane. The complete X snapshot is normalized in
+place; real Y is published only after all input and parameter reads finish.
+Four private validated rank-one readers consume the original channel parameters
+without copying them. Parameters may overlap X, real Y or one another because
+those tensors remain untouched throughout computation. There is no per-channel
+grant, new owner, pool or public workspace API.
+
+Metadata checks five present same-storage-dtype inputs, parameter shape `[C]`,
+complete Y shape/dtype, rank, checked dense/spatial products and storage capacity.
+N=0 needs no scratch while retaining parameter validation; C=0 or empty spatial
+axes keep the previous refusal. Runtime proves Host access, rank/strides and
+computable address extrema before binding scratch. Channel readers support
+negative strides and unaligned origins, with singleton strides normalized to
+zero. Checked i128 extrema bound pointer arithmetic to an addressable host span;
+actual backing allocation bounds and lifetime remain the owning EP's contract.
+
+Each value keeps the original `(x-mean)/sqrt(variance+epsilon)*scale+bias`
+operation order. Computation stays f64 for f64 storage and f32 otherwise; each
+completed result is converted to storage T exactly once in the snapshot. All
+existing norm-family arithmetic tests remain, now using prepared execution.
+There is no compatibility alias for the old BatchNorm factory/module path.
+
+New tests check four storage types and exact result bits, reversed/strided
+parameters, shifted X/Y overlap and each parameter aliasing both or each other,
+Host/address guards before writes, whole-binding refusal/canaries and fresh
+uninitialized scratch. Real allocator controls observe both former X and
+channel-sized copies; repeated calls admit no tensor/channel-sized payload.
+A retained allocation runs 4096 cycles without issuer callbacks, with positive
+zero-byte controls and exact idle trim/refund. Public encoded-model tests cover
+two nodes sharing one peak, dynamic channel counts, empty batch, one-byte-short
+refusal and trim/readmission. Real ORT fixtures require cpu_ep assignment with
+fallback disabled across dynamic shapes. These establish correctness and
+allocation invariants, not inference latency or CUDA execution.
