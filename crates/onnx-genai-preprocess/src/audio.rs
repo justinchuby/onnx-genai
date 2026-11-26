@@ -676,17 +676,14 @@ pub fn decode_audio(
         0
     };
     let mut decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder> = if is_opus {
+        let mut options = AudioDecoderOptions::default();
+        options.gapless = false;
         Box::new(
-            symphonia_opus::OpusDecoder::try_new(
-                params,
-                &AudioDecoderOptions {
-                    gapless: false,
-                    ..Default::default()
-                },
-            )
-            .map_err(|source| AudioPreprocessError::Codec {
-                context: format!("cannot initialize raw {container} Opus track {track_id}"),
-                source,
+            symphonia_opus::OpusDecoder::try_new(params, &options).map_err(|source| {
+                AudioPreprocessError::Codec {
+                    context: format!("cannot initialize raw {container} Opus track {track_id}"),
+                    source,
+                }
             })?,
         )
     } else {
