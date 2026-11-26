@@ -80,21 +80,21 @@ impl<T: Copy + Default, const N: usize> TypedWorkspace<T, N> {
     }
 }
 
-/// Float payloads plus route indices within the same admitted Host lane.
+/// Typed payloads plus route indices within the same admitted Host lane.
 /// This composes layouts only: no allocation, ownership or admission policy.
-pub(super) struct FloatIndexWorkspace<const N: usize> {
+pub(super) struct ValueIndexWorkspace<T: Copy + Default, const N: usize> {
     op: &'static str,
-    floats: TypedWorkspace<f32, N>,
+    values: TypedWorkspace<T, N>,
     indices: TypedWorkspace<usize, 1>,
     layout: WorkspaceLayout<2>,
 }
-impl<const N: usize> FloatIndexWorkspace<N> {
+impl<T: Copy + Default, const N: usize> ValueIndexWorkspace<T, N> {
     pub(super) fn new(
         op: &'static str,
-        floats: [(&str, usize); N],
+        values: [(&str, usize); N],
         indices: (&str, usize),
     ) -> Result<Self> {
-        let floats = TypedWorkspace::new(op, floats)?;
+        let values = TypedWorkspace::new(op, values)?;
         let indices = TypedWorkspace::new(op, [indices])?;
         let region = |r: WorkspaceRequirement| {
             Layout::from_size_align(r.bytes as usize, r.alignment).map_err(|e| {
@@ -104,15 +104,15 @@ impl<const N: usize> FloatIndexWorkspace<N> {
             })
         };
         let layout = WorkspaceLayout::new([
-            region(floats.requirement())?,
+            region(values.requirement())?,
             region(indices.requirement())?,
         ])
         .map_err(|e| {
-            EpError::KernelFailed(format!("{op}: cannot combine float/index workspace: {e}"))
+            EpError::KernelFailed(format!("{op}: cannot combine value/index workspace: {e}"))
         })?;
         Ok(Self {
             op,
-            floats,
+            values,
             indices,
             layout,
         })
@@ -130,16 +130,16 @@ impl<const N: usize> FloatIndexWorkspace<N> {
     pub(super) unsafe fn with_buffers<R>(
         &self,
         view: Option<WorkspaceView>,
-        body: impl for<'a> FnOnce([&'a mut [f32]; N], &'a mut [usize]) -> Result<R>,
+        body: impl for<'a> FnOnce([&'a mut [T]; N], &'a mut [usize]) -> Result<R>,
     ) -> Result<R> {
-        let [floats, indices] = self
+        let [values, indices] = self
             .layout
             .bind(view)
             .map_err(|e| EpError::KernelFailed(format!("{}: {e}", self.op)))?;
         // SAFETY: complete outer layout validated before either subregion is
         // initialized; caller proves lifetime, exclusivity and Host access.
         unsafe {
-            self.floats.with_buffers(Some(floats), |f| {
+            self.values.with_buffers(Some(values), |f| {
                 self.indices.with_buffers(Some(indices), |[i]| body(f, i))
             })
         }
@@ -401,7 +401,7 @@ mod tests {
     }
     #[test]
     fn mixed_regions_initialize_fresh_backing_and_refuse_incomplete_outer_layout() {
-        let plan = FloatIndexWorkspace::new(
+        let plan = ValueIndexWorkspace::<f32, _>::new(
             "mixed fixture",
             [("values", 3), ("empty", 0)],
             ("indices", 3),

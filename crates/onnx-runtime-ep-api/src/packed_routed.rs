@@ -209,6 +209,58 @@ pub fn group_layout(op: Op, x: &[TensorView], y: &TensorMut) -> Result<GroupLayo
     group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, Some(y.shape))
 }
 
+/// Grouped projection shape/type contract for planning without tensor reads.
+pub fn group_metadata_layout(
+    op: Op,
+    x: &[TensorMetadata<'_>],
+    y: &[OutputMetadata<'_>],
+) -> Result<GroupLayout> {
+    if !matches!(op, Op::GroupedMatMul { .. }) || !(3..=4).contains(&x.len()) || y.len() != 1 {
+        return Err(fail(
+            op,
+            "expected activation, weights, routes, optional bias and one output; bind the complete grouped projection signature",
+        ));
+    }
+    let mut dtypes = [DataType::Undefined; 4];
+    for (index, input) in x.iter().enumerate() {
+        if index < 3
+            && (!input.present && !input.shape.contains(&0) || input.dtype == DataType::Undefined)
+        {
+            return Err(fail(
+                op,
+                format!(
+                    "required input {index} is absent; bind activation, weights and integer routes"
+                ),
+            ));
+        }
+        if index < 3 || input.present {
+            dtypes[index] = input.dtype;
+        }
+        if dtypes[index] != DataType::Undefined {
+            elements(op, input.shape)?.checked_mul(input.dtype.byte_size()).ok_or_else(|| fail(op, format!("input {index} shape {:?} exceeds addressable bytes; reduce tensor dimensions", input.shape)))?;
+        }
+    }
+    op.validate_dtypes(&dtypes).map_err(EpError::KernelFailed)?;
+    let out = match &y[0] {
+        OutputMetadata::Tensor { dtype, shape } if *dtype == x[0].dtype => Some(shape.as_ref()),
+        OutputMetadata::Unresolved { dtype } if *dtype == x[0].dtype => None,
+        _ => {
+            return Err(fail(
+                op,
+                format!(
+                    "output must have dtype {:?}; bind a matching projection result",
+                    x[0].dtype
+                ),
+            ));
+        }
+    };
+    let bias = x
+        .get(3)
+        .filter(|b| b.present && b.dtype != DataType::Undefined)
+        .map(|b| b.shape);
+    group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, out)
+}
+
 /// Validate live descriptors through the same device-independent geometry used
 /// for metadata planning. CPU Host access is established by its own reader.
 pub fn packed_group_layout(
@@ -723,5 +775,139 @@ mod packed_metadata_tests {
         bad = m;
         bad[1].shape = &[1];
         assert!(packed_group_metadata_layout(&bank, &bad, &out).is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_metadata_tests {
+    use super::*;
+    use crate::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::DeviceId;
+    #[test]
+    fn native_metadata_matches_live_geometry_for_both_transposes_and_optional_bias() {
+        for transposed in [false, true] {
+            for dt in [
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Float32,
+                DataType::Float64,
+            ] {
+                for bias in 0..3 {
+                    let op = Op::GroupedMatMul { transposed };
+                    let w = if transposed { [3, 5, 4] } else { [3, 4, 5] };
+                    let mut x = vec![
+                        TensorMetadata::new(dt, &[2, 4], true),
+                        TensorMetadata::new(dt, &w, true),
+                        TensorMetadata::new(DataType::Int64, &[2, 2], true),
+                    ];
+                    if bias == 1 {
+                        x.push(TensorMetadata::new(DataType::Undefined, &[], false));
+                    } else if bias == 2 {
+                        x.push(TensorMetadata::new(dt, &[3, 5], true));
+                    }
+                    let strides = x
+                        .iter()
+                        .map(|v| onnx_runtime_ir::compute_contiguous_strides(v.shape))
+                        .collect::<Vec<_>>();
+                    let views = x
+                        .iter()
+                        .zip(&strides)
+                        .map(|(v, s)| {
+                            if v.dtype == DataType::Undefined {
+                                TensorView::absent(v.dtype)
+                            } else {
+                                TensorView::new(
+                                    DevicePtr(16usize as *const _),
+                                    v.dtype,
+                                    v.shape,
+                                    s,
+                                    DeviceId::cuda(0),
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let out = TensorMut::new(
+                        DevicePtrMut(16usize as *mut _),
+                        dt,
+                        &[2, 2, 5],
+                        &[10, 5, 1],
+                        DeviceId::cuda(0),
+                    );
+                    let live = group_layout(op, &views, &out).unwrap();
+                    for out in [
+                        OutputMetadata::tensor(dt, &[2, 2, 5]),
+                        OutputMetadata::Unresolved { dtype: dt },
+                    ] {
+                        let l = group_metadata_layout(op, &x, &[out]).unwrap();
+                        assert_eq!(
+                            (l.k, l.n, l.groups, l.routes, l.lanes, l.bias),
+                            (
+                                live.k,
+                                live.n,
+                                live.groups,
+                                live.routes,
+                                live.lanes,
+                                live.bias
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_metadata_rejects_missing_mismatched_and_unaddressable_operands() {
+        let op = Op::GroupedMatMul { transposed: false };
+        let m = [
+            TensorMetadata::new(DataType::Float32, &[2, 4], true),
+            TensorMetadata::new(DataType::Float32, &[3, 4, 5], true),
+            TensorMetadata::new(DataType::Int64, &[2, 2], true),
+        ];
+        let out = [OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        }];
+        assert!(group_metadata_layout(op, &m[..2], &out).is_err());
+        let mut bad = m;
+        bad[1].present = false;
+        assert!(
+            group_metadata_layout(op, &bad, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("input 1")
+        );
+        bad = m;
+        bad[1].dtype = DataType::Float16;
+        assert!(
+            group_metadata_layout(op, &bad, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("matching")
+        );
+        bad = m;
+        bad[2].shape = &[2, 1];
+        assert!(
+            group_metadata_layout(
+                op,
+                &bad,
+                &[OutputMetadata::tensor(DataType::Float32, &[2, 2, 5])]
+            )
+            .is_err()
+        );
+        bad = m;
+        bad[0].shape = &[usize::MAX, 4];
+        assert!(group_metadata_layout(op, &bad, &out).is_err());
+        assert!(group_metadata_layout(op, &m, &[OutputMetadata::Absent]).is_err());
+        assert!(
+            group_metadata_layout(
+                op,
+                &m,
+                &[OutputMetadata::Unresolved {
+                    dtype: DataType::Float64
+                }]
+            )
+            .is_err()
+        );
     }
 }

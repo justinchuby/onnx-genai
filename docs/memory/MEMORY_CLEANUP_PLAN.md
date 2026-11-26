@@ -3269,7 +3269,7 @@ introducing workspace or quota requests.
 For nonempty output, CPU PackedGroupedMatMul now admits one StepScoped mixed
 lane for f32 Y staging, one conservative K-element X row and usize routes, with
 checked alignment padding. Metadata returns Ready. It reuses the existing
-FloatIndexWorkspace, Host Rows and validated RouteSource helpers: no new owner,
+ValueIndexWorkspace, Host Rows and validated RouteSource helpers: no new owner,
 pool or per-token/expert/block grant is introduced. Aligned inner-contiguous X
 rows borrow even with padded/reversed outer axes; other X rows and INT32/INT64
 routes stream into admitted storage. Packed bytes remain a borrowed contiguous
@@ -3304,3 +3304,45 @@ former X/route/output payload sizes; repeated executions allocate no tested
 payload-sized buffers. Small bookkeeping allocations are outside that claim.
 These checks establish memory/accounting behavior, not measured latency or CUDA
 hardware performance.
+
+
+### Native grouped projection uses the same mixed workspace
+
+CPU GroupedMatMul now plans one StepScoped lane for Y staging, necessary X/W/bias
+snapshots, and usize routes. The mixed helper is ValueIndexWorkspace<T, N>,
+generalizing the existing f32 layout to f64 without another owner, pool or quota
+protocol. Affine grouped, Packed grouped and affine MoE simply specify f32 on
+this same helper. The Native multiply/add loop, transposed weight indexing and
+output conversion remain unchanged. FLOAT16/BFLOAT16 with bias still round the
+MatMul sum to storage precision before adding widened bias; DOUBLE stays f64.
+
+Aligned contiguous FLOAT X/W/bias retain the existing zero-copy borrow. Metadata
+therefore reports Deferred for nonempty FLOAT; execution checks actual views and
+charges only snapshots actually needed. DOUBLE keeps its previous full snapshot
+path. Half/bfloat conversion uses the existing bulk widening helpers once per
+source, preserving architecture-selected conversion paths rather than widening
+weights repeatedly per route. All supported source strides are admitted directly;
+there is no upstream gather for these four operands.
+
+The complete mixed lane binds before any value read. Host/span checks precede
+binding; routes are copied and validated before float sources are consumed. Y is
+published only after every source read and all arithmetic have finished, so all
+four source/Y overlaps remain safe. Empty Y still checks all routes while leaving
+X/W/bias untouched, with only the route region charged. Empty reductions resolve
+zero-element sources before numel/conversion helpers can overflow an intermediate
+product on shapes such as [large_group_count, N, 0]. Host validation remains in
+place for nonempty Y.
+
+Tests compare the original snapshot arithmetic for four floating types, both
+transposes, optional/absent bias slots and dense/padded/reversed/unaligned inputs.
+They also cover half rounding before bias, DOUBLE precision, shifted overlaps
+with strided Y/padding, missing/short/misaligned scratch, invalid routes, stale
+metadata, non-Host and unaddressable sources, zero output and zero reduction.
+Exact and one-byte-short Session budgets exercise Deferred FLOAT versus Ready
+other types, changing logical shapes, physical strides, trim and readmission.
+Allocator positive controls cover the former payload sizes; a retained-owner
+witness exercises 4096 calls with no additional issuer callbacks, including
+zero-byte controls. These establish accounting/correctness, not measured latency.
+Typed snapshot storage is initialized before copying; the former DOUBLE Vec
+collector wrote each element once, so DOUBLE snapshot traffic needs measurement
+before making any speed claim.

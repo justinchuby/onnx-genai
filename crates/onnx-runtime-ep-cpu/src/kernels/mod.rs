@@ -1202,7 +1202,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     }
     rec.register(
         OpKey::new("GroupedMatMul", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::Factory),
     );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {

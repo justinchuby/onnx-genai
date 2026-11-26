@@ -1,6 +1,6 @@
 use super::{AffineMoe, error};
 use crate::kernels::affine_bank;
-use crate::kernels::typed_workspace::FloatIndexWorkspace;
+use crate::kernels::typed_workspace::ValueIndexWorkspace;
 use onnx_runtime_ep_api::{OutputMetadata, Result, TensorMetadata};
 use onnx_runtime_ir::DataType;
 
@@ -132,8 +132,8 @@ impl Geometry {
         k: usize,
         x_row: usize,
         router_row: usize,
-    ) -> Result<FloatIndexWorkspace<6>> {
-        FloatIndexWorkspace::new(
+    ) -> Result<ValueIndexWorkspace<f32, 6>> {
+        ValueIndexWorkspace::new(
             super::OP,
             [
                 ("Y staging", self.output),
@@ -146,7 +146,7 @@ impl Geometry {
             ("routing indices", self.experts),
         )
     }
-    pub(super) fn conservative(&self, k: usize) -> Result<FloatIndexWorkspace<6>> {
+    pub(super) fn conservative(&self, k: usize) -> Result<ValueIndexWorkspace<f32, 6>> {
         self.plan(k, self.hidden, self.experts)
     }
 }
