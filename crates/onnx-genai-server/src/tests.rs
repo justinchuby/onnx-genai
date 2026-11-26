@@ -14145,8 +14145,8 @@ mod ctc_transcription {
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
             assert!(error.contains("codec"), "{error}");
-            for opus in ["celt-1", "hybrid-2"] {
-                let bytes = std::fs::read(fixtures.join(format!("../opus/{opus}.ogg"))).unwrap();
+            for opus in ["celt-1.ogg", "hybrid-2.ogg", "celt-1.webm", "hybrid-2.webm"] {
+                let bytes = std::fs::read(fixtures.join(format!("../opus/{opus}"))).unwrap();
                 let (status, body) = send(
                     router.clone(),
                     "/v1/audio/transcriptions",
@@ -14157,6 +14157,48 @@ mod ctc_transcription {
                 assert_eq!(status, StatusCode::OK, "{name}/{opus}: {body}");
                 let body: Value = serde_json::from_str(&body).unwrap();
                 assert!(body["text"].is_string(), "{name}/{opus}: {body}");
+                let fixture_name = opus.rsplit_once('.').unwrap().0;
+                let channels = if fixture_name.ends_with("-1") { 1 } else { 2 };
+                let reference =
+                    std::fs::read(fixtures.join(format!("../opus/{fixture_name}.reference.f32")))
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                let mono = reference
+                    .chunks_exact(channels)
+                    .map(|frame| {
+                        (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>()
+                            / channels as f64) as f32
+                    })
+                    .collect::<Vec<_>>();
+                let wav = onnx_genai_preprocess::audio::encode_wav_f32(&mono, 48000, 1).unwrap();
+                let (status, expected) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &wav,
+                    &[("model", name)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "reference/{opus}: {expected}");
+                let expected: Value = serde_json::from_str(&expected).unwrap();
+                assert_eq!(
+                    body, expected,
+                    "{name}/{opus}: independent PCM transcription"
+                );
+                let (status, events) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", name), ("stream", "true")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{opus}: {events}");
+                assert_eq!(
+                    transcript_events(&events).last().unwrap(),
+                    &expected,
+                    "{name}/{opus}: streamed independent PCM transcription"
+                );
             }
             for case in manifest["cases"].as_array().unwrap() {
                 let file = case["file"].as_str().unwrap();

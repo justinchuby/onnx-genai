@@ -2276,6 +2276,7 @@ dependencies = [
  "hound",
  "image",
  "onnx-genai-metadata",
+ "onnx-genai-symphonia-mkv",
  "rustfft",
  "serde",
  "serde_json",
@@ -2376,6 +2377,16 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "onnx-genai-symphonia-mkv"
+version = "0.1.0-dev.6"
+dependencies = [
+ "lazy_static",
+ "log",
+ "symphonia-common",
+ "symphonia-core",
 ]
 
 [[package]]
@@ -3961,7 +3972,6 @@ dependencies = [
  "symphonia-core",
  "symphonia-format-caf",
  "symphonia-format-isomp4",
- "symphonia-format-mkv",
  "symphonia-format-ogg",
  "symphonia-format-riff",
  "symphonia-metadata",
@@ -4090,18 +4100,6 @@ dependencies = [
  "symphonia-common",
  "symphonia-core",
  "symphonia-metadata",
-]
-
-[[package]]
-name = "symphonia-format-mkv"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d015c5c0558864665894b3f4cbd95e10abb01b9c868e751c72670f326a56360e"
-dependencies = [
- "lazy_static",
- "log",
- "symphonia-common",
- "symphonia-core",
 ]
 
 [[package]]

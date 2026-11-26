@@ -10,6 +10,22 @@ use rustfft::{Fft, FftPlanner};
 
 mod opus;
 
+// One private content probe; replace only Matroska's reader, never global codecs.
+fn audio_probe() -> &'static symphonia::core::formats::probe::Probe {
+    static PROBE: std::sync::LazyLock<symphonia::core::formats::probe::Probe> =
+        std::sync::LazyLock::new(|| {
+            let mut probe = symphonia::core::formats::probe::Probe::new();
+            symphonia::default::register_enabled_formats(&mut probe);
+            // Preferred also prevents external Cargo feature unification from making
+            // an old standard-tier MKV reader a silent fallback for rejected Opus.
+            probe.register_format_at_tier::<onnx_genai_symphonia_mkv::MkvReader<'_>>(
+                symphonia::core::common::Tier::Preferred,
+            );
+            probe
+        });
+    &PROBE
+}
+
 /// Caller-selected raw PCM work and resident PCM ceiling. This does not account
 /// for container metadata or a codec's private fixed-size state.
 #[derive(Debug, Clone, Copy)]
@@ -579,7 +595,7 @@ pub fn decode_audio(
     };
     let invalid = AudioPreprocessError::Encoded;
     let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
-    let mut format = symphonia::default::get_probe()
+    let mut format = audio_probe()
         .probe(
             &Hint::new(),
             stream,
@@ -623,13 +639,8 @@ pub fn decode_audio(
     let container = format.format_info().short_name;
     let codec = format!("{:?}", params.codec);
     let is_opus = params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
-    if is_opus && container != "ogg" {
-        return Err(invalid(format!(
-            "Opus presentation in {container} is unsupported by this build; use Ogg Opus or WAV/FLAC (WebM/MP4 Opus delay and end trimming are not admitted)"
-        )));
-    }
     let mut opus = if is_opus {
-        Some(opus::OggOpus::new(params, track)?)
+        Some(opus::Presentation::new(params, track, container)?)
     } else {
         None
     };
@@ -645,7 +656,11 @@ pub fn decode_audio(
         let packet_bytes = params
             .channels
             .as_ref()
-            .and_then(|channels| channels.count().checked_mul(5760))
+            .and_then(|channels| {
+                channels
+                    .count()
+                    .checked_mul(onnx_genai_symphonia_mkv::opus::MAX_PACKET_FRAMES)
+            })
             .and_then(|count| count.checked_mul(size_of::<f32>()))
             .ok_or_else(|| {
                 invalid(
@@ -661,13 +676,15 @@ pub fn decode_audio(
         0
     };
     let mut decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder> = if is_opus {
+        let mut options = AudioDecoderOptions::default();
+        options.gapless = false;
         Box::new(
-            symphonia_opus::OpusDecoder::try_new(params, &AudioDecoderOptions::default()).map_err(
-                |source| AudioPreprocessError::Codec {
-                    context: format!("cannot initialize Ogg Opus track {track_id}"),
+            symphonia_opus::OpusDecoder::try_new(params, &options).map_err(|source| {
+                AudioPreprocessError::Codec {
+                    context: format!("cannot initialize raw {container} Opus track {track_id}"),
                     source,
-                },
-            )?,
+                }
+            })?,
         )
     } else {
         symphonia::default::get_codecs()
@@ -703,18 +720,20 @@ pub fn decode_audio(
         }
         if is_opus && packet.data.is_empty() {
             return Err(invalid(format!(
-                "Ogg Opus packet {packet_index} is empty; file decoding does not invent packet-loss concealment for malformed container packets"
+                "{container} Opus packet {packet_index} is empty; file decoding does not invent packet-loss concealment for malformed container packets"
             )));
         }
         let opus_packet = if let Some(presentation) = opus.as_ref() {
-            let frames = opus::OggOpus::packet_frames(&packet)?;
-            presentation.validate_packet(&packet, frames)?;
+            let plan = presentation.plan(&packet)?;
+            let frames = plan.raw_frames;
             let valid = frames;
             let channels = empty_spec
                 .as_ref()
                 .map(|spec| spec.channels().count())
                 .ok_or_else(|| {
-                    invalid("Ogg Opus track has no complete output specification".into())
+                    invalid(format!(
+                        "{container} Opus track has no complete output specification"
+                    ))
                 })?;
             let bytes = frames
                 .checked_mul(channels)
@@ -740,7 +759,7 @@ pub fn decode_audio(
             if work > maximum_bytes || peak > maximum_bytes {
                 return Err(budget_error(work.max(peak)));
             }
-            Some((frames, valid))
+            Some(plan)
         } else {
             None
         };
@@ -820,19 +839,20 @@ pub fn decode_audio(
                 "audio decoder produced partial-channel frames or nonfinite samples".into(),
             ));
         }
-        let mut presented = if let Some((expected, valid)) = opus_packet {
+        let mut presented = if let Some(plan) = opus_packet {
+            let expected = plan.raw_frames;
             if decoded.frames() != expected {
                 return Err(invalid(format!(
-                    "Ogg Opus packet {packet_index} decoded {} raw frames but container declares {expected}; correct the packet duration/end trim metadata",
+                    "{container} Opus packet {packet_index} decoded {} raw frames but container declares {expected}; correct the packet duration/end trim metadata",
                     decoded.frames()
                 )));
             }
-            0..valid
+            plan.range
         } else {
             presented_frames(&packet, time_base, spec.rate(), decoded.frames())?
         };
         if let Some(opus) = opus.as_mut() {
-            presented = opus.present(presented);
+            presented = opus.present(decoded.frames(), presented);
         }
         let start=presented.start.checked_mul(channels).ok_or_else(||invalid("audio presentation start exceeds the packet buffer; provide consistent frame/channel metadata".into()))?;
         let end=presented.end.checked_mul(channels).ok_or_else(||invalid("audio presentation end exceeds the packet buffer; provide consistent frame/channel metadata".into()))?;
