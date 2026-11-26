@@ -3152,9 +3152,39 @@ route and output; separate allocating code/scale/zero controls verify the probe,
 then repeated grouped executions allocate no bank-sized copies. This scope does
 not claim zero allocations for the entire kernel or a measured latency gain.
 
-Affine MoE's activation/router copies, full output staging, routing indices and
-activation temporaries still need the planned whole-execution workspace. They
-are not made governed merely by borrowing their expert banks. The next step is
-one StepScoped mixed f32/usize layout, with row-sized activation/router scratch
-only when borrowing is impossible, reused across tokens without per-token or
-per-expert admission.
+### Affine MoE uses one whole-execution mixed workspace
+
+The standalone affine MoE now advertises metadata workspace planning. Metadata
+validation returns Deferred because row borrowing depends on actual strides and
+pointer alignment. Execution refinement ignores stale cached hints and resolves
+one StepScoped layout containing f32 Y staging, optional X/router row scratch,
+selected logits, probabilities and activated projection, followed by usize
+routing indices with checked alignment padding. For T tokens, hidden width H,
+E experts, intermediate width I and top-k k, the float count is
+`T*H + optional(H) + optional(E) + 2*k + I`, with E usize indices. Missing actual
+views retain both optional rows as a conservative bound.
+
+A row borrows aligned contiguous f32 values even when its outer axes are padded,
+transposed or reversed. Unaligned origins and noncontiguous inner axes copy only
+one row into the admitted scratch; the same regions are reused across all
+tokens. All eight operand slots advertise strided support, avoiding an upstream
+full-tensor gather. Expert banks retain their borrowed readers. Real Y is
+published after all source reads, preserving overlapping X/router/bank bindings.
+
+All Host/address proofs precede workspace binding. Complete capacity/alignment
+validation precedes initialization of either typed sublayout and precedes any
+scale or activation reads. The existing complete positive/finite scale scan and
+routing/threshold/activation arithmetic remain intact. No token/expert request,
+new owner or cache is introduced: the existing retained Host pool supplies the
+whole lane. A recording-governor witness runs 4096 real executions with one
+identity and no additional issuer callbacks, including zero-byte callbacks;
+positive controls observe both zero-byte admission and release. Idle trim refunds
+the complete retained charge. Public Session tests check exact-budget admission,
+one-byte-short refusal, dynamic shrinking/reuse and trim/readmission.
+
+Bitwise reference tests cover ties, nonfinite logits, threshold masking, all
+k/E relationships, row strides and overlapping source/output bindings. A real
+allocator witness independently detects each former payload allocation and
+observes no allocation at least as large as its smallest tested payload during
+execution. Small bookkeeping allocations are outside that assertion. These are
+memory/accounting checks, not latency measurements; CUDA remains untested.

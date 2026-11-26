@@ -1,7 +1,7 @@
 //! Borrowed affine expert-bank storage. No decoded bank or parameter payload.
 
 use crate::dtype::NumericElem;
-use onnx_runtime_ep_api::{EpError, Result, TensorView};
+use onnx_runtime_ep_api::{EpError, Result, TensorMetadata, TensorView};
 use onnx_runtime_ir::DataType;
 use std::marker::PhantomData;
 
@@ -20,76 +20,27 @@ struct Storage<'a, T> {
 }
 impl<'a, T: NumericElem> Storage<'a, T> {
     fn new(name: &str, view: &'a TensorView<'_>) -> Result<Self> {
-        view.validate().map_err(|e| {
-            error(format!(
-                "invalid {name}: {e}; bind valid rank-three Host storage"
-            ))
-        })?;
-        if !view.device.is_host_accessible() || view.dtype != T::DTYPE {
-            return Err(error(format!(
-                "{name} must be Host-accessible {:?}, got {:?} on {:?}; explicitly transfer and bind the matching storage type",
-                T::DTYPE,
-                view.dtype,
-                view.device
-            )));
-        }
+        let count = crate::strided::validate_host_storage::<T>("Affine expert bank", name, view)?;
         let &[experts, width, columns] = view.shape else {
             return Err(error(format!(
                 "{name} shape {:?} must have rank three [experts, rows, columns]",
                 view.shape
             )));
         };
-        let invalid = || {
+        let rows = experts.checked_mul(width).ok_or_else(|| {
             error(format!(
-                "{name} shape {:?}, strides {:?}, byte_offset {} has an unaddressable span; bind valid Host backing with representable strides and offsets",
-                view.shape, view.strides, view.byte_offset
+                "{name} row count overflows; reduce experts or projection width"
             ))
-        };
-        let rows = experts.checked_mul(width).ok_or_else(invalid)?;
-        let count = rows.checked_mul(columns).ok_or_else(invalid)?;
-        std::alloc::Layout::array::<T>(count).map_err(|_| invalid())?;
-        let origin = (view.data.0 as usize)
-            .checked_add(view.byte_offset)
-            .ok_or_else(invalid)?;
-        let mut strides = [0isize; 3];
-        if count != 0 {
-            let (mut low, mut high) = (0i128, 0i128);
-            for (axis, (&dim, &stride)) in view.shape.iter().zip(view.strides).enumerate() {
-                let extent = ((dim - 1) as i128)
-                    .checked_mul(i128::from(stride))
-                    .ok_or_else(invalid)?;
-                if extent < 0 {
-                    low = low.checked_add(extent).ok_or_else(invalid)?;
-                } else {
-                    high = high.checked_add(extent).ok_or_else(invalid)?;
-                }
-                strides[axis] = if dim == 1 {
-                    0
-                } else {
-                    isize::try_from(stride).map_err(|_| invalid())?
-                };
+        })?;
+        // The span proof bounds every active stride to isize; unused strides
+        // on singleton/empty axes need not be representable.
+        let strides = std::array::from_fn(|axis| {
+            if count == 0 || view.shape[axis] == 1 {
+                0
+            } else {
+                view.strides[axis] as isize
             }
-            let bytes = high
-                .checked_sub(low)
-                .and_then(|n| n.checked_add(1))
-                .and_then(|n| n.checked_mul(size_of::<T>() as i128))
-                .ok_or_else(invalid)?;
-            if bytes > isize::MAX as i128 {
-                return Err(invalid());
-            }
-            let offset = |value: i128| {
-                value
-                    .checked_mul(size_of::<T>() as i128)
-                    .and_then(|v| isize::try_from(v).ok())
-                    .ok_or_else(invalid)
-            };
-            origin
-                .checked_add_signed(offset(low)?)
-                .ok_or_else(invalid)?;
-            origin
-                .checked_add_signed(offset(high.checked_add(1).ok_or_else(invalid)?)?)
-                .ok_or_else(invalid)?;
-        }
+        });
         Ok(Self {
             origin: view.data_ptr::<T>(),
             strides,
@@ -181,6 +132,75 @@ impl Storage<'_, f32> {
     }
 }
 
+pub(super) fn validate_metadata(
+    codes: &TensorMetadata<'_>,
+    scales: &TensorMetadata<'_>,
+    zeros: Option<&TensorMetadata<'_>>,
+    [experts, width, depth]: [usize; 3],
+    block: usize,
+    zero: u8,
+) -> Result<()> {
+    if block == 0 || !depth.is_multiple_of(block) || zero > 15 {
+        return Err(error(format!(
+            "block {block} must divide depth {depth} and zero point {zero} must fit UINT4; supply a valid affine format"
+        )));
+    }
+    let blocks = depth / block;
+    if !codes.present
+        || !scales.present
+        || codes.dtype != DataType::Uint8
+        || codes.shape != [experts, width, depth.div_ceil(2)]
+        || scales.dtype != DataType::Float32
+        || scales.shape != [experts, width, blocks]
+        || zeros.is_some_and(|z| {
+            z.dtype != DataType::Uint8 || z.shape != [experts, width, blocks.div_ceil(2)]
+        })
+    {
+        return Err(error(format!(
+            "codes {:?} {:?}, scales {:?} {:?}, zeros {:?} do not match [experts, width, depth]=[{experts},{width},{depth}], block={block}; bind matching packed bytes and FLOAT scales",
+            codes.dtype,
+            codes.shape,
+            scales.dtype,
+            scales.shape,
+            zeros.map(|z| (z.dtype, z.shape))
+        )));
+    }
+    let rows = experts
+        .checked_mul(width)
+        .ok_or_else(|| error("expert row count overflows; reduce bank dimensions"))?;
+    for (name, columns, width) in [
+        ("codes", depth.div_ceil(2), 1usize),
+        ("scales", depth / block, 4),
+        ("zero points", (depth / block).div_ceil(2), 1),
+    ]
+    .into_iter()
+    .take(if zeros.is_some() { 3 } else { 2 })
+    {
+        let count = rows
+            .checked_mul(columns)
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| error(format!("{name} size overflows; reduce bank dimensions")))?;
+        std::alloc::Layout::from_size_align(count, width).map_err(|_| {
+            error(format!(
+                "{name} exceeds addressable capacity; reduce bank dimensions"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+pub(super) struct PreparedAffineBank<'a>(AffineBank<'a>);
+impl<'a> PreparedAffineBank<'a> {
+    pub(super) fn validate(self) -> Result<AffineBank<'a>> {
+        if let Some((row, block, value)) = self.0.scales.first_invalid_scale() {
+            return Err(error(format!(
+                "scales row {row}, block {block} is {value}; DequantizeLinear scales must be positive and finite; bind a valid scale bank"
+            )));
+        }
+        Ok(self.0)
+    }
+}
+
 pub(super) struct AffineBank<'a> {
     codes: Storage<'a, u8>,
     scales: Storage<'a, f32>,
@@ -198,46 +218,36 @@ impl<'a> AffineBank<'a> {
         block: usize,
         zero: u8,
     ) -> Result<Self> {
-        if block == 0 || !depth.is_multiple_of(block) || zero > 15 {
-            return Err(error(format!(
-                "block {block} must divide depth {depth} and zero point {zero} must fit UINT4; supply a valid affine format"
-            )));
-        }
-        let blocks = depth / block;
-        if codes.dtype != DataType::Uint8
-            || codes.shape != [experts, width, depth.div_ceil(2)]
-            || scales.dtype != DataType::Float32
-            || scales.shape != [experts, width, blocks]
-            || zeros.is_some_and(|z| {
-                z.dtype != DataType::Uint8 || z.shape != [experts, width, blocks.div_ceil(2)]
-            })
-        {
-            return Err(error(format!(
-                "codes {:?} {:?}, scales {:?} {:?}, zeros {:?} do not match [experts, width, depth]=[{experts},{width},{depth}], block={block}; bind matching packed bytes and FLOAT scales",
-                codes.dtype,
-                codes.shape,
-                scales.dtype,
-                scales.shape,
-                zeros.map(|z| (z.dtype, z.shape))
-            )));
-        }
+        Self::prepare(codes, scales, zeros, [experts, width, depth], block, zero)?.validate()
+    }
+    /// Validate metadata and Host address proofs without reading scale values.
+    pub(super) fn prepare(
+        codes: &'a TensorView<'_>,
+        scales: &'a TensorView<'_>,
+        zeros: Option<&'a TensorView<'_>>,
+        dimensions: [usize; 3],
+        block: usize,
+        zero: u8,
+    ) -> Result<PreparedAffineBank<'a>> {
+        let metadata =
+            |v: &'a TensorView<'_>| TensorMetadata::new(v.dtype, v.shape, !v.is_absent());
+        let c = metadata(codes);
+        let s = metadata(scales);
+        let z = zeros.map(metadata);
+        validate_metadata(&c, &s, z.as_ref(), dimensions, block, zero)?;
+        let depth = dimensions[2];
         // Validate every source before reading any scale (or packed byte).
         let codes = Storage::new("codes", codes)?;
         let scales = Storage::<f32>::new("scales", scales)?;
         let zeros = zeros.map(|z| Storage::new("zero points", z)).transpose()?;
-        if let Some((row, block, value)) = scales.first_invalid_scale() {
-            return Err(error(format!(
-                "scales row {row}, block {block} is {value}; DequantizeLinear scales must be positive and finite; bind a valid scale bank"
-            )));
-        }
-        Ok(Self {
+        Ok(PreparedAffineBank(Self {
             codes,
             scales,
             zeros,
             depth,
             block,
             zero,
-        })
+        }))
     }
     pub(super) fn dot(&self, row: usize, input: &[f32]) -> f32 {
         assert!(
