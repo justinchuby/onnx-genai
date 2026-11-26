@@ -348,6 +348,16 @@ mod error {
         #[error("internal executor error: {0}")]
         Internal(String),
 
+        #[error(
+            "initialize Host tensor {dtype:?} {shape:?} payload: {source}; repair the initializer or release memory before retrying"
+        )]
+        HostTensorInitialization {
+            dtype: DataType,
+            shape: Vec<usize>,
+            #[source]
+            source: Box<dyn std::error::Error + Send + Sync>,
+        },
+
         #[error("Sequence op {op}: {reason}")]
         SequenceOp { op: String, reason: String },
         #[error("ONNX Optional operator {op}: {reason}")]

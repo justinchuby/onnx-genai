@@ -844,7 +844,7 @@ pub(crate) fn prefix_slice(
     let mut shape = tensor.shape.clone();
     shape[axis] = len;
     allocator.fill(tensor.dtype, shape, |destination| {
-        if destination.len() != retained_bytes { return Err(onnx_runtime_session::SessionError::Internal("native KV prefix dtype requires different byte packing; use a byte-addressable cache representation".into())); }
+        if destination.len() != retained_bytes { return Err(onnx_runtime_session::SessionError::Internal("native KV prefix dtype requires different byte packing; use a byte-addressable cache representation".into()).into()); }
         for index in 0..outer {
             // Geometry above checked all products before backing admission.
             let start = index * source_stride;

@@ -1381,7 +1381,9 @@ impl HostTensorAllocator {
         &self,
         dtype: DataType,
         shape: Vec<usize>,
-        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+        fill: impl FnOnce(
+            &mut [u8],
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>,
     ) -> Result<Tensor> {
         let mut tensor = self.zeros(dtype, shape)?;
         let expected = tensor.as_bytes().len();
@@ -1392,7 +1394,11 @@ impl HostTensorAllocator {
         // SAFETY: zeros initialized the whole uniquely borrowed logical range.
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), expected) };
-        fill(bytes)?;
+        fill(bytes).map_err(|source| SessionError::HostTensorInitialization {
+            dtype,
+            shape: tensor.shape.clone(),
+            source,
+        })?;
         Ok(tensor)
     }
 }
