@@ -746,9 +746,9 @@ pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescr
         .map(|key| {
             let supported_dtypes = if key.op_type == "Conv"
                 && key.domain.is_empty()
-                && key.since_version < onnx_runtime_ir::conv::BF16_SINCE_OPSET
+                && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
             {
-                onnx_runtime_ir::conv::PRE_BF16_DTYPES
+                onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
             } else {
                 cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
             };
@@ -1521,14 +1521,14 @@ pub(crate) fn build_cuda_registry_for_contract(
     );
     reg.register_through(
         OpKey::new("Conv", "", 1),
-        onnx_runtime_ir::conv::BF16_SINCE_OPSET - 1,
+        onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET - 1,
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(conv::ConvFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("Conv", "", onnx_runtime_ir::conv::BF16_SINCE_OPSET),
+        OpKey::new("Conv", "", onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(conv::ConvFactory {
             runtime: runtime.clone(),

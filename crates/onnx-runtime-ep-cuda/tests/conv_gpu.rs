@@ -521,7 +521,7 @@ fn cuda_conv1d_matches_cpu_for_standard_grouped_and_causal_geometry() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn cuda_conv_opset22_bf16_matches_independent_reference() {
+fn cuda_conv_opset11_bf16_matches_independent_reference() {
     let ep = common::require_cuda();
     let dtype = DataType::BFloat16;
     let inputs = [
@@ -537,13 +537,13 @@ fn cuda_conv_opset22_bf16_matches_independent_reference() {
         &ep,
         "Conv",
         "",
-        22,
+        11,
         &inputs,
         &[(dtype, vec![1, 1, 2, 2])],
         &[],
     );
     common::assert_close(
-        "Conv-22 BF16",
+        "Conv-11 BF16",
         dtype,
         &common::decode_floats(&got[0], dtype),
         &[3.75, 6.25, 11.25, 13.75],

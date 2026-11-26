@@ -1007,12 +1007,12 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     }
     registry.register_through(
         OpKey::new("Conv", "", 1),
-        onnx_runtime_ir::conv::BF16_SINCE_OPSET - 1,
+        onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET - 1,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(conv::ConvFactory),
     );
     registry.register(
-        OpKey::new("Conv", "", onnx_runtime_ir::conv::BF16_SINCE_OPSET),
+        OpKey::new("Conv", "", onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(conv::ConvFactory),
     );
@@ -1145,9 +1145,9 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                 });
             let supported_dtypes = if key.op_type == "Conv"
                 && key.domain.is_empty()
-                && key.since_version < onnx_runtime_ir::conv::BF16_SINCE_OPSET
+                && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
             {
-                onnx_runtime_ir::conv::PRE_BF16_DTYPES
+                onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
             } else {
                 supported_dtypes_for_op(&key.op_type, &key.domain)
             };
@@ -3588,9 +3588,10 @@ mod tests {
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed). Standard
-        // Conv is always registered twice (opsets 1-21 and 22+), using the
-        // pure-Rust reference kernel without `mlas` and the optimized
-        // implementation with it.
+        // Conv is registered twice so schema-governed plugin descriptors can
+        // advertise opsets 1-21 and 22+ accurately. Standalone execution uses
+        // the same factory for both ranges and may accept additional
+        // kernel-supported dtypes when the operator semantics are unchanged.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
@@ -3926,7 +3927,7 @@ mod tests {
         assert_eq!((conv[0].since_version, conv[0].end_version), (1, 21));
         assert_eq!(
             conv[0].supported_dtypes,
-            onnx_runtime_ir::conv::PRE_BF16_DTYPES
+            onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
         );
         assert_eq!((conv[1].since_version, conv[1].end_version), (22, u64::MAX));
         assert_eq!(conv[1].supported_dtypes, onnx_runtime_ir::conv::DTYPES);
