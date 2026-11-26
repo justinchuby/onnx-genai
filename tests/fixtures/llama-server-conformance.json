@@ -18,11 +18,22 @@
         "cli_native_transcription_mp3",
         "cli_native_transcription_prompt",
         "cli_native_audio_pcm_policy",
-        "server_cli_infill_limits"
+        "server_cli_infill_limits",
+        "cors_preflight",
+        "cors_restricted",
+        "cors_modes",
+        "cors_config",
+        "cors_cli",
+        "cors_native_http",
+        "cors_mapped_listener",
+        "browser_cors_transport",
+        "cors_accepted_socket",
+        "cors_socket_failure"
       ],
       "remaining": [
         "Fresh complete browser acceptance on the final revision; source-linked drivers are not current results.",
-        "CLI Cargo-built runtime fixtures and maintained [binding wheel smoke](../crates/onnx-genai-python/tests/python_wheel_smoke.py) / [installed console smoke](../crates/onnx-genai-cli/tests/python_wheel_smoke.py) cover synthetic Native CPU workflows without ORT. Remaining installed-artifact acceptance includes release/LTO builds, free-threaded wheels, Linux/Windows, other interpreter versions and broader model/device/format/config permutations; fresh final-revision runs remain required."
+        "CLI Cargo-built runtime fixtures and maintained [binding wheel smoke](../crates/onnx-genai-python/tests/python_wheel_smoke.py) / [installed console smoke](../crates/onnx-genai-cli/tests/python_wheel_smoke.py) cover synthetic Native CPU workflows without ORT. Remaining installed-artifact acceptance includes release/LTO builds, free-threaded wheels, Linux/Windows, other interpreter versions and broader model/device/format/config permutations; fresh final-revision runs remain required.",
+        "CORS transport driver proves browser fetch behavior from independent test pages, not separately hosted official frontend application acceptance. Fresh revision/browser/proxy/TLS/model/device combinations remain open; source links are definitions only."
       ]
     },
     {
@@ -1069,6 +1080,116 @@
       "test": "native_gguf_half_invalid_storage_nonfinite_and_staging_denial_recover",
       "execution_contract": "Independently authored F16/BF16 GGUF factors through explicit target mapping and synthetic Native CPU ONNX MatMul; F32 base/input/live factors/computation, no quantized/device-fused proof",
       "assertions": "Mixed declared/saved half storage and independent NaN/Inf patterns reject; a governed staging denial precedes conversion. Each case preserves actual base inference and restoring the small valid half container recovers scaled output.",
+      "source_markers": []
+    },
+    "cors_preflight": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::tests::cors_preflight_skips_auth_and_route_but_actual_requests_remain_protected",
+      "execution_contract": "In-process protected counting HTTP router; no inference",
+      "assertions": "Allowed unauthenticated OPTIONS bypasses auth and handler; actual protected requests require a key, and credentialed wildcard reflects Origin/requested header names.",
+      "source_markers": []
+    },
+    "cors_restricted": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::tests::cors_restricted_origins_host_and_fetch_site_reject_before_execution",
+      "execution_contract": "In-process counting HTTP router with typed loopback listener extension; no inference",
+      "assertions": "Explicit allowed/same-authority origins enter the handler; disallowed origins, rebinding Host and cross-site no-Origin requests reject before handler execution.",
+      "source_markers": []
+    },
+    "cors_modes": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::tests::cors_same_origin_and_noncredentialed_wildcard_are_distinct",
+      "execution_contract": "In-process HTTP preflight policy only; no inference",
+      "assertions": "Same-origin localhost mode rejects a different port without CORS origin permission; noncredentialed wildcard emits literal wildcard and configured method/header permissions.",
+      "source_markers": []
+    },
+    "cors_config": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::tests::cors_configuration_rejects_invalid_origins_methods_and_headers",
+      "execution_contract": "Public CORS policy constructor validation only",
+      "assertions": "Invalid origin URL shapes, control characters, method/header tokens and empty list entries reject; explicit null origin is accepted.",
+      "source_markers": []
+    },
+    "cors_cli": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cli.rs",
+      "target": "lib",
+      "test": "cli::tests::cors_cli_defaults_overrides_and_invalid_policy_are_explicit",
+      "execution_contract": "Server Clap parser and ServerConfig lowering only; no subprocess/network/inference",
+      "assertions": "Credential defaults and both flag ordering overrides lower correctly; malformed origin configuration reports the CORS option.",
+      "source_markers": []
+    },
+    "cors_native_http": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::native_tests::cors_native_json_sse_errors_and_recovery_preserve_auth",
+      "execution_contract": "Actual synthetic Native CPU generation through in-process authenticated HTTP router; not a real browser",
+      "assertions": "Allowed origins can read auth/JSON validation errors; disallowed origin rejects. Buffered generation has actual output/usage, streamed text equals buffered output and terminal finish/DONE events survive CORS.",
+      "source_markers": []
+    },
+    "cors_mapped_listener": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::tests::cors_mapped_loopback_listener_rejects_rebinding_without_restricting_lan",
+      "execution_contract": "In-process counting router with explicit typed listener addresses; no actual sockets/inference",
+      "assertions": "IPv4-mapped loopback rejects malicious Host with matching Origin before execution; valid localhost succeeds, while unspecified and LAN/mapped-LAN extension values retain their current exemption.",
+      "source_markers": []
+    },
+    "browser_cors_transport": {
+      "kind": "browser",
+      "source": "scripts/test_llama_cors.mjs",
+      "execution_contract": "Real Chrome, two independently served blank test pages and a real authenticated Native CPU fixture server; standalone driver under shared workload lock, not a separately hosted official frontend application",
+      "assertions": "Chrome observes unauthenticated successful preflight, reads authenticated JSON/incremental SSE and readable401/400 errors; another page origin is forbidden, and the embedded frontend page still loads.",
+      "source_markers": [
+        "preflightStatuses: preflights",
+        "crossOriginSse: true",
+        "embeddedUiLoads: true"
+      ]
+    },
+    "cors_accepted_socket": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::tests::cors_wildcard_tcp_listener_uses_each_accepted_socket_local_address",
+      "execution_contract": "Real wildcard TCP listener using shared production serve_listener and a loopback HTTP client; no inference",
+      "assertions": "Actual accepted local socket address enforces rebinding Host rejection before handler despite wildcard bind; an explicitly permitted origin succeeds, and authoritative socket context overrides unrelated manual listener extension.",
+      "source_markers": []
+    },
+    "cors_socket_failure": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cors.rs",
+      "target": "lib",
+      "test": "cors::tests::cors_socket_context_failure_fails_closed_and_nonloopback_does_not_gain_host_guard",
+      "execution_contract": "In-process captured socket-context failure and synthetic nonloopback context; no inference or socket resolver fault injection",
+      "assertions": "Socket-context resolution failure returns actionable500 without handler; authoritative nonloopback context retains exemption and takes precedence over unrelated manual listener extension.",
       "source_markers": []
     }
   },
