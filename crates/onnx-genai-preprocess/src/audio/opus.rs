@@ -326,14 +326,9 @@ mod tests {
                 let params = track.codec_params.as_ref().unwrap().audio().unwrap();
                 let mut presentation =
                     Presentation::new(params, track, format.format_info().short_name).unwrap();
-                let mut decoder = symphonia_opus::OpusDecoder::try_new(
-                    params,
-                    &AudioDecoderOptions {
-                        gapless: false,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+                let mut options = AudioDecoderOptions::default();
+                options.gapless = false;
+                let mut decoder = symphonia_opus::OpusDecoder::try_new(params, &options).unwrap();
                 let mut actual = Vec::new();
                 while let Some(packet) = format.next_packet().unwrap() {
                     if packet.track_id != id {
