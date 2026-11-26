@@ -13,7 +13,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
-use super::float_workspace::FloatWorkspace;
+use super::typed_workspace::TypedWorkspace;
 
 #[derive(Clone, Copy)]
 enum LayerNormKind {
@@ -130,7 +130,7 @@ struct LayerNormGeometry {
     bias_slot: usize,
     writes: [bool; 4],
     affine: [AffineLayout; 2],
-    workspace: FloatWorkspace<4>,
+    workspace: TypedWorkspace<f32, 4>,
 }
 
 impl LayerNormKernel {
@@ -292,7 +292,7 @@ impl LayerNormKernel {
 
             writes[i] = true;
         }
-        let workspace = FloatWorkspace::new(
+        let workspace = TypedWorkspace::<f32, _>::new(
             op,
             [
                 ("Y staging", count),

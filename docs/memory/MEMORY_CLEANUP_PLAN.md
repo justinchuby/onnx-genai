@@ -2623,7 +2623,7 @@ and per-batch DFT allocations still require their own workspace migration.
 
 DFT's real/imaginary input and output vectors now borrow four transform-length
 regions from the same StepScoped Host execution domain as STFT. A private
-FloatWorkspace<4> descriptor centralizes checked partitioning and initialization;
+TypedWorkspace<f32, 4> descriptor centralizes checked partitioning and initialization;
 it owns neither backing nor quota. Both operators use its closure-scoped Host
 borrows. DFT constructs one existing DftPlan per execution and reuses it across
 all batches, instead of allocating vectors and DSP setup for each transform.
@@ -2713,7 +2713,7 @@ accounting or CUDA execution.
 
 ### One private initialized-float binding contract for CPU kernels
 
-DFT, STFT and both RMS schemas now use `FloatWorkspace<N>` instead of separate
+DFT, STFT and both RMS schemas now use `TypedWorkspace<f32, N>` instead of separate
 Fourier and RMS raw-pointer initialization code. A kernel supplies named f32
 region lengths, keeps its own geometry and declares the same existing
 StepScoped requirement. The descriptor uses fixed-size stack arrays and the
@@ -2748,7 +2748,7 @@ claim is made.
 
 LayerNormalization (default and private fused domain) and SkipLayerNormalization
 now share one explicit schema-kind kernel, checked metadata geometry and
-`FloatWorkspace<4>`. The allocating `layer_norm_dense` return interface and
+`TypedWorkspace<f32, 4>`. The allocating `layer_norm_dense` return interface and
 Skip's residual-sum Vec are removed. The regions are Y, requested mean,
 requested inverse standard deviation, and Skip's full residual sum. Standard
 LayerNorm has no sum region; omitted statistics occupy zero bytes. Skip keeps
@@ -2824,7 +2824,7 @@ existing stash-type behavior are outside this change.
 
 Both legacy (opsets 1–12, flattened suffix) and modern (opset 13+, one selected
 axis) LogSoftmax factories now declare metadata workspace planning. The kernel
-replaces its per-execution full-output Vec with FloatWorkspace<1> on the existing
+replaces its per-execution full-output Vec with TypedWorkspace<f32, 1> on the existing
 StepScoped lane. Its bound is exactly four bytes per X element, zero for empty
 input. Unresolved Y metadata derives the same bound from X; resolved Y must
 match the complete input shape. No kernel pool, extra owner or per-slice grant
@@ -2908,3 +2908,24 @@ zero workspace capacity, fallback refusal/reuse/trim, dynamic shapes in both
 opset families, real ORT assignment with fallback disabled, and 4096 warm cycles
 with no governor callbacks (including zero-byte callbacks). These correctness
 checks do not establish zero latency overhead or CUDA behavior.
+
+
+### Typed workspace and LpNormalization storage staging
+
+The CPU-only borrowed workspace helper is now `TypedWorkspace<T, N>` for
+`Copy + Default` elements. All existing f32 callers use the same checked layout,
+Host lane, HRTB closure and whole-binding validation; no compatibility alias or
+new allocation owner remains. Regions are initialized with valid `T::default()`
+values before constructing typed slices. A generic Default is not assumed to be
+all-zero bits. Zero-sized types are rejected; byte counts and alignment come
+from `Layout::array::<T>`.
+
+LpNormalization now requests one StepScoped `numel * sizeof(storage T)` lane.
+It computes reductions and division in the original accumulator type (f64 for
+f64 storage, f32 otherwise), narrows each completed result directly into staging,
+and publishes after all source reads. The previous accumulator-output Vec and
+converted-output Vec are removed. Input materialization remains outside this
+output budget and preserves arbitrary input/output aliasing. Checked metadata
+planning validates exact dtype/shape, axis and indexing capacity, including empty
+shapes; actual execution validates Host views before binding scratch. This
+introduces no per-slice grants or new public EP API and makes no timing/CUDA claim.

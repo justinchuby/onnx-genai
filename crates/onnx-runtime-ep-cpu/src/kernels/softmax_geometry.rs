@@ -1,6 +1,6 @@
 //! Shared checked axis/output geometry for Softmax and LogSoftmax.
 
-use super::float_workspace::FloatWorkspace;
+use super::typed_workspace::TypedWorkspace;
 use onnx_runtime_ep_api::{EpError, OutputMetadata, Result, TensorMetadata};
 use onnx_runtime_ir::DataType;
 
@@ -10,7 +10,7 @@ pub(super) struct SoftmaxGeometry {
     pub(super) inner: usize,
     pub(super) count: usize,
     pub(super) output_dtype: DataType,
-    pub(super) workspace: FloatWorkspace<1>,
+    pub(super) workspace: TypedWorkspace<f32, 1>,
 }
 
 impl SoftmaxGeometry {
@@ -80,7 +80,7 @@ impl SoftmaxGeometry {
             inner,
             count,
             output_dtype: dtype,
-            workspace: FloatWorkspace::new(op, [("Y staging", count)])?,
+            workspace: TypedWorkspace::<f32, _>::new(op, [("Y staging", count)])?,
         })
     }
 }

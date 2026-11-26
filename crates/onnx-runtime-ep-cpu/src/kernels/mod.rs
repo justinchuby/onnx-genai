@@ -672,7 +672,6 @@ mod half_gemm;
 // dead code.
 mod dequantize_packed;
 mod dequantize_packed_gather;
-mod float_workspace;
 pub mod governed_weight_cache;
 mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -728,6 +727,7 @@ pub mod stft;
 pub mod tensor_scatter;
 pub mod text;
 pub mod transpose;
+mod typed_workspace;
 pub mod unary_math;
 pub mod unique;
 pub mod unsqueeze;
@@ -1499,7 +1499,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("LpNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(lp_normalization::LpNormalizationFactory),
     );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
