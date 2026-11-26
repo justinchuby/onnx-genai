@@ -2,7 +2,7 @@
 use super::{
     RealtimeConnection, RealtimeInputOwned, RealtimeLimits,
     conditioning::{Conditioning, PromptOperation},
-    conversation::{Conversation, ItemId, ResponseId, ResponseKind},
+    conversation::{CompletedToolCall, Conversation, ItemId, ResponseId, ResponseKind},
     events::{ResponseEnd, ResponseEvents, TranscriptionEvents},
     pcm::PcmInput,
     settings::{Capabilities, Modalities, OutputBudget, SessionSettings},
@@ -286,6 +286,61 @@ struct ToolText {
     stream: ToolCallStream,
     raw: String,
     published: usize,
+    bindings: Vec<ToolBinding>,
+}
+struct ToolBinding {
+    wire_id: String,
+    item_id: String,
+    name: String,
+    model_id: Option<String>,
+}
+impl ToolText {
+    fn fragments(
+        &mut self,
+        parameters: &ToolArguments,
+        renderer: &mut ResponseEvents,
+    ) -> anyhow::Result<Vec<Value>> {
+        let snapshots = self.stream.fragments(self.protocol)?;
+        let admitted = parameters.admit_fragments(&snapshots)?;
+        let mut events = Vec::new();
+        for proof in admitted {
+            let fragment = proof.fragment();
+            if self.bindings.len() == fragment.index {
+                let wire_id = match &fragment.id {
+                    Some(id) => id.clone(),
+                    None => id("call_")?,
+                };
+                ensure!(
+                    !self
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.wire_id == wire_id),
+                    "realtime model call ID collides with an already projected call; emit distinct function IDs"
+                );
+                self.bindings.push(ToolBinding {
+                    wire_id,
+                    item_id: id("item_")?,
+                    name: fragment.name.clone(),
+                    model_id: fragment.id.clone(),
+                });
+            }
+            let binding = self.bindings.get_mut(fragment.index)
+                .context("realtime function fragment skipped a preceding call identity; repair the model protocol parser")?;
+            ensure!(
+                binding.name == fragment.name
+                    && binding
+                        .model_id
+                        .as_ref()
+                        .is_none_or(|model_id| fragment.id.as_ref() == Some(model_id)),
+                "realtime function fragment changed an already decoded model identity; repair the model tool protocol"
+            );
+            if binding.model_id.is_none() {
+                binding.model_id.clone_from(&fragment.id);
+            }
+            events.extend(renderer.tool_fragment(&proof, &binding.wire_id, &binding.item_id)?);
+        }
+        Ok(events)
+    }
 }
 enum Rendered {
     Response(ResponseEvents),
@@ -513,6 +568,7 @@ impl Runner {
                 stream: ToolCallStream::default(),
                 raw: String::new(),
                 published: 0,
+                bindings: Vec::new(),
             })
         } else {
             None
@@ -752,7 +808,12 @@ impl Runner {
                             &text,
                             &self.settings,
                         )?;
-                        (text, Some(call_id), events, PromptOperation::ToolResult)
+                        (
+                            text,
+                            Some(events.model_call_id),
+                            events.events,
+                            PromptOperation::ToolResult,
+                        )
                     }
                     _ => {
                         return Err(Failure::invalid(
@@ -973,6 +1034,11 @@ impl Runner {
                         }
                         _ => {}
                     }
+                    events.extend(
+                        tools
+                            .fragments(&self.tool_arguments, renderer)
+                            .map_err(Failure::native)?,
+                    );
                 } else if active.text_enabled {
                     events.extend(renderer.text(&text).map_err(Failure::native)?);
                 }
@@ -1006,9 +1072,14 @@ impl Runner {
             ResponseEnd::Model
         };
         let mut calls = Vec::new();
+        let mut completed_calls = Vec::new();
         let final_events = match active.renderer {
             Rendered::Response(mut renderer) => {
                 if let Some(tools) = active.tools {
+                    let final_fragments = tools
+                        .stream
+                        .fragments(tools.protocol)
+                        .map_err(|error| Failure::native(error.into()))?;
                     match tools.stream.finish(tools.protocol) {
                         ToolParseOutcome::NoCall => {
                             if active.text_enabled {
@@ -1022,14 +1093,40 @@ impl Runner {
                         }
                         ToolParseOutcome::TerminalComplete(parsed) => {
                             calls = parsed;
-                            self.tool_arguments.admit(&calls).map_err(Failure::native)?;
+                            self.tool_arguments
+                                .admit_projected(&calls, &final_fragments)
+                                .map_err(Failure::native)?;
+                            if tools.bindings.len() != calls.len() {
+                                return Err(Failure::native(anyhow::anyhow!(
+                                    "realtime completed batch differs from the projected function identities; repair the model tool protocol parser"
+                                )));
+                            }
                             let mut call_events = Vec::new();
-                            for call in &calls {
+                            for (call, binding) in calls.iter().zip(&tools.bindings) {
+                                if call.name != binding.name
+                                    || !binding
+                                        .model_id
+                                        .as_ref()
+                                        .is_none_or(|model_id| *model_id == call.id)
+                                {
+                                    return Err(Failure::native(anyhow::anyhow!(
+                                        "realtime completed tool call changed its projected model identity; repair the model protocol"
+                                    )));
+                                }
+                                let wire_call = onnx_genai_metadata::ToolCall {
+                                    id: binding.wire_id.clone(),
+                                    name: call.name.clone(),
+                                    arguments: call.arguments.clone(),
+                                };
                                 call_events.extend(
                                     renderer
-                                        .tool_call(call, id("item_").map_err(Failure::native)?)
+                                        .tool_call(&wire_call, binding.item_id.clone())
                                         .map_err(Failure::native)?,
                                 );
+                                completed_calls.push(CompletedToolCall {
+                                    wire_id: binding.wire_id.clone(),
+                                    model_call: call.clone(),
+                                });
                             }
                             for event in call_events {
                                 self.emit(out, event).await.map_err(Failure::native)?;
@@ -1069,7 +1166,8 @@ impl Runner {
             .and_then(|item| item.get("id"))
             .and_then(Value::as_str)
             .map(|id| ItemId::new(id.into()));
-        self.conversation.complete(&active.id, &calls, last)?;
+        self.conversation
+            .complete(&active.id, &completed_calls, last)?;
         if self.settings.mode == RealtimeMode::Duplex {
             // llama.cpp's duplex cancel resets stream/gen and its next audio
             // starts a fresh KV/codec stream. Never replay queued old PCM.
@@ -1472,6 +1570,233 @@ mod tests {
         std::fs::write(path, graph).unwrap();
         package
     }
+
+    fn fragment_tool_package(paused: bool, late_id: bool) -> tempfile::TempDir {
+        let package = streaming_tool_package(false);
+        let prefix = if late_id {
+            "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Pa"
+        } else {
+            "<tool_call>\n{\"id\":\"call_lookup\",\"name\":\"lookup\",\"arguments\":{\"city\":\"Pa"
+        };
+        let suffix = if late_id {
+            "ris\"},\"id\":\"model_late\"}\n</tool_call>"
+        } else {
+            "ris\"}}\n</tool_call>"
+        };
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (id, text) in [(16, prefix), (17, suffix)] {
+            let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(text.into(), json!(id));
+            for token in tokenizer["added_tokens"].as_array_mut().unwrap() {
+                if token["id"] == id {
+                    token["content"] = json!(text);
+                }
+            }
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let model_id = if late_id { "model_late" } else { "call_lookup" };
+        metadata["profiles"]["live"]["realtime"]["prompt_template"] = serde_yaml::Value::String(
+            format!(
+                "{{% if operation == \"response_start\" %}}{prefix}{{% elif operation == \"tool_result\" and call_id != \"{model_id}\" %}}{{{{ raise_exception('tool result lost the original model call ID') }}}}{{% else %}}{{{{ text }}}}{{% endif %}}"
+            ),
+        );
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        if paused {
+            let path = package.path().join("model.onnx.textproto");
+            let graph = std::fs::read_to_string(&path).unwrap();
+            let node = "node { input: \"responding\" output: \"needs_input\" op_type: \"Not\" }";
+            assert!(graph.contains(node));
+            std::fs::write(path, graph.replace(node, "initializer { name: \"fragment_wait\" data_type: 9 int32_data: 1 }\nnode { input: \"fragment_wait\" output: \"needs_input\" op_type: \"Identity\" }")).unwrap();
+        }
+        package
+    }
+
+    async fn configure_fragment_client(client: &mut Client) {
+        assert_eq!(event(client).await["type"], "session.created");
+        send(client,json!({"type":"session.update","session":{"output_modalities":["text"],"max_output_tokens":4,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+        assert_eq!(event(client).await["type"], "session.updated");
+        send(client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+        assert_eq!(event(client).await["type"], "conversation.item.added");
+        assert_eq!(event(client).await["type"], "conversation.item.done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_tool_fragment_is_visible_while_native_response_waits_and_cancel_never_admits_it()
+     {
+        let package = fragment_tool_package(true, false);
+        let (state, address, task) = server_for_package(package.path()).await;
+        let mut client = connect(address).await;
+        configure_fragment_client(&mut client).await;
+        send(&mut client, json!({"type":"response.create"})).await;
+        assert_eq!(event(&mut client).await["type"], "response.created");
+        let item = event(&mut client).await;
+        assert_eq!(item["type"], "response.output_item.added");
+        assert_eq!(item["item"]["status"], "in_progress");
+        assert_eq!(item["item"]["call_id"], "call_lookup");
+        let delta = event(&mut client).await;
+        assert_eq!(delta["type"], "response.function_call_arguments.delta");
+        assert_eq!(delta["delta"], r#"{"city":"Pa"#);
+        // The real workflow is waiting for input, so neither a completed call
+        // nor response completion can have been synthesized behind these events.
+        send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"call_lookup","output":"hello"}})).await;
+        assert_eq!(event(&mut client).await["type"], "error");
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            assert_ne!(
+                output["type"], "response.function_call_arguments.done",
+                "{output}"
+            );
+            if output["type"] == "response.done" {
+                assert_eq!(output["response"]["status"], "cancelled");
+                assert_eq!(output["response"]["output"][0]["status"], "cancelled");
+                assert_eq!(
+                    output["response"]["output"][0]["arguments"],
+                    r#"{"city":"Pa"#
+                );
+                break;
+            }
+        }
+        send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"call_lookup","output":"hello"}})).await;
+        assert_eq!(event(&mut client).await["type"], "error");
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_xml_parameter_streams_before_invoke_end_in_a_waiting_native_workflow() {
+        let prefix =
+            r#"<atem:invoke name="lookup"><atem:parameter name="city">"Paris"</atem:parameter>"#;
+        let package = tool_package_from("realtime", prefix);
+        let path = package.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        metadata["package"]["tool_protocol"] =
+            serde_yaml::to_value(json!({"identity":"atem-xml","version":"v1"})).unwrap();
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        let done =
+            "node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }";
+        let waiting = "node { input: \"responding\" output: \"needs_input\" op_type: \"Not\" }";
+        assert!(graph.contains(done) && graph.contains(waiting));
+        let graph = graph.replace(done, "node { input: \"cancelling\" output: \"done\" op_type: \"Identity\" }")
+            .replace(waiting,"initializer { name: \"xml_wait\" data_type: 9 int32_data: 1 }\nnode { input: \"xml_wait\" output: \"needs_input\" op_type: \"Identity\" }");
+        std::fs::write(path, graph).unwrap();
+        let (state, address, task) = server_for_package(package.path()).await;
+        let mut client = connect(address).await;
+        configure_fragment_client(&mut client).await;
+        send(&mut client, json!({"type":"response.create"})).await;
+        assert_eq!(event(&mut client).await["type"], "response.created");
+        let item = event(&mut client).await;
+        assert_eq!(item["type"], "response.output_item.added", "{item}");
+        assert_eq!(item["item"]["name"], "lookup");
+        let delta = event(&mut client).await;
+        assert_eq!(
+            delta["type"], "response.function_call_arguments.delta",
+            "{delta}"
+        );
+        assert_eq!(delta["delta"], r#"{"city":"Paris""#);
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            assert_ne!(
+                output["type"], "response.function_call_arguments.done",
+                "{output}"
+            );
+            if output["type"] == "response.done" {
+                assert_eq!(output["response"]["status"], "cancelled");
+                assert_eq!(
+                    output["response"]["output"][0]["arguments"],
+                    r#"{"city":"Paris""#
+                );
+                break;
+            }
+        }
+        send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":item["item"]["call_id"],"output":"hello"}})).await;
+        assert_eq!(event(&mut client).await["type"], "error");
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_tool_fragments_keep_opaque_wire_id_and_condition_results_with_late_model_id()
+    {
+        let package = fragment_tool_package(false, true);
+        let (state, address, task) = server_for_package(package.path()).await;
+        let mut client = connect(address).await;
+        configure_fragment_client(&mut client).await;
+        send(&mut client, json!({"type":"response.create"})).await;
+        let mut wire_id = None;
+        let mut deltas = Vec::new();
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            if output["type"] == "response.output_item.added" {
+                assert!(wire_id.is_none());
+                wire_id = Some(output["item"]["call_id"].as_str().unwrap().to_owned());
+                assert_ne!(wire_id.as_deref(), Some("model_late"));
+            }
+            if output["type"] == "response.function_call_arguments.delta" {
+                assert_eq!(output["call_id"].as_str(), wire_id.as_deref());
+                deltas.push(output["delta"].as_str().unwrap().to_owned());
+            }
+            if output["type"] == "response.function_call_arguments.done" {
+                assert_eq!(output["arguments"], deltas.concat());
+            }
+            if output["type"] == "response.done" {
+                assert_eq!(deltas, [r#"{"city":"Pa"#, r#"ris"}"#]);
+                assert_eq!(
+                    output["response"]["output"][0]["call_id"].as_str(),
+                    wire_id.as_deref()
+                );
+                assert_eq!(
+                    output["response"]["output"][0]["arguments"],
+                    r#"{"city":"Paris"}"#
+                );
+                assert_eq!(output["response"]["usage"]["output_tokens"], 3);
+                break;
+            }
+        }
+        send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"model_late","output":"hello"}})).await;
+        assert_eq!(event(&mut client).await["type"], "error");
+        send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":wire_id.unwrap(),"output":"hello"}})).await;
+        // The authored template raises if conditioning receives the wire ID
+        // instead of model_late; these acknowledgements follow native execution.
+        assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+        assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_tool_prefix_at_token_limit_completes_and_keeps_session_usable() {
         for native_budget_stop in [false, true] {
@@ -1520,47 +1845,57 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_required_tool_grammar_masks_native_selection() {
-        let package = tool_package_from(
-            "realtime-constrained",
-            "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
-        );
-        let (state, address, task) = server_for_package(package.path()).await;
-        let mut client = connect(address).await;
-        assert_eq!(event(&mut client).await["type"], "session.created");
-        send(&mut client, json!({"type":"session.update","session":{"output_modalities":["text"],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
-        assert_eq!(event(&mut client).await["type"], "session.updated");
-        send(&mut client, json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
-        assert_eq!(event(&mut client).await["type"], "conversation.item.added");
-        assert_eq!(event(&mut client).await["type"], "conversation.item.done");
-        send(&mut client, json!({"type":"response.create"})).await;
-        let mut observed = Vec::new();
-        loop {
-            let output = event(&mut client).await;
-            observed.push(output.clone());
-            assert_ne!(output["type"], "error", "{observed:?}");
-            if output["type"] == "response.done" {
-                assert_eq!(output["response"]["usage"]["output_tokens"], 1);
-                assert_eq!(output["response"]["output"][0]["name"], "lookup");
-                assert_eq!(
-                    serde_json::from_str::<Value>(
-                        output["response"]["output"][0]["arguments"]
-                            .as_str()
-                            .unwrap()
-                    )
-                    .unwrap(),
-                    json!({"city":"Paris"})
-                );
-                break;
+        for body in [
+            r#"{"name":"lookup","arguments":{"city":"Paris"}}"#,
+            r#"{"id":"call_lookup","name":"lookup","arguments":{"city":"Paris"}}"#,
+            r#"{"id":"call_lookup","arguments":{"city":"Paris"},"name":"lookup"}"#,
+            r#"{"name":"lookup","id":"call_lookup","arguments":{"city":"Paris"}}"#,
+            r#"{"name":"lookup","arguments":{"city":"Paris"},"id":"call_lookup"}"#,
+            r#"{"arguments":{"city":"Paris"},"id":"call_lookup","name":"lookup"}"#,
+            r#"{"arguments":{"city":"Paris"},"name":"lookup","id":"call_lookup"}"#,
+        ] {
+            let package = tool_package_from(
+                "realtime-constrained",
+                &format!("<tool_call>\n{body}\n</tool_call>"),
+            );
+            let (state, address, task) = server_for_package(package.path()).await;
+            let mut client = connect(address).await;
+            assert_eq!(event(&mut client).await["type"], "session.created");
+            send(&mut client, json!({"type":"session.update","session":{"output_modalities":["text"],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+            assert_eq!(event(&mut client).await["type"], "session.updated");
+            send(&mut client, json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+            assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+            assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+            send(&mut client, json!({"type":"response.create"})).await;
+            let mut observed = Vec::new();
+            loop {
+                let output = event(&mut client).await;
+                observed.push(output.clone());
+                assert_ne!(output["type"], "error", "{observed:?}");
+                if output["type"] == "response.done" {
+                    assert_eq!(output["response"]["usage"]["output_tokens"], 1);
+                    assert_eq!(output["response"]["output"][0]["name"], "lookup");
+                    assert_eq!(
+                        serde_json::from_str::<Value>(
+                            output["response"]["output"][0]["arguments"]
+                                .as_str()
+                                .unwrap()
+                        )
+                        .unwrap(),
+                        json!({"city":"Paris"})
+                    );
+                    break;
+                }
             }
+            client.close(None).await.unwrap();
+            drop(client);
+            let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+            tokio::task::spawn_blocking(move || model.engine.shutdown())
+                .await
+                .unwrap();
+            task.abort();
+            let _ = task.await;
         }
-        client.close(None).await.unwrap();
-        drop(client);
-        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
-        tokio::task::spawn_blocking(move || model.engine.shutdown())
-            .await
-            .unwrap();
-        task.abort();
-        let _ = task.await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_initializes_native_session_with_rendered_prompt_tokens() {
