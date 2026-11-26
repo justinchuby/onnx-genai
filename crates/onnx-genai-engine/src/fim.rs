@@ -31,6 +31,7 @@ impl FimConfig {
                     extra_context_template: None,
                     additional_stop_tokens: ["<|fim_pad|>", "<|endoftext|>", "<|file_sep|>"]
                         .into_iter()
+                        .filter(|token| tokenizer_config_mentions(config, token))
                         .map(str::to_owned)
                         .collect(),
                     format: InfillOrder::Psm,
@@ -95,6 +96,14 @@ mod tests {
         assert_eq!(fim.middle_token, "<|fim_middle|>");
         assert_eq!(fim.suffix_token, "<|fim_suffix|>");
         assert_eq!(fim.format, InfillOrder::Psm);
+        assert!(fim.additional_stop_tokens.is_empty());
+        let with_stop = json!({"additional_special_tokens":["<|fim_prefix|>","<|fim_middle|>","<|fim_suffix|>","<|file_sep|>"]});
+        assert_eq!(
+            FimConfig::from_tokenizer_config(&with_stop)
+                .unwrap()
+                .additional_stop_tokens,
+            vec!["<|file_sep|>"]
+        );
     }
 
     #[test]

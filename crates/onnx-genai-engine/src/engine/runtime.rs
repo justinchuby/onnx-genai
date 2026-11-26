@@ -3415,11 +3415,19 @@ impl Engine {
         .into_iter()
         .chain(fim_config.additional_stop_tokens.iter().map(String::as_str))
         {
-            if let Some(token_id) = self
+            let token_id = self
                 .tokenizer
                 .as_ref()
-                .and_then(|tokenizer| tokenizer.token_id(token))
-            {
+                .and_then(|tokenizer| tokenizer.token_id(token));
+            anyhow::ensure!(
+                token_id.is_some()
+                    || !fim_config
+                        .additional_stop_tokens
+                        .iter()
+                        .any(|declared| declared == token),
+                "FimConfig.additional_stop_tokens {token:?} is absent from the active tokenizer; register this exact token or remove the declared terminator"
+            );
+            if let Some(token_id) = token_id {
                 push_unique_stop_sequence(
                     &mut options.stop_sequences,
                     StopSequence::Tokens(vec![token_id]),
@@ -4910,6 +4918,30 @@ mod tests {
                 cancel_before_commit,
             )?;
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_fim_rejects_unknown_public_additional_stop_tokens() -> anyhow::Result<()> {
+        let engine = tiny_native_cold_engine()?;
+        let config = FimConfig {
+            prefix_token: "<P>".into(),
+            middle_token: "<M>".into(),
+            suffix_token: "<S>".into(),
+            format: crate::InfillOrder::Psm,
+            extra_context_template: None,
+            additional_stop_tokens: vec!["missing-explicit-fim-terminator".into()],
+        };
+        let error = engine
+            .fim_options(&config, GenerateOptions::default())
+            .unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("FimConfig.additional_stop_tokens"),
+            "{error}"
+        );
+        assert!(error.contains("missing-explicit-fim-terminator"), "{error}");
         Ok(())
     }
 
