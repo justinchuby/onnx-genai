@@ -935,7 +935,8 @@ mod tests {
                             .alloc_raw((elements * metadata.dtype.byte_size()).max(1))
                             .unwrap(),
                         shape: metadata.shape.clone(),
-                        strides: onnx_runtime_ir::compute_contiguous_strides(&metadata.shape),
+                        strides: onnx_runtime_ir::compute_contiguous_strides(&metadata.shape)
+                            .expect("fixture shape has representable contiguous strides"),
                         dtype: metadata.dtype,
                         present: true,
                     }

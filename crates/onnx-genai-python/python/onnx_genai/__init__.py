@@ -1,120 +1,62 @@
-"""onnx_genai — Native text generation.
+"""Native-default Python engine with inert optional reference-library discovery.
 
-Same API as ``nxrt.genai`` (``Engine`` / ``GenerateResult``), with Native
-execution selected by default. ORT remains linked for runtime infrastructure
-and explicit reference tests.
-
-The ONNX Runtime shared library is intentionally **not** bundled in this wheel.
-It is loaded at import time from the installed ``onnxruntime`` (CPU) or
-``onnxruntime-gpu`` (CUDA) wheel, for runtime infrastructure and reference
-execution. Install the CUDA runtime with
-``pip install onnx-genai[cuda]`` on Windows/Linux; on macOS the
-``onnxruntime-ep-mlx`` plugin is pulled in by default for Apple Silicon.
+The engine selects Native by default. Python locates installed optional libraries
+without importing their packages or loading any shared library itself.
 """
 
 from __future__ import annotations
 
-import ctypes
-import glob
+import importlib.util
 import os
 import sys
 from pathlib import Path
 
-# Environment variable through which the native engine can locate the MLX
-# execution-provider plugin (macOS). Spelled out in full for readability.
-_MLX_EP_LIBRARY_ENVIRONMENT_VARIABLE = "ONNX_GENAI_MLX_EP_LIBRARY"
+# Windows loader search handles must outlive the compiled CLI invocation.
+_DLL_DIRECTORY_HANDLES: dict[str, object] = {}
 
 
-def _onnxruntime_capi_directory() -> Path:
-    """Return the ``capi`` directory of the installed onnxruntime package.
-
-    Raises a clear, actionable error if the ``onnxruntime`` (or
-    ``onnxruntime-gpu``) wheel is not installed, since it supplies the ONNX
-    Runtime shared library this extension links against.
-    """
-    try:
-        import onnxruntime  # noqa: F401  (imported for its filesystem location)
-    except ImportError as error:  # pragma: no cover - exercised via install docs
-        raise ImportError(
-            "onnx_genai requires the ONNX Runtime shared library, which is "
-            "provided by the 'onnxruntime' package. Install it with "
-            "'pip install onnxruntime' (CPU) or 'pip install onnx-genai[cuda]' "
-            "(CUDA, Windows/Linux)."
-        ) from error
-
-    capi_directory = Path(onnxruntime.__file__).resolve().parent / "capi"
-    if not capi_directory.is_dir():
-        raise ImportError(
-            f"Could not locate the onnxruntime native library directory at "
-            f"{capi_directory}. The installed onnxruntime package appears to be "
-            f"incomplete."
-        )
-    return capi_directory
+def _package_directory(name: str) -> Path | None:
+    """Locate a top-level package without executing its initialization code."""
+    specification = importlib.util.find_spec(name)
+    if specification is None or specification.origin is None:
+        return None
+    return Path(specification.origin).resolve().parent
 
 
-def _preload_onnxruntime() -> None:
-    """Load libonnxruntime from the onnxruntime package before the extension.
-
-    Our compiled ``_onnx_genai`` module links libonnxruntime dynamically. By
-    loading the exact shared library shipped in the onnxruntime wheel first (and,
-    on Windows, adding its directory to the DLL search path), the operating
-    system resolves the extension's dependency to that already-loaded library.
-    """
-    capi_directory = _onnxruntime_capi_directory()
-
+def _configure_optional_libraries() -> None:
+    """Publish discovery hints; the selected Rust backend loads its libraries."""
+    if not any(
+        name in os.environ for name in ("ONNX_GENAI_ORT_LIB", "ONNX_GENAI_ORT_LIB_DIR")
+    ):
+        package = _package_directory("onnxruntime")
+        if package is not None:
+            capi = package / "capi"
+            if capi.is_dir():
+                os.environ["ONNX_GENAI_ORT_LIB_DIR"] = str(capi)
     if sys.platform.startswith("win"):
-        # Add the capi directory to the DLL search path, then load the DLL so
-        # the extension's import-by-name (onnxruntime.dll) resolves to it.
-        os.add_dll_directory(str(capi_directory))
-        library = capi_directory / "onnxruntime.dll"
-        if library.is_file():
-            ctypes.CDLL(str(library))
-        return
-
-    if sys.platform == "darwin":
-        patterns = ["libonnxruntime.*.dylib", "libonnxruntime.dylib"]
-        flags = os.RTLD_GLOBAL | os.RTLD_NOW
-    else:
-        patterns = ["libonnxruntime.so.*", "libonnxruntime.so"]
-        flags = os.RTLD_GLOBAL | os.RTLD_NOW
-
-    for pattern in patterns:
-        matches = sorted(glob.glob(str(capi_directory / pattern)))
-        if matches:
-            # Load with RTLD_GLOBAL so the extension's DT_NEEDED (tracked by the
-            # library's SONAME / install name) is satisfied by this object.
-            ctypes.CDLL(matches[-1], mode=flags)
-            return
-
-    raise ImportError(
-        f"Could not find the ONNX Runtime shared library under {capi_directory}."
-    )
+        library = os.environ.get("ONNX_GENAI_ORT_LIB")
+        directory = (
+            str(Path(library).resolve().parent)
+            if library
+            else os.environ.get("ONNX_GENAI_ORT_LIB_DIR")
+        )
+        if (
+            directory
+            and Path(directory).is_dir()
+            and directory not in _DLL_DIRECTORY_HANDLES
+        ):
+            _DLL_DIRECTORY_HANDLES[directory] = os.add_dll_directory(directory)
+    if sys.platform == "darwin" and "ONNX_GENAI_MLX_EP_LIBRARY" not in os.environ:
+        package = _package_directory("onnxruntime_ep_mlx")
+        if package is not None:
+            library = package / "libonnxruntime_mlx_ep.dylib"
+            if library.is_file():
+                os.environ["ONNX_GENAI_MLX_EP_LIBRARY"] = str(library)
 
 
-def _configure_mlx_execution_provider() -> None:
-    """Expose the MLX execution-provider plugin path to the native engine (macOS).
+# Discovery records optional reference-library hints without importing ORT or MLX.
+_configure_optional_libraries()
 
-    ``onnxruntime-ep-mlx`` ships the plugin dylib bundled in the wheel. We record
-    its absolute path in an environment variable so the engine can register it
-    with ONNX Runtime; failures here are non-fatal (MLX simply stays disabled).
-    """
-    if sys.platform != "darwin":
-        return
-    if _MLX_EP_LIBRARY_ENVIRONMENT_VARIABLE in os.environ:
-        return
-    try:
-        import onnxruntime_ep_mlx
-
-        library_path = onnxruntime_ep_mlx.library_path()
-    except Exception:  # pragma: no cover - MLX plugin is optional at runtime
-        return
-    if library_path and os.path.isfile(library_path):
-        os.environ[_MLX_EP_LIBRARY_ENVIRONMENT_VARIABLE] = str(library_path)
-
-
-_preload_onnxruntime()
-_configure_mlx_execution_provider()
-
-from ._onnx_genai import Engine, GenerateResult, __version__  # noqa: E402
+from ._onnx_genai import Engine, GenerateResult, __version__
 
 __all__ = ["Engine", "GenerateResult", "__version__"]

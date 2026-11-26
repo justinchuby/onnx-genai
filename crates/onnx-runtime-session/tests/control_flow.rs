@@ -10,7 +10,7 @@ use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
     static_shape,
 };
-use onnx_runtime_session::{InferenceSession, SessionError, Tensor};
+use onnx_runtime_session::{InferenceSession, Tensor};
 
 // --- construction helpers ---------------------------------------------------
 
@@ -1265,56 +1265,225 @@ fn scan_zero_trip_preserves_state_and_builds_typed_empty_output() {
     assert_eq!(session.control_flow_stats().subgraph_runs, 0);
 }
 
-#[test]
-fn scan_rejects_zero_element_nonleading_output_axis_stack_overflow() {
-    const HUGE: usize = 7_000_000_000_000_000_000;
+fn packed_transport_cases() -> [(DataType, &'static [u8], &'static [u8]); 7] {
+    [
+        (DataType::Int2, &[0xf9], &[0x79, 0x0e]),
+        (DataType::Uint2, &[0xf9], &[0x79, 0x0e]),
+        (DataType::Int4, &[0x21, 0xf3], &[0x21, 0x13, 0x32]),
+        (DataType::Uint4, &[0x21, 0xf3], &[0x21, 0x13, 0x32]),
+        (DataType::Float4E2M1, &[0x21, 0xf3], &[0x21, 0x13, 0x32]),
+        (
+            DataType::Float6E2M3,
+            &[0x81, 0x30, 0xfc],
+            &[0x81, 0x30, 0x04, 0xc2, 0x00],
+        ),
+        (
+            DataType::Float6E3M2,
+            &[0x81, 0x30, 0xfc],
+            &[0x81, 0x30, 0x04, 0xc2, 0x00],
+        ),
+    ]
+}
 
-    let mut body = Graph::new();
-    let body_x = capture(&mut body, "x", DataType::Float32, &[HUGE, 0]);
-    body.add_input(body_x);
-    let body_y = op(
-        &mut body,
+fn packed_if_branch(opset: u64, dtype: DataType) -> Graph {
+    let mut branch = new_parent_at_opset(opset);
+    let x = capture(&mut branch, "X", dtype, &[3]);
+    let output = op(
+        &mut branch,
         "Identity",
-        &[body_x],
-        Some("scan_out"),
-        DataType::Float32,
-        &[HUGE, 0],
+        &[x],
+        Some("branch_output"),
+        dtype,
+        &[3],
         &[],
     );
-    body.add_output(body_y);
+    branch.add_output(output);
+    branch
+}
 
-    let mut g = new_parent_at_opset(16);
-    let x = input(&mut g, "X", DataType::Float32, &[HUGE, 0, 3]);
-    // Keep the declared output zero-sized without overflowing eager buffer
-    // planning; Scan computes the actual [HUGE, 3, 0] shape before storing it.
-    let y = g.create_named_value("Y", DataType::Float32, static_shape([HUGE, 0, 3]));
-    let node = control_flow_node(
-        &mut g,
-        "Scan",
-        vec![Some(x)],
-        vec![y],
-        &[
-            ("num_scan_inputs", Attribute::Int(1)),
-            ("scan_input_axes", Attribute::Ints(vec![2])),
-            ("scan_output_axes", Attribute::Ints(vec![1])),
-        ],
-    );
-    register(&mut g, node, "body", body);
-    g.add_output(y);
+#[test]
+fn packed_if_transports_exact_bytes_before_dtype_schema_opsets() {
+    const OPSET: u64 = 18;
+    for (dtype, input_bytes, _) in packed_transport_cases() {
+        let mut graph = new_parent_at_opset(OPSET);
+        let condition = input(&mut graph, "condition", DataType::Bool, &[]);
+        input(&mut graph, "X", dtype, &[3]);
+        let output = graph.create_named_value("Y", dtype, static_shape([3]));
+        let node = control_flow_node(&mut graph, "If", vec![Some(condition)], vec![output], &[]);
+        register(
+            &mut graph,
+            node,
+            "then_branch",
+            packed_if_branch(OPSET, dtype),
+        );
+        register(
+            &mut graph,
+            node,
+            "else_branch",
+            packed_if_branch(OPSET, dtype),
+        );
+        graph.add_output(output);
 
-    let mut session = InferenceSession::from_graph(g).expect("build session");
-    let x = Tensor::from_f32(&[HUGE, 0, 3], &[]).unwrap();
-    let err = session
-        .run(&[("X", &x)])
-        .expect_err("Scan stacking must reject overflowing zero-element shapes");
-    assert!(
-        matches!(
-            &err,
-            SessionError::ShapeOverflow { value, .. }
-                if value == "stacked tensor output row count"
-        ),
-        "unexpected error: {err}"
+        let mut session = InferenceSession::from_graph(graph)
+            .unwrap_or_else(|error| panic!("build If-{OPSET} for {dtype:?}: {error}"));
+        let x = Tensor::from_raw(dtype, vec![3], input_bytes).unwrap();
+        for predicate in [false, true] {
+            let condition = Tensor::from_raw(DataType::Bool, vec![], &[predicate as u8]).unwrap();
+            let outputs = session
+                .run(&[("condition", &condition), ("X", &x)])
+                .unwrap_or_else(|error| panic!("run If-{OPSET} for {dtype:?}: {error}"));
+            assert_eq!(outputs[0].dtype, dtype);
+            assert_eq!(outputs[0].shape, [3]);
+            assert_eq!(outputs[0].as_bytes(), input_bytes);
+        }
+    }
+}
+
+fn packed_loop_transport_body(opset: u64, dtype: DataType) -> Graph {
+    let mut body = new_parent_at_opset(opset);
+    input(&mut body, "iter", DataType::Int64, &[]);
+    let condition = input(&mut body, "condition", DataType::Bool, &[]);
+    let carried = input(&mut body, "carried", dtype, &[3]);
+    let condition_out = op(
+        &mut body,
+        "Identity",
+        &[condition],
+        Some("condition_out"),
+        DataType::Bool,
+        &[],
+        &[],
     );
+    let carried_out = op(
+        &mut body,
+        "Identity",
+        &[carried],
+        Some("carried_out"),
+        dtype,
+        &[3],
+        &[],
+    );
+    let scan_out = op(
+        &mut body,
+        "Identity",
+        &[carried],
+        Some("scan_out"),
+        dtype,
+        &[3],
+        &[],
+    );
+    body.add_output(condition_out);
+    body.add_output(carried_out);
+    body.add_output(scan_out);
+    body
+}
+
+#[test]
+fn packed_loop_carry_and_scan_transport_exact_bytes_before_dtype_schema_opsets() {
+    const OPSET: u64 = 18;
+    for (dtype, input_bytes, stacked_bytes) in packed_transport_cases() {
+        let mut graph = new_parent_at_opset(OPSET);
+        let trips = init(&mut graph, "trips", DataType::Int64, &[], i64_bytes(&[2]));
+        let condition = init(&mut graph, "condition", DataType::Bool, &[], vec![1]);
+        let initial = input(&mut graph, "X", dtype, &[3]);
+        let carried = graph.create_named_value("carried", dtype, static_shape([3]));
+        let scan = graph.create_named_value("scan", dtype, static_shape([2, 3]));
+        let node = control_flow_node(
+            &mut graph,
+            "Loop",
+            vec![Some(trips), Some(condition), Some(initial)],
+            vec![carried, scan],
+            &[],
+        );
+        register(
+            &mut graph,
+            node,
+            "body",
+            packed_loop_transport_body(OPSET, dtype),
+        );
+        graph.add_output(carried);
+        graph.add_output(scan);
+
+        let mut session = InferenceSession::from_graph(graph)
+            .unwrap_or_else(|error| panic!("build Loop-{OPSET} for {dtype:?}: {error}"));
+        let x = Tensor::from_raw(dtype, vec![3], input_bytes).unwrap();
+        let outputs = session
+            .run(&[("X", &x)])
+            .unwrap_or_else(|error| panic!("run Loop-{OPSET} for {dtype:?}: {error}"));
+        assert_eq!(outputs[0].dtype, dtype);
+        assert_eq!(outputs[0].shape, [3]);
+        assert_eq!(outputs[0].as_bytes(), input_bytes);
+        assert_eq!(outputs[1].dtype, dtype);
+        assert_eq!(outputs[1].shape, [2, 3]);
+        assert_eq!(outputs[1].as_bytes(), stacked_bytes);
+    }
+}
+
+fn packed_scan_transport_body(opset: u64, dtype: DataType) -> Graph {
+    let mut body = new_parent_at_opset(opset);
+    let state = input(&mut body, "state", dtype, &[3]);
+    let slice = input(&mut body, "slice", dtype, &[3]);
+    let state_out = op(
+        &mut body,
+        "Identity",
+        &[state],
+        Some("state_out"),
+        dtype,
+        &[3],
+        &[],
+    );
+    let scan_out = op(
+        &mut body,
+        "Identity",
+        &[slice],
+        Some("scan_out"),
+        dtype,
+        &[3],
+        &[],
+    );
+    body.add_output(state_out);
+    body.add_output(scan_out);
+    body
+}
+
+#[test]
+fn packed_scan_state_and_slices_transport_exact_bytes_before_dtype_schema_opsets() {
+    const OPSET: u64 = 18;
+    for (dtype, state_bytes, scan_bytes) in packed_transport_cases() {
+        let mut graph = new_parent_at_opset(OPSET);
+        let state = input(&mut graph, "state", dtype, &[3]);
+        let scan_input = input(&mut graph, "scan_input", dtype, &[2, 3]);
+        let final_state = graph.create_named_value("final_state", dtype, static_shape([3]));
+        let scan_output = graph.create_named_value("scan_output", dtype, static_shape([2, 3]));
+        let node = control_flow_node(
+            &mut graph,
+            "Scan",
+            vec![Some(state), Some(scan_input)],
+            vec![final_state, scan_output],
+            &[("num_scan_inputs", Attribute::Int(1))],
+        );
+        register(
+            &mut graph,
+            node,
+            "body",
+            packed_scan_transport_body(OPSET, dtype),
+        );
+        graph.add_output(final_state);
+        graph.add_output(scan_output);
+
+        let mut session = InferenceSession::from_graph(graph)
+            .unwrap_or_else(|error| panic!("build Scan-{OPSET} for {dtype:?}: {error}"));
+        let state = Tensor::from_raw(dtype, vec![3], state_bytes).unwrap();
+        let scan_input = Tensor::from_raw(dtype, vec![2, 3], scan_bytes).unwrap();
+        let outputs = session
+            .run(&[("state", &state), ("scan_input", &scan_input)])
+            .unwrap_or_else(|error| panic!("run Scan-{OPSET} for {dtype:?}: {error}"));
+        assert_eq!(outputs[0].dtype, dtype);
+        assert_eq!(outputs[0].shape, [3]);
+        assert_eq!(outputs[0].as_bytes(), state_bytes);
+        assert_eq!(outputs[1].dtype, dtype);
+        assert_eq!(outputs[1].shape, [2, 3]);
+        assert_eq!(outputs[1].as_bytes(), scan_bytes);
+    }
 }
 
 #[test]

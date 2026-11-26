@@ -420,7 +420,8 @@ mod tests {
         Owned {
             bytes: data.iter().map(|&v| v as u8).collect(),
             shape: shape.to_vec(),
-            strides: onnx_runtime_ir::compute_contiguous_strides(shape),
+            strides: onnx_runtime_ir::compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
             dtype: DataType::Int8,
         }
     }

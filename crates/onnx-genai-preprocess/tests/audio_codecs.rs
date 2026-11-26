@@ -4,7 +4,11 @@ use serde_json::json;
 const MP3: &[u8] = include_bytes!("../../../tests/fixtures/audio/stereo-tone.mp3");
 #[test]
 fn mp3_gapless_stereo_mean_matches_independent_pcm_reference() {
-    let actual = decode_audio(MP3).unwrap();
+    let actual = decode_audio(
+        MP3,
+        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+    )
+    .unwrap();
     assert_eq!(actual.sample_rate, 16000);
     let reference = include_bytes!("../../../tests/fixtures/audio/stereo-tone-reference.f32le")
         .chunks_exact(4)
@@ -33,12 +37,25 @@ fn authored_decode_program_accepts_mp3_and_preserves_valid_samples() {
         "outputs":[{"name":"wave","source":"wave","content":"waveform","dtype":"float32"},{"name":"count","source":"count","content":"valid_samples","dtype":"int64"}]
     })).unwrap();
     let program = AudioProgram::from_program(&declaration).unwrap();
-    let outputs = program.run(&[MP3]).unwrap();
+    let outputs = program
+        .run(
+            &[MP3],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     assert_eq!(outputs[0].shape, [1, 1600]);
     let AudioTensorData::Fp32(actual) = &outputs[0].data else {
         panic!("waveform dtype")
     };
-    assert_eq!(actual, &decode_audio(MP3).unwrap().samples);
+    assert_eq!(
+        actual,
+        &decode_audio(
+            MP3,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY
+        )
+        .unwrap()
+        .samples
+    );
     let AudioTensorData::Int64(count) = &outputs[1].data else {
         panic!("count dtype")
     };
@@ -47,14 +64,23 @@ fn authored_decode_program_accepts_mp3_and_preserves_valid_samples() {
 #[test]
 fn malformed_encoded_audio_fails_actionably_and_pcm16_wav_is_unchanged() {
     for bytes in [&[][..], &b"ID3bad"[..], &MP3[..20]] {
-        let error = decode_audio(bytes).unwrap_err().to_string();
+        let error = decode_audio(
+            bytes,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("encoded audio") && error.contains("supported audio"),
             "{error}"
         );
     }
     let wav = encode_wav_pcm16(&[-0.5, 0.0, 0.5], 8000, 1).unwrap();
-    let actual = decode_audio(&wav).unwrap();
+    let actual = decode_audio(
+        &wav,
+        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+    )
+    .unwrap();
     assert_eq!(actual.sample_rate, 8000);
     assert_eq!(actual.samples, [-0.5, 0.0, 0.5]);
 }
@@ -67,7 +93,10 @@ fn symphonia_codec_matrix_matches_independent_pcm_references() {
     let mut failures = Vec::new();
     for case in manifest["cases"].as_array().unwrap() {
         let name = case["file"].as_str().unwrap();
-        let decoded = match decode_audio(&std::fs::read(root.join(name)).unwrap()) {
+        let decoded = match decode_audio(
+            &std::fs::read(root.join(name)).unwrap(),
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        ) {
             Ok(value) => value,
             Err(error) => {
                 failures.push(format!("{name}: {error}"));
@@ -111,20 +140,35 @@ fn float_wav_transport_preserves_precision_empty_clips_and_finite_guards() {
     use onnx_genai_preprocess::audio::encode_wav_f32;
     let values = [0.1234567, -0.0000001, 1.25, -1.5];
     let mut bytes = encode_wav_f32(&values, 8000, 1).unwrap();
-    assert_eq!(decode_audio(&bytes).unwrap().samples, values);
+    assert_eq!(
+        decode_audio(
+            &bytes,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY
+        )
+        .unwrap()
+        .samples,
+        values
+    );
     let data = bytes.windows(4).position(|chunk| chunk == b"data").unwrap() + 8;
     bytes[data..data + 4].copy_from_slice(&f32::NAN.to_le_bytes());
     assert!(
-        decode_audio(&bytes)
-            .unwrap_err()
-            .to_string()
-            .contains("nonfinite")
+        decode_audio(
+            &bytes,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("nonfinite")
     );
     for bytes in [
         encode_wav_f32(&[], 8000, 1).unwrap(),
         encode_wav_pcm16(&[], 8000, 1).unwrap(),
     ] {
-        let decoded = decode_audio(&bytes).unwrap();
+        let decoded = decode_audio(
+            &bytes,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
         assert_eq!(decoded.sample_rate, 8000);
         assert!(decoded.samples.is_empty());
     }
@@ -139,8 +183,13 @@ fn float_wav_transport_preserves_precision_empty_clips_and_finite_guards() {
 }
 #[test]
 fn unsupported_codec_preserves_the_decoder_cause_and_repair_guidance() {
-    let bytes = include_bytes!("../../../tests/fixtures/audio/codec-matrix/unsupported-opus.ogg");
-    let error = decode_audio(bytes).unwrap_err();
+    let mut bytes = encode_wav_pcm16(&[0.5; 8], 8000, 1).unwrap();
+    bytes[20..22].copy_from_slice(&0xffff_u16.to_le_bytes());
+    let error = decode_audio(
+        &bytes,
+        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+    )
+    .unwrap_err();
     assert!(
         std::error::Error::source(&error).is_some(),
         "codec error cause must survive"

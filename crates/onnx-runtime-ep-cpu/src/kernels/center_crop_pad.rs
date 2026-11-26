@@ -64,7 +64,7 @@ impl Kernel for CenterCropPadKernel {
 
         let esize = elem_size(inputs[0].dtype)?;
         let source = to_dense_bytes(&inputs[0])?;
-        let source_strides = compute_contiguous_strides(inputs[0].shape);
+        let source_strides = compute_contiguous_strides(inputs[0].shape)?;
         let mut output = vec![0; numel(&target) * esize];
         if !output.is_empty() {
             let mut index = vec![0; rank];

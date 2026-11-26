@@ -96,6 +96,13 @@ struct Step {
     budget: RealtimeTokenBudget,
     reply: oneshot::Sender<anyhow::Result<RealtimeOutput>>,
 }
+enum ConnectionRequest {
+    Quantum(Step),
+    ArmConstraint {
+        constraint: Option<onnx_genai_engine::GenerateConstraint>,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+}
 struct ConnectionCancellation(Arc<AtomicBool>);
 impl Drop for ConnectionCancellation {
     fn drop(&mut self) {
@@ -106,11 +113,26 @@ impl Drop for ConnectionCancellation {
 /// A single producer with one in-flight request and a bounded native mailbox.
 /// Dropping it cancels a running quantum and closes the worker's receiver.
 pub(crate) struct RealtimeConnection {
-    steps: mpsc::Sender<Step>,
+    steps: mpsc::Sender<ConnectionRequest>,
     _cancellation: ConnectionCancellation,
     budget: RealtimeTokenBudget,
 }
 impl RealtimeConnection {
+    /// Prepare a response-local constraint on the native owner without running
+    /// a quantum or consuming input/usage. Generate retains its existing path.
+    pub(crate) async fn arm_constraint(
+        &mut self,
+        constraint: Option<onnx_genai_engine::GenerateConstraint>,
+    ) -> anyhow::Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.steps
+            .send(ConnectionRequest::ArmConstraint { constraint, reply })
+            .await
+            .context("native realtime connection closed before constraint admission")?;
+        response
+            .await
+            .context("native realtime worker closed before arming response sampling")?
+    }
     pub(crate) fn set_budget(&mut self, budget: RealtimeTokenBudget) {
         self.budget = budget;
     }
@@ -120,11 +142,11 @@ impl RealtimeConnection {
     ) -> anyhow::Result<RealtimeOutput> {
         let (reply, response) = oneshot::channel();
         self.steps
-            .send(Step {
+            .send(ConnectionRequest::Quantum(Step {
                 input,
                 budget: self.budget,
                 reply,
-            })
+            }))
             .await
             .context("native realtime connection closed before quantum admission")?;
         response
@@ -137,7 +159,7 @@ pub(crate) struct RealtimeCommand {
     mode: RealtimeMode,
     initial_tokens: Vec<u32>,
     ready: oneshot::Sender<anyhow::Result<RealtimeOutput>>,
-    steps: mpsc::Receiver<Step>,
+    steps: mpsc::Receiver<ConnectionRequest>,
     cancelled: Arc<AtomicBool>,
     // Release admission before publishing the worker as idle. Fields drop in
     // declaration order, including initialization failures and disconnects.
@@ -232,8 +254,18 @@ impl RealtimeCommand {
                     step = self.steps.recv() => step,
                 }
             });
-            let Some(step) = next else {
-                break;
+            let step = match next {
+                None => break,
+                Some(ConnectionRequest::ArmConstraint { constraint, reply }) => {
+                    // Compilation is transactional and does not execute the
+                    // workflow. Admission rejection need not poison native KV.
+                    if !reply.is_closed() && reply.send(session.set_constraint(constraint)).is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                Some(ConnectionRequest::Quantum(step)) => step,
             };
             if step.reply.is_closed() {
                 continue;

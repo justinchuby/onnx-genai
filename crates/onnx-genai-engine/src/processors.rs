@@ -84,7 +84,8 @@ pub(crate) fn build_processor_chain(
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
+            | GenerateConstraint::Lark { prefix, .. }
+            | GenerateConstraint::XmlToolCall { prefix, .. } => prefix.as_str(),
             GenerateConstraint::Gbnf { .. }
             | GenerateConstraint::RawLark { .. }
             | GenerateConstraint::LazyJsonSchema { .. } => "",
@@ -158,7 +159,7 @@ pub(crate) fn build_processor_chain(
                             crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?
                         }
                     };
-                    let constraint = llguidance::panic_utils::catch_unwind(
+                    let constraint = onnx_genai_llguidance::panic_utils::catch_unwind(
                         std::panic::AssertUnwindSafe(|| {
                             LlguidanceConstraint::from_token_bytes(
                                 GrammarConstraintKind::Lark, &lark, contract.pieces, &endings, "",
@@ -238,6 +239,35 @@ pub(crate) fn build_processor_chain(
                         &terminal_token_ids(options),
                     )?
                 }
+            }
+            GenerateConstraint::XmlToolCall {
+                grammar,
+                prefix: plain,
+            } => {
+                let (kind, prefix) = if let Some(projection) = projection {
+                    (
+                        crate::text_projection::ProjectionKind::Declared(
+                            projection.template().clone(),
+                        ),
+                        projection.prefix(),
+                    )
+                } else {
+                    (
+                        crate::text_projection::ProjectionKind::Plain,
+                        plain.as_str(),
+                    )
+                };
+                Box::new(
+                    crate::response_constraint::ContentConstraint::xml_tool_call(
+                        tokenizer,
+                        grammar,
+                        kind,
+                        prefix,
+                        max_bytes,
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                    )?,
+                )
             }
             GenerateConstraint::Lark {
                 grammar,
@@ -569,7 +599,47 @@ pub(crate) fn device_sampling_plan(
 
 pub(crate) fn load_fim_config_from_model_dir(
     model_dir: &Path,
+    metadata: &onnx_genai_metadata::InferenceMetadata,
+    tokenizer: &Tokenizer,
 ) -> anyhow::Result<Option<FimConfig>> {
+    if let Some(declaration) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.infill.as_ref())
+    {
+        for (role, spelling) in [
+            ("prefix_token", &declaration.prefix_token),
+            ("middle_token", &declaration.middle_token),
+            ("suffix_token", &declaration.suffix_token),
+        ]
+        .into_iter()
+        .chain(
+            declaration
+                .additional_stop_tokens
+                .iter()
+                .map(|spelling| ("additional_stop_tokens", spelling)),
+        ) {
+            let id = tokenizer.token_id(spelling).with_context(||format!("package.infill.{role} {spelling:?} is absent from the package tokenizer; declare an exact registered control token"))?;
+            anyhow::ensure!(
+                tokenizer.encode_with_options(
+                    spelling,
+                    onnx_genai_ort::TokenizationOptions {
+                        add_special: false,
+                        parse_special: true
+                    }
+                ).with_context(|| format!("encode package.infill.{role} {spelling:?}; repair the declared tokenizer control token"))? == [id],
+                "package.infill.{role} must encode to its one declared tokenizer ID; register the control token explicitly"
+            );
+        }
+        return Ok(Some(FimConfig {
+            prefix_token: declaration.prefix_token.clone(),
+            middle_token: declaration.middle_token.clone(),
+            suffix_token: declaration.suffix_token.clone(),
+            format: declaration.order,
+            additional_stop_tokens: declaration.additional_stop_tokens.clone(),
+            extra_context_template: declaration.extra_context_template.clone(),
+        }));
+    }
     let tokenizer_config = model_dir.join("tokenizer_config.json");
     if !tokenizer_config.is_file() {
         return Ok(None);
@@ -611,7 +681,10 @@ fn build_llguidance_constraint(
                 let piece = bytes
                     .get_mut(usize::try_from(id)?)
                     .context("special grammar token is outside the declared byte vocabulary")?;
-                piece.insert(0, llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER);
+                piece.insert(
+                    0,
+                    onnx_genai_llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER,
+                );
             }
         }
         return LlguidanceConstraint::from_token_bytes_with_prefix(
@@ -648,7 +721,7 @@ fn tokenizer_token_texts(tokenizer: &Tokenizer) -> anyhow::Result<Vec<Option<Str
     let mut token_texts = vec![None; max_id + 1];
     for &id in vocab.values() {
         token_texts[id as usize] = Some(
-            llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| tokenizer.decode(&[id]).map_err(anyhow::Error::from)))
+            onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| tokenizer.decode(&[id]).map_err(anyhow::Error::from)))
                 .with_context(|| format!("decode vocabulary token {id} for sampling; repair tokenizer.decoder or this vocabulary entry"))?
         );
     }

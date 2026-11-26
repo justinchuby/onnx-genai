@@ -1,0 +1,166 @@
+{
+  "generator": "actual FFmpeg stream copy of unchanged checked-in Opus packets; independent libopus PCM oracle",
+  "toolchain": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "cases": [
+    {
+      "name": "silk-1",
+      "webm_sha256": "dfe9f68c4491f69dbfc0016f3b6b2728fb5dd7fcd4b1e3c0c1fa8c819e07419a",
+      "reference_sha256": "8c937208ff7bdae44a1742f42fb34cd889bc3d2ff036357a799ad3cc4045bc60",
+      "full_pcm_samples": 11520,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/silk-1.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/silk-1.webm"
+      ]
+    },
+    {
+      "name": "silk-2",
+      "webm_sha256": "0ad8ae2350e4c34e111a779c678123f42f61336b029b7468a94ef6a0e194ef15",
+      "reference_sha256": "2dd399ef733a4888bbe8eef33cba7d2f33da784e1bf2308a6fe910d5cffa7651",
+      "full_pcm_samples": 23040,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/silk-2.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/silk-2.webm"
+      ]
+    },
+    {
+      "name": "hybrid-1",
+      "webm_sha256": "ea069c8971289e40307b81641644f980a9e62298895ffcc90adb261d798d7f87",
+      "reference_sha256": "650858a9ce91eca4a9dff920a47729496fbfcbc10a40b75494d9a7117719c387",
+      "full_pcm_samples": 11520,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/hybrid-1.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/hybrid-1.webm"
+      ]
+    },
+    {
+      "name": "hybrid-2",
+      "webm_sha256": "658c3cc96f15d0135fff3eff7edaea15c1803b0ab864484748efc30f3bbf7ee4",
+      "reference_sha256": "1904be5a08e75281f2d2a748c8264a0488f27f617c918a8c86e6abc23905e252",
+      "full_pcm_samples": 23040,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/hybrid-2.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/hybrid-2.webm"
+      ]
+    },
+    {
+      "name": "celt-1",
+      "webm_sha256": "6d94eb89701659d1140da280db99099eab14477f9d27b4d9c1fd7f0dc708a37e",
+      "reference_sha256": "2400b107c43cd988cbfc379b27ec93221059350effc7b62a26280bad1571bd25",
+      "full_pcm_samples": 11520,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/celt-1.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/celt-1.webm"
+      ]
+    },
+    {
+      "name": "celt-2",
+      "webm_sha256": "e5a20e4aa71c28976ec9b84a9ecb3731aad9a94294a0976be42aaec213b59964",
+      "reference_sha256": "0562ce88e6afef75923f546163cea6686320957aa77a5ce3ee59987c4fe36f81",
+      "full_pcm_samples": 23040,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/celt-2.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/celt-2.webm"
+      ]
+    },
+    {
+      "name": "mapping1-3",
+      "webm_sha256": "24668ba26945f827fc30adff94676dd96117312a2f9a9f555468805cf852102c",
+      "reference_sha256": "fc3fd573be2447ef2610f07bd1e9ea1081be1942dd9ee5f7277f359c6ff6bbb9",
+      "full_pcm_samples": 34560,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/mapping1-3.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/mapping1-3.webm"
+      ]
+    },
+    {
+      "name": "mapping1-6",
+      "webm_sha256": "df131fe7bf5f72393b78de3fcd260931f1d93863bfb07cd5844fa2af57fb9187",
+      "reference_sha256": "97e5b68bee79447ab15287ada1ca3c92c3a3cfbf9715a4f38d77f57ff2b07fa4",
+      "full_pcm_samples": 69120,
+      "max_error": 0.0,
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/mapping1-6.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-webm-opus-normalized/tests/fixtures/audio/opus/mapping1-6.webm"
+      ]
+    }
+  ]
+}

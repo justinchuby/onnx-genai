@@ -2287,7 +2287,7 @@ impl SkipBroadcastMetadataCache {
             "SkipSimplifiedLayerNorm broadcast metadata",
             |key| key.input_shape == input_shape && key.skip_shape == skip_shape,
             || {
-                let metadata = skip_broadcast_metadata(input_shape, skip_shape);
+                let metadata = skip_broadcast_metadata(input_shape, skip_shape)?;
                 Ok((
                     SkipBroadcastMetadataKey {
                         input_shape: input_shape.to_vec(),
@@ -3188,9 +3188,9 @@ fn groups_u_i32(groups: u32) -> i32 {
 
 /// Resolve the optional per-group `Mean` (output slot 1) and `InvStdDev` (slot 2)
 /// device pointers, validating f32 dtype and `num_groups` length when present.
-fn skip_broadcast_metadata(input: &[usize], skip: &[usize]) -> Vec<u64> {
+fn skip_broadcast_metadata(input: &[usize], skip: &[usize]) -> Result<Vec<u64>> {
     let mut metadata = input.iter().map(|&dim| dim as u64).collect::<Vec<_>>();
-    let contiguous = onnx_runtime_ir::compute_contiguous_strides(skip);
+    let contiguous = onnx_runtime_ir::compute_contiguous_strides(skip)?;
     let leading = input.len() - skip.len();
     metadata.extend((0..input.len()).map(|axis| {
         if axis < leading || skip[axis - leading] == 1 {
@@ -3199,7 +3199,7 @@ fn skip_broadcast_metadata(input: &[usize], skip: &[usize]) -> Vec<u64> {
             contiguous[axis - leading] as u64
         }
     }));
-    metadata
+    Ok(metadata)
 }
 
 fn u64_bytes(values: &[u64]) -> &[u8] {
@@ -3431,14 +3431,20 @@ mod tests {
     #[test]
     fn skip_metadata_preserves_dimensions_and_right_aligned_broadcast_strides() {
         assert_eq!(
-            skip_broadcast_metadata(&[1, 2, 4], &[2, 1]),
+            skip_broadcast_metadata(&[1, 2, 4], &[2, 1])
+                .expect("fixture shape has representable contiguous strides"),
             [1, 2, 4, 0, 1, 0]
         );
         assert_eq!(
-            skip_broadcast_metadata(&[2, 1, 4], &[1, 4]),
+            skip_broadcast_metadata(&[2, 1, 4], &[1, 4])
+                .expect("fixture shape has representable contiguous strides"),
             [2, 1, 4, 0, 0, 1]
         );
-        assert_eq!(skip_broadcast_metadata(&[2, 3], &[]), [2, 3, 0, 0]);
+        assert_eq!(
+            skip_broadcast_metadata(&[2, 3], &[])
+                .expect("fixture shape has representable contiguous strides"),
+            [2, 3, 0, 0]
+        );
     }
     #[test]
     fn sources_expose_their_entry_points() {
@@ -3728,9 +3734,11 @@ mod tests {
         hidden: usize,
     ) -> (Vec<f16>, Vec<f16>, Vec<f16>) {
         let shape = [1, hidden];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let gamma_shape = [hidden];
-        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let gamma_strides = compute_contiguous_strides(&gamma_shape)
+            .expect("fixture shape has representable contiguous strides");
         let input = (0..hidden)
             .map(|index| f16::from_f32(((index * 37 % 101) as f32 - 50.0) / 31.0))
             .collect::<Vec<_>>();
@@ -3846,9 +3854,11 @@ mod tests {
         };
         let hidden = 3584usize;
         let shape = [1, hidden];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let gamma_shape = [hidden];
-        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let gamma_strides = compute_contiguous_strides(&gamma_shape)
+            .expect("fixture shape has representable contiguous strides");
         let stat_shape = [1usize];
         let stat_strides = [1i64];
         let input = (0..hidden)
@@ -4017,9 +4027,11 @@ mod tests {
         };
         let hidden = 6656usize; // Muse-Glimmer-30B hidden size.
         let shape = [1usize, hidden];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let gamma_shape = [hidden];
-        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let gamma_strides = compute_contiguous_strides(&gamma_shape)
+            .expect("fixture shape has representable contiguous strides");
         let runtime = ep.runtime();
 
         let input: Vec<bf16> = (0..hidden)
@@ -4308,9 +4320,11 @@ mod tests {
 
     fn run_bf16_norm_gpu(ep: &CudaExecutionProvider, layer_norm: bool) -> Vec<bf16> {
         let shape = [2, 5];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let param_shape = [shape[1]];
-        let param_strides = compute_contiguous_strides(&param_shape);
+        let param_strides = compute_contiguous_strides(&param_shape)
+            .expect("fixture shape has representable contiguous strides");
         let input = (0..shape.iter().product())
             .map(|index| bf16::from_f32((index as f32 - 4.5) / 3.0))
             .collect::<Vec<_>>();
@@ -4451,9 +4465,11 @@ mod tests {
         hidden: usize,
     ) -> (Vec<f16>, Vec<f16>, Vec<f32>) {
         let shape = [1, hidden];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let gamma_shape = [hidden];
-        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let gamma_strides = compute_contiguous_strides(&gamma_shape)
+            .expect("fixture shape has representable contiguous strides");
         let input = (0..hidden)
             .map(|index| f16::from_f32(((index * 37 % 101) as f32 - 50.0) / 31.0))
             .collect::<Vec<_>>();
@@ -4822,9 +4838,11 @@ mod tests {
         let scale_f32: Vec<f32> = (0..hidden).map(|i| 1.0 + ((i % 7) as f32) * 0.03).collect();
 
         let shape = [1usize, hidden];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let param_shape = [hidden];
-        let param_strides = compute_contiguous_strides(&param_shape);
+        let param_strides = compute_contiguous_strides(&param_shape)
+            .expect("fixture shape has representable contiguous strides");
 
         let x_buffer = ep
             .allocate(std::mem::size_of_val(x_bf16.as_slice()), 256)

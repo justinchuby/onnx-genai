@@ -370,6 +370,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbindgen"
+version = "0.29.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ecb53484c9c167ba674026b656d8a27d7657a58e6066aa902bfb1a4aa00ae20"
+dependencies = [
+ "clap",
+ "heck",
+ "indexmap",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1366,6 +1385,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "instant"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "io-extras"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1476,6 +1504,30 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "161c33c3ec738cfea3288c5c53dfcdb32fd4fc2954de86ea06f71b5a1a40bfcd"
+dependencies = [
+ "ahash",
+ "base64 0.22.1",
+ "bytecount",
+ "email_address",
+ "fancy-regex 0.14.0",
+ "fraction",
+ "idna",
+ "itoa",
+ "num-cmp",
+ "once_cell",
+ "percent-encoding",
+ "referencing 0.29.1",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "uuid-simd",
+]
+
+[[package]]
+name = "jsonschema"
 version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f05a6cff806294a7699d48761d4ae2bdebab7fa2eef05e4a0b83320f0ff46901"
@@ -1575,21 +1627,6 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
-
-[[package]]
-name = "llguidance"
-version = "1.9.1"
-dependencies = [
- "anyhow",
- "derivre",
- "indexmap",
- "rayon",
- "referencing 0.29.1",
- "regex-syntax",
- "serde",
- "serde_json",
- "toktrie",
-]
 
 [[package]]
 name = "lock_api"
@@ -2084,10 +2121,10 @@ dependencies = [
  "async-trait",
  "half",
  "libc",
- "llguidance",
  "memmap2",
  "onnx-genai-genai-config",
  "onnx-genai-kv",
+ "onnx-genai-llguidance",
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
@@ -2147,10 +2184,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-llguidance"
+version = "0.1.0-dev.6"
+dependencies = [
+ "anyhow",
+ "cbindgen",
+ "derivre",
+ "indexmap",
+ "instant",
+ "jsonschema 0.29.1",
+ "lazy_static",
+ "rayon",
+ "referencing 0.29.1",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "toktrie",
+]
+
+[[package]]
 name = "onnx-genai-metadata"
 version = "0.1.0-dev.6"
 dependencies = [
- "jsonschema",
+ "jsonschema 0.48.5",
  "schemars",
  "serde",
  "serde_json",
@@ -2219,11 +2276,13 @@ dependencies = [
  "hound",
  "image",
  "onnx-genai-metadata",
+ "onnx-genai-symphonia-mkv",
  "rustfft",
  "serde",
  "serde_json",
  "serde_yaml",
  "symphonia",
+ "symphonia-opus",
 ]
 
 [[package]]
@@ -2314,10 +2373,20 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
- "toml",
+ "toml 0.8.23",
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "onnx-genai-symphonia-mkv"
+version = "0.1.0-dev.6"
+dependencies = [
+ "lazy_static",
+ "log",
+ "symphonia-common",
+ "symphonia-core",
 ]
 
 [[package]]
@@ -3703,6 +3772,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3894,7 +3972,6 @@ dependencies = [
  "symphonia-core",
  "symphonia-format-caf",
  "symphonia-format-isomp4",
- "symphonia-format-mkv",
  "symphonia-format-ogg",
  "symphonia-format-riff",
  "symphonia-metadata",
@@ -4026,18 +4103,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "symphonia-format-mkv"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d015c5c0558864665894b3f4cbd95e10abb01b9c868e751c72670f326a56360e"
-dependencies = [
- "lazy_static",
- "log",
- "symphonia-common",
- "symphonia-core",
-]
-
-[[package]]
 name = "symphonia-format-ogg"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4072,6 +4137,17 @@ dependencies = [
  "regex-lite",
  "smallvec",
  "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-opus"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5af6bc6d58f41f4f5107f0b58c2f128fd24531b104bc3ef13e1e50785994c63c"
+dependencies = [
+ "log",
+ "symphonia-core",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4380,9 +4456,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
  "serde",
- "serde_spanned",
- "toml_datetime",
+ "serde_spanned 0.6.9",
+ "toml_datetime 0.6.11",
  "toml_edit",
+]
+
+[[package]]
+name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned 1.1.1",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -4395,6 +4486,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "toml_edit"
 version = "0.22.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4402,10 +4502,19 @@ checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
 dependencies = [
  "indexmap",
  "serde",
- "serde_spanned",
- "toml_datetime",
+ "serde_spanned 0.6.9",
+ "toml_datetime 0.6.11",
  "toml_write",
- "winnow",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
+dependencies = [
+ "winnow 1.0.3",
 ]
 
 [[package]]
@@ -4413,6 +4522,12 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toml_writer"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tower"
@@ -4661,12 +4776,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "uuid"
+version = "1.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "uuid-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b082222b4f6619906941c17eb2297fff4c2fb96cb60164170522942a200bd8"
 dependencies = [
  "outref",
+ "uuid",
  "vsimd",
 ]
 
@@ -4979,6 +5105,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "winnow"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
+
+[[package]]
 name = "winx"
 version = "0.36.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5008,7 +5140,7 @@ dependencies = [
  "clap",
  "onnx-runtime-operator-selection",
  "serde",
- "toml",
+ "toml 0.8.23",
 ]
 
 [[package]]

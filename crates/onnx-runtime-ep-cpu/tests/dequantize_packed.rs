@@ -49,7 +49,8 @@ fn cpu_dequantize_packed_conformance() {
                     DevicePtrMut(bytes.as_mut_ptr().cast()),
                     dtype,
                     shape,
-                    &compute_contiguous_strides(shape),
+                    &compute_contiguous_strides(shape)
+                        .expect("fixture shape has representable contiguous strides"),
                     DeviceId::cpu(),
                 )],
             )

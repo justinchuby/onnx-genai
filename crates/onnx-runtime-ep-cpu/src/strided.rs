@@ -96,7 +96,7 @@ pub fn view_in_bounds(
         });
     }
     // An empty tensor addresses no bytes; the origin itself need not be valid.
-    if numel(shape) == 0 {
+    if shape.contains(&0) {
         return Ok(());
     }
     let (min_elem, max_elem) = addressed_elem_range(shape, strides);
@@ -271,6 +271,12 @@ mod tests {
     #[test]
     fn empty_tensor_is_in_bounds() {
         assert!(view_in_bounds(&[0, 5], &[5, 1], 0, 4, 0).is_ok());
+        for shape in [[0, usize::MAX, 2], [usize::MAX, 0, 2], [usize::MAX, 2, 0]] {
+            assert!(view_in_bounds(&shape, &[i64::MIN; 3], usize::MAX, 4, 0).is_ok());
+            assert!(view_in_bounds(&shape, &[0; 2], 0, 4, 0).is_err());
+        }
+        assert!(view_in_bounds(&[], &[], 0, 4, 0).is_err());
+        assert!(view_in_bounds(&[], &[], 0, 4, 4).is_ok());
     }
 
     /// H-D1 (bounds layer): a view whose `max_elem * esize` would overflow i64

@@ -1,0 +1,141 @@
+{
+  "oracle": "ffmpeg 9.0.2, explicit libopus 1.6.1 decoder",
+  "sample_rate": 48000,
+  "maximum_absolute_error": 3.0517578125e-05,
+  "cases": [
+    {
+      "name": "silk-1",
+      "channels": 1,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "001e11934c9d266330fb98e0cdc542af0a9842803b3f1ae5d7b0d75573bf0c08",
+        ".reference.f32": "8c937208ff7bdae44a1742f42fb34cd889bc3d2ff036357a799ad3cc4045bc60"
+      }
+    },
+    {
+      "name": "silk-2",
+      "channels": 2,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "06f6287adece01f48d68388a1954370e3831f7eba12899f61e052e9ea57255a4",
+        ".reference.f32": "2dd399ef733a4888bbe8eef33cba7d2f33da784e1bf2308a6fe910d5cffa7651"
+      }
+    },
+    {
+      "name": "hybrid-1",
+      "channels": 1,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "08f527719d56ae498eb683070a304728fb8ed1647b4fdd36ee1720f39d5e9060",
+        ".reference.f32": "650858a9ce91eca4a9dff920a47729496fbfcbc10a40b75494d9a7117719c387"
+      }
+    },
+    {
+      "name": "hybrid-2",
+      "channels": 2,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "94f08bb9fdc16b584b059cb4c4e39b6a4a950633ae545d66b0fd134cf00ecac5",
+        ".reference.f32": "1904be5a08e75281f2d2a748c8264a0488f27f617c918a8c86e6abc23905e252"
+      }
+    },
+    {
+      "name": "celt-1",
+      "channels": 1,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "ee0578a12def2bd773c3819748dff623769e3174af8344d6580a28966cf607eb",
+        ".reference.f32": "2400b107c43cd988cbfc379b27ec93221059350effc7b62a26280bad1571bd25"
+      }
+    },
+    {
+      "name": "celt-2",
+      "channels": 2,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "fc5f370bf158a10bd7322d5ffdf527118d437d2e6c621167f66ee30b0ff4f7c9",
+        ".reference.f32": "0562ce88e6afef75923f546163cea6686320957aa77a5ce3ee59987c4fe36f81"
+      }
+    },
+    {
+      "name": "mapping1-3",
+      "channels": 3,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "6653101bcd6790094feccf936ac0abc63c53f9bf6d57ee3a61e3b778724fb622",
+        ".reference.f32": "fc3fd573be2447ef2610f07bd1e9ea1081be1942dd9ee5f7277f359c6ff6bbb9"
+      }
+    },
+    {
+      "name": "mapping1-6",
+      "channels": 6,
+      "frames": 11520,
+      "sha256": {
+        ".ogg": "7227d82f8293debf5c5aa29ff6f19f8005683d883e702ae76d8850c7510b919b",
+        ".reference.f32": "97e5b68bee79447ab15287ada1ca3c92c3a3cfbf9715a4f38d77f57ff2b07fa4"
+      }
+    }
+  ],
+  "unsupported_containers": [
+    {
+      "file": "unsupported-opus.webm",
+      "sha256": "e469e338915458524c7526b9f76067c8329886adbc7f4f47668f73d8797df75f",
+      "probe": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "opus",
+            "sample_rate": "48000",
+            "channels": 2
+          }
+        ],
+        "format": {
+          "format_name": "matroska,webm"
+        }
+      },
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-ogg-opus-decoding/tests/fixtures/audio/opus/celt-2.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-ogg-opus-decoding/tests/fixtures/audio/opus/unsupported-opus.webm"
+      ]
+    },
+    {
+      "file": "unsupported-opus.mp4",
+      "sha256": "190d282629db1f87b22276241e2a89d481bbc6990aa4194247cd6f3c6f927268",
+      "probe": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "opus",
+            "sample_rate": "48000",
+            "channels": 2
+          }
+        ],
+        "format": {
+          "format_name": "mov,mp4,m4a,3gp,3g2,mj2"
+        }
+      },
+      "command": [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        "/private/tmp/nxrt-ogg-opus-decoding/tests/fixtures/audio/opus/celt-2.ogg",
+        "-c:a",
+        "copy",
+        "/private/tmp/nxrt-ogg-opus-decoding/tests/fixtures/audio/opus/unsupported-opus.mp4"
+      ]
+    }
+  ]
+}

@@ -96,3 +96,23 @@ For a real release, replace each crate's explicit `0.1.0-dev.0` version with
 the chosen stable version, update all twelve workspace dependency pins to the
 same exact version, rebuild, and publish again in this order. Published
 prerelease versions are immutable and remain on crates.io.
+
+## Maintained GenAI compiler dependency
+
+`onnx-genai-llguidance` is a workspace-owned maintained compiler package derived
+from the audited MIT-licensed llguidance archive. It uses the workspace version
+and is published before `onnx-genai-engine`; the engine exact-pins that package.
+Its canonical Rust import is `onnx_genai_llguidance`, with no legacy import alias
+or registry/path fallback. The source remains one tree in `vendor/llguidance`.
+See [compiler provenance and registry artifact verification](../GRAMMAR_COMPILER.md).
+
+## Maintained GenAI Matroska reader
+
+`onnx-genai-symphonia-mkv` is the workspace-owned MPL-2.0 format-only reader
+maintained from the exact Symphonia 0.6.1 archive. Publish it before
+`onnx-genai-preprocess`, which exact-pins the normal package identity; there is no
+legacy import alias or registry/path fallback. It retains unchanged published
+`symphonia-core` and `symphonia-common` types. The package includes the upstream
+archive, copied-file hashes, notices and modified source. Registry-only package
+and consumer verification are required before a release; no crate publication is
+part of adding this source to the repository.

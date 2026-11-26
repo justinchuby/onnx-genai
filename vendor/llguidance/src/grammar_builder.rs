@@ -364,7 +364,7 @@ impl GrammarBuilder {
             negated
         } else {
             self.add_warning("no tokenizer - can't validate <[^...]>".to_string());
-            vec![INVALID_TOKEN..=INVALID_TOKEN]
+            std::iter::once(INVALID_TOKEN..=INVALID_TOKEN).collect()
         };
 
         let name = token_ranges_to_string(&negated_ranges);
@@ -392,10 +392,10 @@ impl GrammarBuilder {
             INVALID_TOKEN
         };
 
-        let idx = self
-            .regex
-            .spec
-            .add_special_token(token.to_string(), vec![tok_id..=tok_id])?;
+        let idx = self.regex.spec.add_special_token(
+            token.to_string(),
+            std::iter::once(tok_id..=tok_id).collect(),
+        )?;
         Ok(self.lexeme_to_node(idx))
     }
 

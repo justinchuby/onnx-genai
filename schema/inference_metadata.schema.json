@@ -2451,6 +2451,56 @@
       },
       "type": "object"
     },
+    "InfillOrder": {
+      "enum": [
+        "psm",
+        "spm"
+      ],
+      "type": "string"
+    },
+    "InfillSpec": {
+      "additionalProperties": false,
+      "description": "Model-authored fill-in-the-middle wire facts; filenames are caller-owned labels.",
+      "properties": {
+        "additional_stop_tokens": {
+          "description": "Additional exact tokenizer spellings terminating FIM generation.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "extra_context_template": {
+          "description": "Bounded Jinja template over input_extra (ordered filename/text objects).\nNative `/infill` prepends its result before the FIM control envelope, including\nfor an empty list. Other FIM entrypoints apply only the control roles.\nNo filesystem lookup.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "middle_token": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "order": {
+          "$ref": "#/$defs/InfillOrder",
+          "default": "psm"
+        },
+        "prefix_token": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "suffix_token": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "prefix_token",
+        "middle_token",
+        "suffix_token"
+      ],
+      "type": "object"
+    },
     "KeySequenceLengthsSpec": {
       "description": "Explicit compatibility rules for attention key-sequence-length metadata.",
       "properties": {
@@ -3182,6 +3232,17 @@
             "$ref": "#/$defs/ConstraintLanguageFacts"
           },
           "type": "array"
+        },
+        "infill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InfillSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit fill-in-the-middle control roles and extra-context serialization."
         },
         "tokenizer": {
           "anyOf": [
