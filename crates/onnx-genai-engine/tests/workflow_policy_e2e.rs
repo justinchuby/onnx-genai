@@ -4171,3 +4171,88 @@ fn output_stops_finalize_pending_utf8_before_committing_real_generic_state() -> 
     );
     Ok(())
 }
+
+#[test]
+fn indentation_stops_commit_generic_recurrence_and_keep_clipping_when_eos_wins()
+-> anyhow::Result<()> {
+    use onnx_genai_engine::{FinishReason, GenerationControl};
+    for eos_wins in [false, true] {
+        let model = ADD_STATE.replace("shape {}", "shape { dim { dim_value: 1 } }");
+        let root = package(
+            "indentation-generic",
+            STATEFUL_OUTPUT_LOOP,
+            &[("counter.onnx.textproto", &model)],
+        )?;
+        fs::write(
+            root.join("tokenizer.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,
+                "decoder":{"type":"Fuse"},"model":{"type":"WordLevel","vocab":{"head\n":0," ":1,"bad":2,"next":3,"more":4,"<unk>":15},"unk_token":"<unk>"}
+            }))?,
+        )?;
+        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let session = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+        request.options.max_new_tokens = 10;
+        request.options.minimum_indent = 2;
+        request.options.stop_on_eos = eos_wins;
+        request.options.eos_token_id = eos_wins.then_some(2);
+        let mut delivered = Vec::new();
+        let result = engine.generate_in_session_with_control_callbacks(
+            session,
+            request.clone(),
+            GenerationControl::new(),
+            None,
+            Some(&mut |token: onnx_genai_engine::GenerateToken| {
+                delivered.push(token);
+                Ok(())
+            }),
+        )?;
+        assert_eq!(result.token_ids, [0, 1, 2]);
+        assert_eq!(result.text, "head\n ");
+        let reason = if eos_wins {
+            FinishReason::EosToken
+        } else {
+            FinishReason::IndentationLimit
+        };
+        assert_eq!(result.finish_reason, reason);
+        assert_eq!(delivered.len(), 3);
+        assert_eq!(delivered.last().unwrap().finish_reason, Some(reason));
+        assert_eq!(engine.session_token_count(session)?, 3);
+        request.options.minimum_indent = 0;
+        request.options.stop_on_eos = false;
+        request.options.max_new_tokens = 2;
+        assert_eq!(
+            engine.generate_in_session(session, request)?.token_ids,
+            [3, 4]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn indentation_requires_a_tokenizer_before_generic_output_or_state_commit() -> anyhow::Result<()> {
+    let root = package("indentation-no-tokenizer", GENERIC_OUTPUT_LOOP, &[])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+    request.options.max_new_tokens = 1;
+    request.options.minimum_indent = 2;
+    let mut delivered = Vec::new();
+    let error = engine
+        .generate_with_callbacks(
+            request.clone(),
+            None,
+            Some(&mut |token| {
+                delivered.push(token);
+                Ok(())
+            }),
+        )
+        .expect_err("indentation observation requires an explicit package tokenizer");
+    assert!(format!("{error:#}").contains("indentation"), "{error:#}");
+    assert!(format!("{error:#}").contains("tokenizer"), "{error:#}");
+    assert!(delivered.is_empty());
+    assert!(engine.take_committed_workflow_publications().is_empty());
+    request.options.minimum_indent = 0;
+    assert_eq!(engine.generate(request)?.token_ids, [0]);
+    Ok(())
+}

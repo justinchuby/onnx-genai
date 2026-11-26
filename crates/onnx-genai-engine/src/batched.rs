@@ -466,7 +466,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     FinishReason::Length,
                     0,
                     None,
-                    &options.effective_preserved_tokens(),
+                    &options,
                 )?,
             });
             return Ok(handle);
@@ -1142,7 +1142,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 reason,
                 row.state.prefix_cache_hit_len,
                 row.state.logprobs.as_deref(),
-                &row.options.effective_preserved_tokens(),
+                &row.options,
             )?;
             row.turn.stage_finished(row.handle, result);
             Ok((token_id, true))

@@ -3927,6 +3927,19 @@ mod tests {
     use crate::test_support::EnvVarGuard;
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
 
+    #[test]
+    fn affine_moe_is_not_admitted_by_cuda_optimizer() {
+        let passes = cuda_optimization_passes(None);
+        assert!(
+            passes
+                .iter()
+                .any(|pass| pass.name() == "QuantizedGroupedFusion")
+        );
+        // The current CUDA QMoE would pick different ties, normalize over a
+        // different set of logits, and multiply inactive contributions.
+        assert!(!passes.iter().any(|pass| pass.name() == "AffineMoeFusion"));
+    }
+
     /// Falsifiable guard against re-introducing the parallel-test env race this
     /// module was fixed for: every environment mutation in `optimizer.rs` must go
     /// through [`EnvVarGuard`] (which serialises on a process-global lock and

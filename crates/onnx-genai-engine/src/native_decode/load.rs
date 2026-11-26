@@ -77,6 +77,7 @@ pub fn native_cuda_provider_construction_attempts() -> u64 {
 }
 
 pub(crate) struct NativeDecodeLoadOptions<'a> {
+    pub(crate) keyed_weight_files: &'a [onnx_runtime_session::KeyedWeightFile],
     pub(crate) cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
     #[cfg(feature = "native-cuda")]
     pub(crate) cuda_offload_policy: Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>,
@@ -286,6 +287,9 @@ impl NativeDecodeSession {
             // `MAX_WEIGHT_FOLD_ELEMS` in
             // `onnx-runtime-optimizer::constant_folding` for the tradeoff.
             .option("optimization", "basic");
+        for file in options.keyed_weight_files {
+            builder = builder.keyed_weight_file(file.clone());
+        }
         let cpu: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = Arc::new(
             onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
                 options.cpu_resources,
@@ -549,6 +553,22 @@ impl NativeDecodeSession {
             // See the identical `.option("optimization", "basic")` rationale
             // in `load_with_resources` above.
             .option("optimization", "basic");
+        let metadata = resolve_io_metadata_from_model_path(path)?;
+        let graph_weights = metadata
+            .as_ref()
+            .map(|metadata| {
+                crate::keyed_weights::GraphWeightFiles::resolve(
+                    path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                    metadata,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(files) = graph_weights.for_graph(path)? {
+            for file in &files.containers {
+                builder = builder.keyed_weight_file(file.clone());
+            }
+        }
         let cpu: Arc<dyn onnx_runtime_ep_api::ExecutionProvider> = Arc::new(
             onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_resources(
                 Default::default(),

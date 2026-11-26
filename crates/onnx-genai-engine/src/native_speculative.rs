@@ -251,7 +251,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 FinishReason::MaxTokens,
                 0,
                 block.state.logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             ),
         };
         result.map(|mut result| {
@@ -309,7 +309,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 FinishReason::MaxTokens,
                 0,
                 state.logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         let context_len = prompt_len + state.generated_tokens.len();
@@ -320,7 +320,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 FinishReason::Length,
                 0,
                 state.logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
 
@@ -466,7 +466,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     reason,
                     0,
                     state.logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )?));
             }
             pending.push(token);
@@ -654,7 +654,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     reason,
                     0,
                     state.logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )?));
             }
             if is_bonus {

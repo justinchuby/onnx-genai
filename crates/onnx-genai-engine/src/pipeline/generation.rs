@@ -745,16 +745,17 @@ impl GenerationOutputObserver {
             .iter()
             .any(|stop| matches!(stop, StopSequence::Tokens(tokens) if !tokens.is_empty()));
         if matches!(mode, OutputObservationMode::AcceptedPrefix)
+            && options.minimum_indent == 0
             && time.is_none()
             && !text_stops
             && !token_stops
         {
             return Ok(None);
         }
-        let needs_text = time.is_some() || text_stops;
+        let needs_text = time.is_some() || text_stops || options.minimum_indent > 0;
         anyhow::ensure!(
             !needs_text || tokenizer.is_some(),
-            "text stops and prediction time limits require the package tokenizer; declare one before requesting these controls"
+            "text stops, indentation and prediction time limits require the package tokenizer; declare one before requesting these controls"
         );
         let mut chain = ProcessorChain::new();
         crate::processors::append_output_observers(&mut chain, options);
@@ -789,6 +790,7 @@ impl GenerationOutputObserver {
             ))
             && !self.context.generated_tokens.is_empty()
         {
+            let signal = self.chain.signal(&self.context);
             self.stop_reason = if self
                 .context
                 .generated_tokens
@@ -797,9 +799,11 @@ impl GenerationOutputObserver {
             {
                 Some(GenerationStopReason::EosCommitted)
             } else {
-                self.chain
-                    .signal(&self.context)
+                signal
                     .map(|signal| match signal {
+                        crate::logits::ProcessorSignal::IndentationLimit { .. } => {
+                            GenerationStopReason::IndentationLimit
+                        }
                         crate::logits::ProcessorSignal::PredictionTimeLimit => {
                             GenerationStopReason::PredictionTimeLimit
                         }
@@ -993,6 +997,8 @@ pub(crate) fn run_declared_generation(
     {
         request.request.options.validate_preserved_tokens(tokenizer.context("preserved_tokens requires a package tokenizer; declare one before preserving output tokens")?)?;
     }
+    let output_options =
+        (request.request.options.minimum_indent > 0).then(|| request.request.options.clone());
     let preserved_tokens = request.request.options.effective_preserved_tokens();
     let output = if core.is_none() {
         GenerationOutputObserver::new(
@@ -1143,8 +1149,11 @@ pub(crate) fn run_declared_generation(
     };
 
     let text = tokenizer
-        .map(|tokenizer| {
-            crate::tokenization::decode_output(tokenizer, &token_ids, &preserved_tokens)
+        .map(|tokenizer| match output_options.as_ref() {
+            Some(options) => {
+                crate::tokenization::decode_generation_output(tokenizer, &token_ids, options)
+            }
+            None => crate::tokenization::decode_output(tokenizer, &token_ids, &preserved_tokens),
         })
         .transpose()?
         .unwrap_or_default();
@@ -1254,7 +1263,7 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
             finish_reason,
             state.prefix_cache_hit_len,
             state.logprobs.as_deref(),
-            &request.options.effective_preserved_tokens(),
+            request.options,
         )?;
         result.tool_calls = tool_calls;
         return Ok(result);

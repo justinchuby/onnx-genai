@@ -633,6 +633,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
 pub mod activations;
 pub mod add;
+pub(crate) mod affine_bank;
+pub(crate) mod affine_moe;
 pub mod attention;
 pub mod bit_cast;
 mod bit_packing;
@@ -672,7 +674,6 @@ mod half_gemm;
 // dead code.
 mod dequantize_packed;
 mod dequantize_packed_gather;
-mod fourier_workspace;
 pub mod governed_weight_cache;
 mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -721,12 +722,14 @@ pub mod simd_sumsq;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
+mod softmax_geometry;
 pub mod sparse_kv_gather;
 pub mod split;
 pub mod stft;
 pub mod tensor_scatter;
 pub mod text;
 pub mod transpose;
+mod typed_workspace;
 pub mod unary_math;
 pub mod unique;
 pub mod unsqueeze;
@@ -747,11 +750,13 @@ macro_rules! operator_group_modules {
 operator_group_modules!(
     "ops-cnn";
     affine_grid,
+    batch_normalization,
     center_crop_pad,
     col2im,
     conv_transpose,
     deform_conv,
     grid_sample,
+    mean_variance_normalization,
     norm_ops,
     pooling,
     resize,
@@ -1053,8 +1058,8 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     // the legacy `is_test` attribute was removed.
     registry.register(
         OpKey::new("BatchNormalization", "", 7),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(norm_ops::BatchNormFactory),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(batch_normalization::BatchNormalizationFactory),
     );
     registry.register(
         OpKey::new("InstanceNormalization", "", 6),
@@ -1063,8 +1068,8 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     );
     registry.register(
         OpKey::new("MeanVarianceNormalization", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(norm_ops::MeanVarianceNormalizationFactory),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(mean_variance_normalization::MeanVarianceNormalizationFactory),
     );
     registry.register(
         OpKey::new("GroupNormalization", "", 18),
@@ -1306,7 +1311,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("LayerNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer emits fused `LayerNormalization` in the private contrib
@@ -1315,7 +1320,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // still serves standard ONNX `LayerNormalization`.
     rec.register(
         OpKey::new("LayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer's `MatMul + Add(bias)` fusion emits `FusedMatMulBias` in the
@@ -1450,7 +1455,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SkipLayerNormFactory),
     );
     rec.register(
@@ -1498,7 +1503,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("LpNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(lp_normalization::LpNormalizationFactory),
     );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
@@ -1632,24 +1637,24 @@ pub(crate) fn build_cpu_registry_with_resources(
     // provider's opset-aware lookup selects the version-correct kernel.
     rec.register(
         OpKey::new("Softmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("Softmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxFactory),
     );
     // LogSoftmax shares Softmax's opset split: legacy flattened trailing axes
     // through opset 12, then one-axis normalization from opset 13.
     rec.register(
         OpKey::new("LogSoftmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("LogSoftmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxFactory),
     );
     // Shape / data movement.

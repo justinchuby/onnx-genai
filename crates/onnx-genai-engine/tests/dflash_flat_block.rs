@@ -2124,3 +2124,58 @@ fn output_stops_finalize_pending_utf8_and_roll_back_specialized_state() -> anyho
     );
     Ok(())
 }
+
+#[test]
+fn indentation_stops_preserve_real_specialized_prefix_state() -> anyhow::Result<()> {
+    let root = package_with_target("1", false, &[0; 8], CONTEXTUAL_TARGET)?;
+    let mut base = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2]));
+    base.options.max_new_tokens = 3;
+    base.options.greedy = true;
+    base.options.stop_on_eos = false;
+    let mut probe = Engine::from_dir(&root, ort_config())?;
+    let prefix = probe.generate(base.clone())?.token_ids;
+    drop(probe);
+    assert_eq!(prefix.len(), 3);
+    install_tool_protocol_tokenizer(&root, u64::from(prefix[0]), "head\n bad")?;
+    let mut reference = Engine::from_dir(&root, ort_config())?;
+    let reference_session = reference.create_session()?;
+    assert_eq!(
+        reference
+            .generate_in_session(reference_session, base.clone())?
+            .token_ids,
+        prefix
+    );
+    let expected = reference
+        .generate_in_session(reference_session, base.clone())?
+        .token_ids;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
+    let session = engine.create_session()?;
+    let mut request = base.clone();
+    request.options.max_new_tokens = 20;
+    request.options.minimum_indent = 2;
+    let mut delivered = Vec::new();
+    let result = engine.generate_in_session_with_control_callbacks(
+        session,
+        request,
+        GenerationControl::new(),
+        None,
+        Some(&mut |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        }),
+    )?;
+    assert_eq!(result.token_ids, prefix);
+    assert_eq!(result.finish_reason, FinishReason::IndentationLimit);
+    assert_eq!(result.text, "head\n ");
+    assert_eq!(delivered.len(), 3);
+    assert_eq!(
+        delivered.last().unwrap().finish_reason,
+        Some(FinishReason::IndentationLimit)
+    );
+    assert_eq!(engine.session_token_count(session)?, 3);
+    assert_eq!(
+        engine.generate_in_session(session, base)?.token_ids,
+        expected
+    );
+    Ok(())
+}

@@ -46,6 +46,10 @@ pub struct ProcessorContext {
 /// Non-logit side-channel emitted by processors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessorSignal {
+    /// Insufficient indentation after a generated newline.
+    IndentationLimit {
+        visible_bytes: usize,
+    },
     PredictionTimeLimit,
     /// A configured stop sequence matched the current generated output.
     StopSequence {
@@ -74,6 +78,18 @@ pub trait Constraint: Send + Sync {
         context: &ProcessorContext,
         candidates: &[TokenCandidate],
     ) -> anyhow::Result<Vec<bool>>;
+
+    /// Whether accepting a selected token can change constraint validity before
+    /// another mask is requested (for example, lazy grammar activation).
+    fn needs_selection_feedback(&self) -> bool {
+        false
+    }
+
+    /// Validate selected output before it is committed or published. Context
+    /// contains the history preceding `token`; errors abort the selection.
+    fn on_selected(&self, _token: TokenId, _context: &ProcessorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     fn name(&self) -> &str;
 }
@@ -416,7 +432,12 @@ impl ProcessorChain {
 
     /// Return the first termination signal from the ordered chain.
     pub fn signal(&self, context: &ProcessorContext) -> Option<ProcessorSignal> {
-        self.processors.iter().find_map(|proc| proc.signal(context))
+        // All observers must see committed output, even when an earlier one
+        // wins the label priority (for example time versus indentation).
+        self.processors.iter().fold(None, |first, processor| {
+            let current = processor.signal(context);
+            first.or(current)
+        })
     }
 
     /// Processor names in configured order, useful for diagnostics and tests.
@@ -528,6 +549,14 @@ impl LogitProcessor for ConstraintProcessor {
             context.generated_tokens.len()
         );
         Ok(())
+    }
+
+    fn needs_selection_feedback(&self) -> bool {
+        self.constraint.needs_selection_feedback()
+    }
+
+    fn on_selected(&self, token: TokenId, context: &ProcessorContext) -> anyhow::Result<()> {
+        self.constraint.on_selected(token, context)
     }
 
     fn name(&self) -> &str {

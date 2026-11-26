@@ -15,15 +15,14 @@
 //! axes shape (`X.shape[axis:]`), or any intermediate — and is broadcast over
 //! `X` before the elementwise multiply.
 
-use std::alloc::Layout;
-
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLayout, WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
+    WorkspacePreparation, WorkspaceView,
 };
 use onnx_runtime_ir::Node;
 
 use super::check_arity;
+use super::typed_workspace::TypedWorkspace;
 use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
 
 #[derive(Clone, Copy)]
@@ -80,17 +79,7 @@ struct RmsGeometry {
     groups: usize,
     count: usize,
     stats: bool,
-    layout: WorkspaceLayout<2>,
-}
-
-impl RmsGeometry {
-    fn requirement(&self) -> WorkspaceRequirement {
-        WorkspaceRequirement {
-            bytes: self.layout.bytes() as u64,
-            alignment: self.layout.alignment(),
-            ..WorkspaceRequirement::NONE
-        }
-    }
+    workspace: TypedWorkspace<f32, 2>,
 }
 
 impl RmsNormKernel {
@@ -233,23 +222,20 @@ impl RmsNormKernel {
             }
             stats |= i == 1;
         }
-        let region = |len, name| {
-            Layout::array::<f32>(len).map_err(|_| EpError::KernelFailed(format!("{op}: {name} of {len} f32 elements exceeds addressable capacity; reduce the tensor shape")))
-        };
-        let layout = WorkspaceLayout::new([
-            region(count, "Y staging")?,
-            region(if stats { groups } else { 0 }, "statistics")?,
-        ])
-        .map_err(|error| {
-            EpError::KernelFailed(format!("{op}: cannot plan RMS workspace: {error}"))
-        })?;
+        let workspace = TypedWorkspace::<f32, _>::new(
+            op,
+            [
+                ("Y staging", count),
+                ("statistics", if stats { groups } else { 0 }),
+            ],
+        )?;
         Ok(RmsGeometry {
             axis,
             norm_size,
             groups,
             count,
             stats,
-            layout,
+            workspace,
         })
     }
 
@@ -302,47 +288,31 @@ impl RmsNormKernel {
                 .saturating_mul(4)
                 .saturating_add((geometry.groups as u64).saturating_mul(4))
         });
-        let regions = geometry
-            .layout
-            .bind(workspace)
-            .map_err(|error| EpError::KernelFailed(format!("{op}: {error}")))?;
-        if geometry.count == 0 {
-            return Ok(());
+        // SAFETY: CPU execution owns exclusive live Host scratch through this
+        // synchronous borrow. The descriptor validates and initializes all regions.
+        unsafe {
+            geometry.workspace.with_buffers(workspace, |[y, stats]| {
+                if geometry.count == 0 {
+                    return Ok(());
+                }
+
+                let x = to_dense_f32_widen(op, &inputs[0])?;
+                let scale = to_dense_f32_widen(op, &inputs[1])?;
+                rms_norm_into(
+                    &geometry,
+                    self.epsilon,
+                    [&x, &scale],
+                    [inputs[0].shape, inputs[1].shape],
+                    [y, stats],
+                );
+                // Compute all groups before publishing, preserving X/scale aliasing.
+                write_dense_f32_narrow(op, &mut outputs[0], y)?;
+                if geometry.stats {
+                    write_dense_f32_narrow(op, &mut outputs[1], stats)?;
+                }
+                Ok(())
+            })
         }
-        // SAFETY: caller owns exclusive live Host scratch through synchronous
-        // execution; checked layout proves aligned, disjoint complete regions.
-        // Initialize raw storage before creating any f32 references.
-        let [y, stats] = std::array::from_fn::<_, 2, _>(|i| unsafe {
-            let len = if i == 0 {
-                geometry.count
-            } else if geometry.stats {
-                geometry.groups
-            } else {
-                0
-            };
-            let ptr = if len == 0 {
-                std::ptr::NonNull::<f32>::dangling().as_ptr()
-            } else {
-                regions[i].ptr().0.cast::<f32>()
-            };
-            ptr.write_bytes(0, len);
-            std::slice::from_raw_parts_mut(ptr, len)
-        });
-        let x = to_dense_f32_widen(op, &inputs[0])?;
-        let scale = to_dense_f32_widen(op, &inputs[1])?;
-        rms_norm_into(
-            &geometry,
-            self.epsilon,
-            [&x, &scale],
-            [inputs[0].shape, inputs[1].shape],
-            [y, stats],
-        );
-        // Compute all groups before publishing, preserving X/scale aliasing.
-        write_dense_f32_narrow(op, &mut outputs[0], y)?;
-        if geometry.stats {
-            write_dense_f32_narrow(op, &mut outputs[1], stats)?;
-        }
-        Ok(())
     }
 }
 
@@ -353,7 +323,7 @@ impl Kernel for RmsNormKernel {
         outputs: &[OutputMetadata<'_>],
     ) -> Result<WorkspacePreparation> {
         Ok(WorkspacePreparation::Ready(
-            self.geometry(inputs, outputs)?.requirement(),
+            self.geometry(inputs, outputs)?.workspace.requirement(),
         ))
     }
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
