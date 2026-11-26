@@ -1001,6 +1001,13 @@ struct BuildPlacement {
 }
 
 impl Executor {
+    pub(crate) fn host_tensor_allocator(&self) -> Result<crate::tensor::HostTensorAllocator> {
+        if self.heterogeneous.is_some() {
+            return Err(SessionError::Internal("host tensor allocation requires an explicit single host provider; mixed-provider sessions must select their host allocation owner explicitly".into()));
+        }
+        crate::tensor::HostTensorAllocator::new(Arc::clone(&self.ep))
+    }
+
     /// Per-expert region candidates recorded for `com.microsoft::QMoE` lazy
     /// weights, keyed by initializer [`ValueId`]. See
     /// [`Executor::expert_region_candidates`](state) for the additive,
