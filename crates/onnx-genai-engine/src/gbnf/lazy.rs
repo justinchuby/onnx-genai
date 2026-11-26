@@ -215,7 +215,7 @@ impl LazyGrammarConstraint {
         schema: &str,
         tokenizer: &Tokenizer,
         options: &GenerateOptions,
-        pieces: Vec<Vec<u8>>,
+        contract: crate::byte_stream::ByteStreamContract,
         endings: Vec<TokenId>,
         activation: &GrammarActivation,
     ) -> Result<Self> {
@@ -227,20 +227,12 @@ impl LazyGrammarConstraint {
         );
         let schema = serde_json::from_str(schema)
             .context("parse lazy JSON Schema; supply a valid JSON schema value")?;
-        let added = tokenizer.inner().get_added_vocabulary();
-        let preserved = added
-            .get_added_tokens_decoder()
-            .iter()
-            .filter_map(|(&id, token)| added.is_special_token(&token.content).then_some(id))
-            .collect();
-        let initial = crate::response_constraint::ContentConstraint::json_schema(
+        let pieces = contract.pieces.clone();
+        let initial = crate::response_constraint::ContentConstraint::raw_json_schema(
             tokenizer,
             &schema,
-            crate::text_projection::ProjectionKind::Plain,
-            "",
             options.max_constraint_bytes,
-            vec![],
-            &preserved,
+            contract,
         )
         .context("compile lazy JSON Schema before sampling")?;
         let ResolvedTriggers { tokens, patterns } = resolve_activation(
@@ -588,6 +580,9 @@ mod tests {
         ])
     }
     fn tokenizer_pieces(pieces: &[(u64, &str)]) -> Tokenizer {
+        tokenizer_with_decoder(pieces, serde_json::json!({"type":"ByteFallback"}))
+    }
+    fn tokenizer_with_decoder(pieces: &[(u64, &str)], decoder: serde_json::Value) -> Tokenizer {
         let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/tiny-llm/tokenizer.json"
@@ -604,7 +599,7 @@ mod tests {
             vocab.remove(&old);
             vocab.insert(text.into(), serde_json::json!(id));
         }
-        value["decoder"] = serde_json::json!({"type":"ByteFallback"});
+        value["decoder"] = decoder;
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -665,6 +660,60 @@ mod tests {
             ..Default::default()
         };
         build_processor_chain(&options, Some(&tokenizer), false).unwrap()
+    }
+
+    #[test]
+    fn lazy_json_uses_raw_bytes_after_trigger_despite_publication_stripping() {
+        let tokenizer = tokenizer_with_decoder(
+            &[(22, "\""), (23, "A"), (24, "B")],
+            serde_json::json!({"type":"Sequence","decoders":[
+                {"type":"ByteFallback"}, {"type":"Fuse"},
+                {"type":"Strip","content":"\"","start":1,"stop":1}
+            ]}),
+        );
+        assert_eq!(tokenizer.inner().decode(&[22, 23, 22], false).unwrap(), "A");
+        let projected = crate::response_constraint::ContentConstraint::json_schema(
+            &tokenizer,
+            &serde_json::json!({"const":"A"}),
+            crate::text_projection::ProjectionKind::Plain,
+            "",
+            4096,
+            vec![3],
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            projected
+                .allowed_next_tokens(
+                    &ProcessorContext {
+                        generated_tokens: vec![22, 23, 22],
+                        ..Default::default()
+                    },
+                    &[],
+                )
+                .is_err(),
+            "published A lacks JSON quotes and must remain invalid for content constraints"
+        );
+
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::LazyJsonSchema {
+                schema: r#"{"const":"A"}"#.into(),
+                activation: GrammarActivation::new(
+                    vec![GrammarTrigger::Token(22)],
+                    crate::GrammarCollation::Libcxx,
+                )
+                .unwrap(),
+            }),
+            eos_token_id: Some(3),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        assert!(allowed(&chain, &[22]).unwrap().contains(&23));
+        assert!(!allowed(&chain, &[22]).unwrap().contains(&24));
+        assert!(allowed(&chain, &[22, 23]).unwrap().contains(&22));
+        assert_eq!(allowed(&chain, &[22, 23, 22]).unwrap(), [3]);
+        assert!(allowed(&chain, &[22, 24]).is_err());
+        assert!(allowed(&chain, &[22]).unwrap().contains(&23));
     }
 
     #[test]

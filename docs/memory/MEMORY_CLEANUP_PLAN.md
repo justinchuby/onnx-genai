@@ -3002,3 +3002,77 @@ schema-callback executions. This proves the real plugin compute path under the
 provided descriptor, not built-in ORT MVN-29 schema compatibility. Native Session
 tests exercise the unmodified MVN-29 attributes and computation directly.
 Official schema: https://onnx.ai/onnx/operators/onnx__MeanVarianceNormalization.html
+
+
+### LogSoftmax reuses staging for widening and streams narrowed output
+
+LogSoftmax now widens non-borrowable input directly into its existing admitted
+f32 lane, then reduces that snapshot in place. Each logical coordinate belongs
+to one `(outer, inner)` group. A group's maximum and exponential sum finish
+before its first write; no later group can read that group's results. The
+arithmetic loop is shared with the unchanged contiguous aligned-f32 borrowing
+route through statically dispatched source accessors. The original reduction
+order, f32 computation (including f64 input conversion), and storage narrowing
+are preserved for both opset families. Real output is published only after all
+source reads, including shifted overlap.
+
+The allocation witness also exposed a second payload: scalar output narrowing
+collected a complete storage-T Vec before scattering. Typed writes and scalar
+narrowing now share one private checked scatter visitor, which converts and
+writes one element at a time. Existing f16/bf16 SIMD and f32 memcpy routes remain
+unchanged. The source/output disjoint contract already required by those routes
+is explicit; production callers were audited for owned or workspace-backed
+results and direct-output bypasses. There is no new snapshot owner, pool,
+per-group request, or workspace-bound increase: LogSoftmax still uses one
+StepScoped `4 * numel` lane. Rank-sized indexing metadata may still allocate.
+
+Real allocator tests cover all four float storage types, contiguous/strided
+sources, padded strided outputs, every axis and both opset semantics. A real
+allocating storage-copy positive control verifies the counter; 32 repeated calls
+per combination allocate no matrix-sized payload. Immutable coordinate oracles
+check storage-converted output bits and padding. Separate tests exercise both
+directions of shifted overlap (including NaN/Inf), unaligned negative-stride
+narrowing with exact byte canaries, and short-producer refusal before writes.
+Existing warm governor, peak refusal/reuse/trim, public Session and real ORT
+assignment tests remain in place. These are correctness and allocation results;
+no latency or CUDA-runtime improvement is inferred.
+
+
+### Softmax admits input snapshots within the same single-lane peak
+
+Softmax no longer allocates a tensor-sized f32 Vec for input widening or layout
+materialization. A non-borrowable source now admits its required `4 * numel`
+payload, including when real Y can be written directly. This makes the previous
+owned input copy part of the workspace bound. Metadata can return Ready(full)
+for non-f32 X; only potentially borrowable f32 X with f32 Y remains Deferred.
+Actual-view refinement retains NONE for safely borrowed contiguous aligned f32
+X and eligible disjoint Y. Missing real views retain the complete bound.
+
+The admitted lane first receives every converted source element. Eligible
+contiguous f32 Y then uses the original out-of-place row/interior reducer
+reading that snapshot, including when source tensor storage overlaps Y. Other
+outputs normalize the snapshot in place before streaming narrowed output.
+Borrowable input with an ineligible Y keeps the original out-of-place reducer
+into the lane. Input/output storage conversion, arithmetic order and CPU ISA
+selection are unchanged. The interior-axis loop is shared through static source
+accessors; disjoint reduction groups finish max before overwriting, read each
+original value once for exp, then normalize their own outputs.
+
+Untransformed in-place worker runs now call the existing row kernel once for
+the whole run, matching the out-of-place batching. The scale/mask driver keeps
+its cache tiles when it actually transforms data. A static callback regression
+checks actual call spans above the tile boundary: no-transform batches once,
+while scale-only and mask routes retain both tiles. This avoids increasing
+single-thread row-kernel prologues as a consequence of snapshot reuse; it is not
+a latency measurement.
+
+No additional owner, pool or per-row grant is introduced. One StepScoped f32
+lane replaces the previous separate input/output temporary payloads; scalar
+output conversion uses the shared streaming writer. Tests retain all original
+materialized-source overlap cases, add unfunded/short refusal with unchanged
+backing bytes, compare in-place/borrowed reducer bits at boundary widths with
+NaN/Inf, and verify four storage types, both opset semantics, every axis, strided
+outputs and direct f32 outputs with real allocation positive controls. Existing
+4096 warm iterations also execute a widened source within the same retained
+allocation identity without issuer callbacks, including zero-byte callbacks.
+Rank-sized metadata can still allocate. No CUDA-runtime or latency claim is made.

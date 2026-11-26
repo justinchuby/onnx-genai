@@ -235,3 +235,222 @@ fn mvn_direct_and_snapshot_routes_avoid_matrix_sized_heap_allocations() {
     check::<half::f16>();
     check::<half::bf16>();
 }
+
+#[test]
+fn softmax_and_logsoftmax_widening_reuse_one_lane_without_matrix_sized_allocations() {
+    use onnx_runtime_ep_cpu::kernels::log_softmax::{LogSoftmaxFactory, LogSoftmaxLegacyFactory};
+    use onnx_runtime_ep_cpu::kernels::softmax::{SoftmaxFactory, SoftmaxLegacyFactory};
+    fn check<T: NumericElem + FloatElem + Default>(logarithmic: bool) {
+        let shape = [4, 8, 8];
+        let sentinel = T::from_f32_scalar(123.);
+        for strided in [false, true] {
+            let step = if strided { 2 } else { 1 };
+            let strides = [64 * step as i64, 8 * step as i64, step as i64];
+            let mut source = vec![sentinel; 256 * step];
+            let values = (0..256)
+                .map(|i| T::from_f32_scalar((i % 23) as f32 * 0.25 - 3.))
+                .collect::<Vec<_>>();
+            for (i, &v) in values.iter().enumerate() {
+                source[i * step] = v;
+            }
+            let x = TensorView::new(
+                DevicePtr(source.as_ptr().cast()),
+                <T as NumericElem>::DTYPE,
+                &shape,
+                &strides,
+                DeviceId::cpu(),
+            );
+            let threshold = 256 * size_of::<T>().min(size_of::<f32>());
+            let control = observed(threshold, || {
+                drop(std::hint::black_box(to_dense::<T>(&x).unwrap()))
+            });
+            assert!(control.1 > 0, "allocating snapshot control: {control:?}");
+            for legacy in [false, true] {
+                for axis in 0..3 {
+                    let op = if logarithmic { "LogSoftmax" } else { "Softmax" };
+                    let mut node = Node::new(NodeId(0), op, vec![], vec![]);
+                    node.attributes
+                        .insert("axis".into(), Attribute::Int(axis as i64));
+                    let factory: &dyn KernelFactory = match (logarithmic, legacy) {
+                        (true, true) => &LogSoftmaxLegacyFactory,
+                        (true, false) => &LogSoftmaxFactory,
+                        (false, true) => &SoftmaxLegacyFactory,
+                        (false, false) => &SoftmaxFactory,
+                    };
+                    let k = factory.create(&node, &[]).unwrap();
+                    let mut output = vec![sentinel; 512];
+                    let out_strides = [128, 16, 2];
+                    let mut y = TensorMut::new(
+                        DevicePtrMut(output.as_mut_ptr().cast()),
+                        <T as NumericElem>::DTYPE,
+                        &shape,
+                        &out_strides,
+                        DeviceId::cpu(),
+                    );
+                    let request = k
+                        .workspace_requirement_for_execution(
+                            &[x],
+                            std::slice::from_ref(&y),
+                            &[TensorMetadata::new(x.dtype, x.shape, true)],
+                            &[OutputMetadata::from_view(&y)],
+                            None,
+                        )
+                        .unwrap()
+                        .require_ready()
+                        .unwrap();
+                    assert_eq!(request.bytes, 1024, "one f32 lane, independent of dtype");
+                    let mut backing = vec![0u128; 64];
+                    let ws = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 1024);
+                    k.execute_with_workspace(&[x], std::slice::from_mut(&mut y), Some(ws))
+                        .unwrap();
+                    let counts = observed(threshold, || {
+                        for _ in 0..32 {
+                            k.execute_with_workspace(
+                                std::hint::black_box(&[x]),
+                                std::slice::from_mut(&mut y),
+                                Some(ws),
+                            )
+                            .unwrap();
+                        }
+                    });
+                    assert_eq!(
+                        counts.1, 0,
+                        "dtype={:?} strided={strided} legacy={legacy} axis={axis}: {counts:?}",
+                        x.dtype
+                    );
+                    // Immutable coordinate oracle: reduction groups derive from
+                    // coordinates rather than the kernel's outer/inner indexing.
+                    let coords = |n: usize| [n / 64, (n / 8) % 8, n % 8];
+                    for flat in 0..256 {
+                        let same_group = |other: usize| {
+                            (0..3).all(|d| {
+                                d == axis
+                                    || (legacy && d > axis)
+                                    || coords(flat)[d] == coords(other)[d]
+                            })
+                        };
+                        let mut max = f32::NEG_INFINITY;
+                        for j in (0..256).filter(|&j| same_group(j)) {
+                            max = max.max(values[j].to_f32());
+                        }
+                        let mut sum = 0f32;
+                        for j in (0..256).filter(|&j| same_group(j)) {
+                            sum += (values[j].to_f32() - max).exp();
+                        }
+                        if logarithmic {
+                            let expected =
+                                T::from_f32_scalar((values[flat].to_f32() - max) - sum.ln());
+                            assert_eq!(
+                                output[2 * flat].to_f32().to_bits(),
+                                expected.to_f32().to_bits()
+                            );
+                        } else {
+                            let expected = (values[flat].to_f32() - max).exp() / sum;
+                            let tolerance = match x.dtype {
+                                onnx_runtime_ir::DataType::Float16 => 0.001,
+                                onnx_runtime_ir::DataType::BFloat16 => 0.008,
+                                _ => 3e-6,
+                            };
+                            assert!(
+                                (output[2 * flat].to_f32() - expected).abs() < tolerance,
+                                "dtype={:?} strided={strided} legacy={legacy} axis={axis} flat={flat}",
+                                x.dtype
+                            );
+                        }
+                        assert_eq!(
+                            output[2 * flat + 1].to_f32().to_bits(),
+                            sentinel.to_f32().to_bits()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for logarithmic in [false, true] {
+        check::<f32>(logarithmic);
+        check::<f64>(logarithmic);
+        check::<half::f16>(logarithmic);
+        check::<half::bf16>(logarithmic);
+    }
+}
+
+#[test]
+fn softmax_direct_float32_output_uses_admitted_sources_without_payload_allocations() {
+    use onnx_runtime_ep_cpu::kernels::softmax::SoftmaxFactory;
+    use onnx_runtime_ir::DataType;
+    fn check<T: NumericElem + FloatElem + Default>() {
+        let shape = [4, 64];
+        for strided in [false, true] {
+            let step = if strided { 2 } else { 1 };
+            let source = (0..256 * step)
+                .map(|i| T::from_f32_scalar((i % 17) as f32 * 0.25 - 2.))
+                .collect::<Vec<_>>();
+            let strides = [64 * step as i64, step as i64];
+            let x = TensorView::new(
+                DevicePtr(source.as_ptr().cast()),
+                <T as NumericElem>::DTYPE,
+                &shape,
+                &strides,
+                DeviceId::cpu(),
+            );
+            let mut output = vec![0f32; 256];
+            let mut y = TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr().cast()),
+                DataType::Float32,
+                &shape,
+                &[64, 1],
+                DeviceId::cpu(),
+            );
+            let k = SoftmaxFactory
+                .create(&Node::new(NodeId(0), "Softmax", vec![], vec![]), &[])
+                .unwrap();
+            let request = k
+                .workspace_requirement_for_execution(
+                    &[x],
+                    std::slice::from_ref(&y),
+                    &[TensorMetadata::new(x.dtype, x.shape, true)],
+                    &[OutputMetadata::from_view(&y)],
+                    None,
+                )
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            let borrowed = x.dtype == DataType::Float32 && !strided;
+            assert_eq!(request.bytes, if borrowed { 0 } else { 1024 });
+            let threshold = 256 * size_of::<T>().min(4);
+            assert!(
+                observed(threshold, || {
+                    drop(std::hint::black_box(to_dense::<T>(&x).unwrap()));
+                })
+                .1 > 0
+            );
+            let mut backing = [0u128; 64];
+            let workspace = (!borrowed)
+                .then(|| WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 1024));
+            k.execute_with_workspace(&[x], std::slice::from_mut(&mut y), workspace)
+                .unwrap();
+            let counts = observed(threshold, || {
+                for _ in 0..32 {
+                    k.execute_with_workspace(
+                        std::hint::black_box(&[x]),
+                        std::slice::from_mut(&mut y),
+                        workspace,
+                    )
+                    .unwrap();
+                }
+            });
+            assert_eq!(
+                counts.1, 0,
+                "dtype={:?} strided={strided}: {counts:?}",
+                x.dtype
+            );
+            for row in output.chunks_exact(64) {
+                assert!((row.iter().sum::<f32>() - 1.).abs() < 3e-6);
+            }
+        }
+    }
+    check::<f32>();
+    check::<f64>();
+    check::<half::f16>();
+    check::<half::bf16>();
+}

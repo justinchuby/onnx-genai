@@ -27,6 +27,136 @@ fn tiny_state() -> AppState {
 }
 
 #[tokio::test]
+async fn raw_grammar_strip_wire_matches_native_and_ort_publication() {
+    for backend in [
+        onnx_genai_engine::EngineDecodeBackend::Native,
+        onnx_genai_engine::EngineDecodeBackend::Ort,
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        copy_tree(&source, scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("tok22");
+        vocab.insert(" \"A\" ".into(), json!(22));
+        tokenizer["decoder"] = json!({"type":"Sequence","decoders":[
+            {"type":"ByteFallback"},{"type":"Fuse"},
+            {"type":"Strip","content":" ","start":1,"stop":1}
+        ]});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            json!({"chat_template":"{% for m in messages %}{{ m.content }} {% endfor %}"})
+                .to_string(),
+        )
+        .unwrap();
+        let router = app(AppState::load_with_config(
+            scratch.path(),
+            Some("strip".into()),
+            ServerConfig {
+                engine_config: onnx_genai_engine::EngineConfig {
+                    decode_backend: backend,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap());
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            let chat = path.ends_with("/chat/completions");
+            for mode in 0..4 {
+                for stream in [false, true] {
+                    let mut body = if chat {
+                        json!({"messages":[{"role":"user","content":"hello"}]})
+                    } else {
+                        json!({"prompt":"hello"})
+                    };
+                    if mode == 3 {
+                        body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"a","schema":{"const":"A"}}});
+                    } else {
+                        body["grammar"] = json!(if mode == 1 {
+                            format!(
+                                "%llguidance {{}}\nstart: {}",
+                                serde_json::to_string(" \"A\" ").unwrap()
+                            )
+                        } else {
+                            format!("root ::= {}", serde_json::to_string(" \"A\" ").unwrap())
+                        });
+                    }
+                    if mode >= 2 {
+                        body["grammar_lazy"] = json!(true);
+                        body["grammar_triggers"] = json!([{"type":0,"token":22,"value":" \"A\" "}]);
+                    }
+                    body["max_tokens"] = json!(1);
+                    body["temperature"] = json!(0);
+                    body["logit_bias"] = json!({"22":1000});
+                    body["stream"] = json!(stream);
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::post(path)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                    assert!(
+                        status.is_success(),
+                        "{backend:?} {path} mode={mode} stream={stream}: {}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                    let content = if stream {
+                        String::from_utf8_lossy(&bytes)
+                            .lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .filter(|data| *data != "[DONE]")
+                            .map(|data| {
+                                let event: Value = serde_json::from_str(data).unwrap();
+                                assert!(event.get("error").is_none(), "{event}");
+                                if path == "/completion" {
+                                    event["content"].as_str().unwrap_or("").to_owned()
+                                } else if chat {
+                                    event["choices"][0]["delta"]["content"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_owned()
+                                } else {
+                                    event["choices"][0]["text"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_owned()
+                                }
+                            })
+                            .collect::<String>()
+                    } else {
+                        let event: Value = serde_json::from_slice(&bytes).unwrap();
+                        if path == "/completion" {
+                            event["content"].as_str().unwrap().to_owned()
+                        } else if chat {
+                            event["choices"][0]["message"]["content"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        } else {
+                            event["choices"][0]["text"].as_str().unwrap().to_owned()
+                        }
+                    };
+                    assert_eq!(
+                        content, "\"A\"",
+                        "{backend:?} {path} mode={mode} stream={stream}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn json_object_domain_wire_matches_schema_wrappers_in_native_and_ort() {
     for backend in [
         onnx_genai_engine::EngineDecodeBackend::Native,
