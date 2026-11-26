@@ -106,9 +106,12 @@ pub(super) fn load(
             let view=views.tensors.get(&name).with_context(||format!("GGUF factor {name:?} is missing; binding.weight_key must be the exact saved parameter prefix for the standard .lora_a/.lora_b pair"))?;
             ensure!(
                 view.dtype == storage.dtype() && view.packed_format.is_none(),
-                "GGUF factor {name:?} dtype {:?}/packing {:?} is unsupported; saved A/B factors must exactly match the declared storage dtype; quantized blocks are unsupported",
+                "GGUF adapter {}@{} factor {name:?} dtype {:?}/packing {:?} is unsupported; saved A/B factors must exactly match the declared storage dtype {:?}; correct the manifest or export matching unquantized factors; quantized blocks are unsupported",
+                artifact.identity,
+                artifact.version,
                 view.dtype,
-                view.packed_format
+                view.packed_format,
+                storage.dtype()
             );
             ensure!(
                 view.shape == shape,

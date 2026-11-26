@@ -24,7 +24,7 @@ pub fn select_portable_adapter_source(
     artifact: &AdapterArtifact,
 ) -> anyhow::Result<&AdapterWeightArtifact> {
     artifact.weights.iter().find(|weight| matches!(weight.format,AdapterWeightFormat::Json|AdapterWeightFormat::HfPeft|AdapterWeightFormat::Gguf))
-        .with_context(||format!("adapter {}@{} has no portable source; declare a supported JSON, HF PEFT or F32 GGUF LoRA artifact, or choose an executor implementing its loader capability",artifact.identity,artifact.version))
+        .with_context(||format!("adapter {}@{} has no portable source; declare a supported JSON, HF PEFT or unquantized GGUF LoRA artifact, or choose an executor implementing its loader capability",artifact.identity,artifact.version))
 }
 fn content_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -643,7 +643,7 @@ fn load_adapter(
     anyhow::ensure!(
         weight.format != AdapterWeightFormat::Json
             || matches!(artifact.dtype.as_str(), "float32" | "fp32"),
-        "portable JSON adapter normalization requires float32, but {}@{} declares {}; use F32 JSON factors or an explicitly typed HF PEFT safetensors artifact",
+        "portable JSON adapter normalization requires float32, but {}@{} declares {}; use F32 JSON factors or an explicitly typed HF PEFT safetensors or unquantized GGUF artifact",
         artifact.identity,
         artifact.version,
         artifact.dtype
