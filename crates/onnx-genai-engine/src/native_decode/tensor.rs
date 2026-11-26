@@ -326,7 +326,6 @@ fn last_row_values(tensor: &Tensor) -> anyhow::Result<impl ExactSizeIterator<Ite
         }))
 }
 
-#[cfg(any(feature = "native-cuda", test))]
 pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     Ok(last_row_values(tensor)?.collect())
 }
