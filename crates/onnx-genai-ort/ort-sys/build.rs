@@ -43,11 +43,22 @@ fn main() {
         .derive_default(true)
         .prepend_enum_name(false)
         .generate()
-        .expect("Failed to generate ORT bindings");
+        .unwrap_or_else(|error| {
+            panic!(
+                "generate ORT API {ORT_API_VERSION} bindings from {}: {error}; install libclang and set LIBCLANG_PATH to its directory, then restore the pinned headers if needed",
+                header_path.display()
+            )
+        });
 
+    let bindings_path = out_dir.join("bindings.rs");
     bindings
-        .write_to_file(out_dir.join("bindings.rs"))
-        .expect("Failed to write bindings");
+        .write_to_file(&bindings_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "write generated ORT bindings to {}: {error}; free disk space and ensure Cargo's output directory is writable",
+                bindings_path.display()
+            )
+        });
 }
 
 fn header_matches_api_version(header_path: &Path) -> bool {
