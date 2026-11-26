@@ -61,6 +61,17 @@ pub fn quantized_matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
     Ok(())
 }
 
+/// Native packed arithmetic is validated independently of output shape.
+fn packed_quantized_matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    onnx_runtime_ir::packed_arithmetic::ActivationArithmetic::from_node(ctx.node).map_err(
+        |detail| ShapeInferError::Invalid {
+            op: ctx.node.op_type.clone(),
+            detail,
+        },
+    )?;
+    quantized_matmul(ctx)
+}
+
 /// `com.microsoft.FusedMatMul`: MatMul with optional pre-transposition of the
 /// last two dims (`transA`/`transB`) and batch-axis relocation
 /// (`transBatchA`/`transBatchB`), plus a shape-neutral `alpha` scale.
@@ -744,7 +755,12 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "QLinearMatMul", 10, qlinear_matmul);
     reg.register("", "Gemm", 1, gemm);
     reg.register("", "Det", 11, det);
-    reg.register("pkg.nxrt", "BlockQuantizedMatMul", 1, quantized_matmul);
+    reg.register(
+        "pkg.nxrt",
+        "BlockQuantizedMatMul",
+        1,
+        packed_quantized_matmul,
+    );
     reg.register("com.microsoft", "MatMulNBits", 1, quantized_matmul);
     // com.microsoft fused matmul honors transA/transB/transBatch attributes.
     reg.register("com.microsoft", "FusedMatMul", 1, fused_matmul);

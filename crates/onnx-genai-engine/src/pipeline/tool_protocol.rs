@@ -12,6 +12,9 @@ use crate::{FinishReason, TokenId, ToolCallPolicy};
 /// A normal host stop that prevents a later workflow-loop body entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerationStopReason {
+    IndentationLimit,
+    StopSequence { index: usize },
+    PredictionTimeLimit,
     BudgetExhausted,
     EosCommitted,
     ContextExhausted,
@@ -22,6 +25,9 @@ impl GenerationStopReason {
     /// The transport-facing completion label for this committed normal stop.
     pub fn finish_reason(&self) -> FinishReason {
         match self {
+            Self::IndentationLimit => FinishReason::IndentationLimit,
+            Self::StopSequence { index } => FinishReason::StopSequence { index: *index },
+            Self::PredictionTimeLimit => FinishReason::PredictionTimeLimit,
             Self::BudgetExhausted => FinishReason::MaxTokens,
             Self::EosCommitted => FinishReason::EosToken,
             Self::ContextExhausted => FinishReason::Length,
@@ -232,14 +238,14 @@ impl ToolCallStagedOutputObserver {
                 let limit = self.projection.as_ref().expect("projected token codec owns a projection").max_bytes();
                 for &id in &self.tokens {
                     let piece = contract.pieces.get(id as usize).ok_or_else(|| self.projection_error(anyhow::anyhow!("tool observation token {id} is absent from the bound tokenizer vocabulary; use IDs from that model")))?;
-                    let delta = decoder.step(piece);
-                    if bytes.len().checked_add(delta.len()).is_none_or(|size| size > limit) {
+                    let delta = decoder.step(piece,contract.kinds[id as usize],limit.saturating_sub(bytes.len())).map_err(|error|self.projection_error(error))?;
+                    if bytes.len().checked_add(delta.len()).and_then(|size|size.checked_add(decoder.retained_bytes())).is_none_or(|size| size > limit) {
                         return Err(self.projection_error(anyhow::anyhow!("projected tool output exceeds its {limit}-byte response buffer; reduce max_tokens or increase the response buffer")));
                     }
                     bytes.extend_from_slice(&delta);
                 }
                 if terminal {
-                    let tail = decoder.finish();
+                    let tail = decoder.finish(limit.saturating_sub(bytes.len())).map_err(|error|self.projection_error(error))?;
                     if bytes.len().checked_add(tail.len()).is_none_or(|size| size > limit) {
                         return Err(self.projection_error(anyhow::anyhow!("terminal projected tool output exceeds its {limit}-byte response buffer; reduce max_tokens or increase the response buffer")));
                     }
@@ -699,7 +705,7 @@ mod tests {
                     json!({"type":"ByteFallback"})
                 };
                 tokenizer["decoder"] = if deferred {
-                    json!({"type":"Sequence","decoders":[decoder,{"type":"Strip","content":"x","start":0,"stop":1}]})
+                    json!({"type":"Sequence","decoders":[decoder,{"type":"Replace","pattern":{"Regex":"x+"},"content":""}]})
                 } else {
                     decoder
                 };

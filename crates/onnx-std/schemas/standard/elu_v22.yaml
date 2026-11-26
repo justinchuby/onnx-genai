@@ -1,0 +1,10 @@
+domain: ""
+name: Elu
+since_version: 22
+doc: Exponential linear unit.
+attributes:
+  - { name: alpha, type: float, default: 1.0 }
+inputs: [{ name: X, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

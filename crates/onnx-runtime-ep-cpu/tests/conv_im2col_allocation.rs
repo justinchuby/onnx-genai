@@ -68,104 +68,111 @@ fn observed(bytes: usize, body: impl FnOnce()) -> (usize, usize) {
 
 #[test]
 fn native_conv_im2col_buffer_is_optional_and_reused_across_batches_and_groups() {
-    let control = observed(280, || {
-        std::hint::black_box(vec![0u8; 280]);
-    });
-    assert!(
-        control.0 > 0 && control.1 == 1,
-        "allocation-size positive control must execute: {control:?}"
-    );
-    for group in [1, 2] {
-        for pointwise in [false, true] {
-            // group1 is dilated to exclude BNNS. A 1x1 kernel with dilation2
-            // deliberately retains the existing non-pointwise classification.
-            // group2 has multiple channels/output channels, excluding depthwise.
-            if group == 1 && pointwise {
-                continue;
-            }
-            let (height, width, kh, kw, dilation) = if group == 1 {
-                (7, 9, 2, 3, 2)
-            } else {
-                (5, 7, 1, 1, if pointwise { 1 } else { 2 })
-            };
-            let oh = height - (kh - 1) * dilation;
-            let ow = width - (kw - 1) * dilation;
-            let col_bytes = 2 * kh * kw * oh * ow * 4;
-            let mut totals = Vec::new();
-            for batch in [0, 1, 2, 17] {
-                let x_shape = [batch, group * 2, height, width];
-                let w_shape = [group * 3, 2, kh, kw];
-                let y_shape = [batch, group * 3, oh, ow];
-                let xs = compute_contiguous_strides(&x_shape);
-                let ws = compute_contiguous_strides(&w_shape);
-                let ys = compute_contiguous_strides(&y_shape);
-                let x = vec![1f32; x_shape.iter().product()];
-                let w = vec![1f32; w_shape.iter().product()];
-                let mut y = vec![f32::NAN; y_shape.iter().product()];
-                let mut node = Node::new(NodeId(0), "Conv", vec![], vec![]);
-                node.attributes
-                    .insert("group".into(), Attribute::Int(group as i64));
-                node.attributes.insert(
-                    "dilations".into(),
-                    Attribute::Ints(vec![dilation as i64; 2]),
-                );
-                let kernel = ConvFactory
-                    .create(&node, &[x_shape.to_vec(), w_shape.to_vec()])
-                    .unwrap();
-                let mut run = || {
-                    kernel
-                        .execute(
-                            &[
-                                TensorView::new(
-                                    DevicePtr(x.as_ptr().cast()),
-                                    DataType::Float32,
-                                    &x_shape,
-                                    &xs,
-                                    DeviceId::cpu(),
-                                ),
-                                TensorView::new(
-                                    DevicePtr(w.as_ptr().cast()),
-                                    DataType::Float32,
-                                    &w_shape,
-                                    &ws,
-                                    DeviceId::cpu(),
-                                ),
-                            ],
-                            &mut [TensorMut::new(
-                                DevicePtrMut(y.as_mut_ptr().cast()),
-                                DataType::Float32,
-                                &y_shape,
-                                &ys,
-                                DeviceId::cpu(),
-                            )],
-                        )
-                        .unwrap()
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        assert_eq!(rayon::current_num_threads(), 1);
+        let control = observed(280, || {
+            std::hint::black_box(vec![0u8; 280]);
+        });
+        assert!(
+            control.0 > 0 && control.1 == 1,
+            "allocation-size positive control must execute: {control:?}"
+        );
+        for group in [1, 2] {
+            for pointwise in [false, true] {
+                // group1 is dilated to exclude BNNS. A 1x1 kernel with dilation2
+                // deliberately retains the existing non-pointwise classification.
+                // group2 has multiple channels/output channels, excluding depthwise.
+                if group == 1 && pointwise {
+                    continue;
+                }
+                let (height, width, kh, kw, dilation) = if group == 1 {
+                    (7, 9, 2, 3, 2)
+                } else {
+                    (5, 7, 1, 1, if pointwise { 1 } else { 2 })
                 };
-                run(); // Exclude one-time runtime initialization, not a scratch cache.
-                let (total, cols) = observed(col_bytes, &mut run);
-                assert!(y.iter().all(|&v| v == (2 * kh * kw) as f32));
-                assert_eq!(
-                    cols,
-                    usize::from(batch != 0 && !pointwise),
-                    "group={group} pointwise={pointwise} batch={batch} total={total}"
-                );
-                if batch != 0 {
-                    assert!(
-                        total > 0,
-                        "nonempty native execution still owns staging storage"
+                let oh = height - (kh - 1) * dilation;
+                let ow = width - (kw - 1) * dilation;
+                let col_bytes = 2 * kh * kw * oh * ow * 4;
+                let mut totals = Vec::new();
+                for batch in [0, 1, 2, 17] {
+                    let x_shape = [batch, group * 2, height, width];
+                    let w_shape = [group * 3, 2, kh, kw];
+                    let y_shape = [batch, group * 3, oh, ow];
+                    let xs = compute_contiguous_strides(&x_shape).expect("fixture shape has representable contiguous strides");
+                    let ws = compute_contiguous_strides(&w_shape).expect("fixture shape has representable contiguous strides");
+                    let ys = compute_contiguous_strides(&y_shape).expect("fixture shape has representable contiguous strides");
+                    let x = vec![1f32; x_shape.iter().product()];
+                    let w = vec![1f32; w_shape.iter().product()];
+                    let mut y = vec![f32::NAN; y_shape.iter().product()];
+                    let mut node = Node::new(NodeId(0), "Conv", vec![], vec![]);
+                    node.attributes
+                        .insert("group".into(), Attribute::Int(group as i64));
+                    node.attributes.insert(
+                        "dilations".into(),
+                        Attribute::Ints(vec![dilation as i64; 2]),
                     );
+                    let kernel = ConvFactory
+                        .create(&node, &[x_shape.to_vec(), w_shape.to_vec()])
+                        .unwrap();
+                    let mut run = || {
+                        kernel
+                            .execute(
+                                &[
+                                    TensorView::new(
+                                        DevicePtr(x.as_ptr().cast()),
+                                        DataType::Float32,
+                                        &x_shape,
+                                        &xs,
+                                        DeviceId::cpu(),
+                                    ),
+                                    TensorView::new(
+                                        DevicePtr(w.as_ptr().cast()),
+                                        DataType::Float32,
+                                        &w_shape,
+                                        &ws,
+                                        DeviceId::cpu(),
+                                    ),
+                                ],
+                                &mut [TensorMut::new(
+                                    DevicePtrMut(y.as_mut_ptr().cast()),
+                                    DataType::Float32,
+                                    &y_shape,
+                                    &ys,
+                                    DeviceId::cpu(),
+                                )],
+                            )
+                            .unwrap()
+                    };
+                    run(); // Exclude one-time runtime initialization, not a scratch cache.
+                    let (total, cols) = observed(col_bytes, &mut run);
+                    assert!(y.iter().all(|&v| v == (2 * kh * kw) as f32));
+                    assert_eq!(
+                        cols,
+                        usize::from(batch != 0 && !pointwise),
+                        "group={group} pointwise={pointwise} batch={batch} total={total}"
+                    );
+                    if batch != 0 {
+                        assert!(
+                            total > 0,
+                            "nonempty native execution still owns staging storage"
+                        );
+                    }
+                    println!(
+                        "group={group} pointwise={pointwise} batch={batch} col_bytes={col_bytes} col_allocations={cols} execute_allocations={total}"
+                    );
+                    if batch != 0 {
+                        totals.push(total);
+                    }
                 }
-                println!(
-                    "group={group} pointwise={pointwise} batch={batch} col_bytes={col_bytes} col_allocations={cols} execute_allocations={total}"
+                assert!(
+                    totals.iter().all(|&n| n == totals[0]),
+                    "complete serial execute allocations must not grow with batches: {totals:?}"
                 );
-                if batch != 0 {
-                    totals.push(total);
-                }
             }
-            assert!(
-                totals.iter().all(|&n| n == totals[0]),
-                "complete serial execute allocations must not grow with batches: {totals:?}"
-            );
         }
-    }
+    });
 }

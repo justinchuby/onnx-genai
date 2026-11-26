@@ -55,10 +55,63 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use common::{
-    Tensor, assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
+    Tensor, absent_input, assert_close, build_graph, decode_floats, float_input, input,
+    require_cuda, run_cpu, run_cuda, try_run_cuda,
 };
+use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
-use onnx_runtime_ir::{Attribute, DataType};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn transpose_packed_cuda_matches_reference_bytes() {
+    let ep = require_cuda();
+    // Permute [3,1,5] -> [5,3,1]. Each column crosses packed source bytes,
+    // and the dirty high bits of the final source byte never reach the output.
+    let nibble_input = [0x70, 0x6e, 0x4d, 0x3c, 0x2a, 0x09, 0xf8, 0xf6];
+    let nibble_expected = [0x40, 0x79, 0x0c, 0x3e, 0x68, 0xfa, 0x2d, 0x06];
+    let two_bit_input = [0xac, 0xc1, 0x1a, 0xec];
+    let two_bit_expected = [0xd0, 0xe0, 0xe8, 0x29];
+    let float8_input = [0, 7, 14, 6, 13, 4, 12, 3, 10, 2, 9, 0, 8, 15, 6];
+    let float8_expected = [0, 4, 9, 7, 12, 0, 14, 3, 8, 6, 10, 15, 13, 2, 6];
+    let cases: [(DataType, u64, &[u8], &[u8]); 6] = [
+        (DataType::Int4, 21, &nibble_input, &nibble_expected),
+        (DataType::Uint4, 21, &nibble_input, &nibble_expected),
+        (DataType::Float4E2M1, 23, &nibble_input, &nibble_expected),
+        (DataType::Float8E8M0, 24, &float8_input, &float8_expected),
+        (DataType::Int2, 25, &two_bit_input, &two_bit_expected),
+        (DataType::Uint2, 25, &two_bit_input, &two_bit_expected),
+    ];
+    for (dtype, opset, payload, expected) in cases {
+        let claim = ep.supports_op(
+            &Node::new(NodeId(0), "Transpose", vec![], vec![]),
+            opset - 1,
+            &[static_shape([3, 1, 5])],
+            &[dtype],
+            &[],
+        );
+        assert!(
+            claim
+                .reason()
+                .is_some_and(|reason| reason.contains(&format!("use opset {opset}"))),
+            "CUDA must reject {dtype:?} before opset {opset}: {:?}",
+            claim.reason()
+        );
+        let outputs = run_cuda(
+            &ep,
+            "Transpose",
+            "",
+            opset,
+            &[input(dtype, &[3, 1, 5], payload)],
+            &[(dtype, vec![5, 3, 1])],
+            &[("perm", Attribute::Ints(vec![2, 0, 1]))],
+        );
+        assert_eq!(outputs[0], expected, "{dtype:?} at opset {opset}");
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Profile model
@@ -602,7 +655,7 @@ fn conv_transpose_cases() -> Vec<Case> {
             label: "ConvTranspose[2d,grouped,multiple-output-channels]".into(),
             op: "ConvTranspose",
             domain: "",
-            opset: 11,
+            opset: 22,
             inputs: vec![
                 float_input(
                     DataType::BFloat16,
@@ -621,6 +674,34 @@ fn conv_transpose_cases() -> Vec<Case> {
             outputs: vec![(DataType::BFloat16, vec![1, 4, 2, 2])],
             attrs: vec![("group", Attribute::Int(2))],
             compare: Compare::Float { tol: 3e-2 },
+        },
+        Case {
+            label: "ConvTranspose[3d,grouped,dilated,asymmetric]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 22,
+            inputs: vec![
+                float_input(
+                    DataType::Float32,
+                    &[1, 2, 2, 1, 2],
+                    &[1., 2., 3., 4., -1., -2., -3., -4.],
+                ),
+                float_input(
+                    DataType::Float32,
+                    &[2, 1, 2, 2, 1],
+                    &[1., 2., 3., 4., 0.5, 1.5, -0.5, -1.5],
+                ),
+                float_input(DataType::Float32, &[2], &[0.25, 2.]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 2, 4, 2, 3])],
+            attrs: vec![
+                ("group", Attribute::Int(2)),
+                ("strides", Attribute::Ints(vec![2, 1, 2])),
+                ("dilations", Attribute::Ints(vec![2, 1, 1])),
+                ("pads", Attribute::Ints(vec![1, 0, 0, 1, 0, 1])),
+                ("output_padding", Attribute::Ints(vec![1, 0, 1])),
+            ],
+            compare: Compare::Float { tol: 1e-5 },
         },
     ]
 }
@@ -680,16 +761,80 @@ fn dropout_cases() -> Vec<Case> {
             compare: Compare::ExactBytes,
         },
         Case {
-            label: "Dropout[i32,inference]".into(),
+            label: "Dropout[bf16,inference]".into(),
             op: "Dropout",
             domain: "",
             opset: 13,
-            inputs: vec![input(DataType::Int32, &[4], &[-7i32, 0, 3, 99])],
-            outputs: vec![(DataType::Int32, vec![4])],
+            inputs: vec![input(
+                DataType::BFloat16,
+                &[4],
+                &[0xbfe0u16, 0, 0x8000, 0x7fc1],
+            )],
+            outputs: vec![(DataType::BFloat16, vec![4])],
             attrs: vec![],
             compare: Compare::ExactBytes,
         },
     ]
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn dropout_22_inference_inputs_on_physical_cuda() {
+    let ep = require_cuda();
+    use DataType::*;
+    // Independent byte oracle: include signed zero and NaN payload encodings.
+    let x = input(Float8E4M3FN, &[4], &[0x38u8, 0x80, 0x7f, 0xb8]);
+    let ratio = input(Float8E5M2, &[], &[0x38u8]);
+    let no_ratio = absent_input(Undefined);
+    let evaluation = input(Bool, &[], &[0u8]);
+    let training = input(Bool, &[], &[1u8]);
+    let y = (Float8E4M3FN, vec![4]);
+    let mask = (Bool, vec![4]);
+
+    for (inputs, outputs, capture, expected) in [
+        (
+            vec![x.clone(), ratio.clone()],
+            vec![y.clone(), mask.clone()],
+            true,
+            vec![x.bytes.clone(), vec![1; 4]],
+        ),
+        (
+            vec![x.clone(), no_ratio.clone(), evaluation.clone()],
+            vec![y.clone()],
+            false,
+            vec![x.bytes.clone()],
+        ),
+        (
+            vec![x.clone(), ratio, evaluation],
+            vec![y.clone(), mask],
+            false,
+            vec![x.bytes.clone(), vec![1; 4]],
+        ),
+    ] {
+        let (graph, id) = build_graph("Dropout", "", 22, &inputs, &outputs, &[]);
+        let kernel = ep.get_kernel(graph.node(id), &[], 22).unwrap();
+        assert_eq!(
+            kernel.capture_support(),
+            if capture {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            } else {
+                onnx_runtime_ep_api::CaptureSupport::unsupported(
+                    "Dropout reads training_mode on the host; omit training_mode to capture inference",
+                )
+            }
+        );
+        assert_eq!(
+            run_cuda(&ep, "Dropout", "", 22, &inputs, &outputs, &[]),
+            expected
+        );
+    }
+
+    let error =
+        try_run_cuda(&ep, "Dropout", "", 22, &[x, no_ratio, training], &[y], &[]).unwrap_err();
+    assert!(error.to_string().contains("training_mode=true"), "{error}");
 }
 
 fn instance_normalization_cases() -> Vec<Case> {
@@ -2494,11 +2639,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(sweep(
         "Sin",
-        unary_float("Sin", 13, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        unary_float("Sin", 22, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
     ));
     p.push(sweep(
         "Cos",
-        unary_float("Cos", 13, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        unary_float("Cos", 22, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
     ));
     p.push(sweep(
         "Softplus",
@@ -2624,6 +2769,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("QLinearMatMul", qlinear_matmul_cases()));
     p.push(sweep("Resize", resize_cases()));
     p.push(sweep("ConvTranspose", conv_transpose_cases()));
+    p.push(dedicated(
+        "RoiAlign",
+        "session:roi_align.rs",
+        "Pinned ONNX vectors and batch-index validation with CPU fallback disabled",
+    ));
     p.push(sweep("GridSample", grid_sample_cases()));
     p.push(dedicated(
         "DeformConv",
@@ -2637,6 +2787,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         instance_normalization_cases(),
     ));
     p.push(sweep("GroupNormalization", group_normalization_cases()));
+    p.push(dedicated(
+        "MeanVarianceNormalization",
+        "mean_variance_normalization_gpu.rs",
+        "opset 29 native CPU/CUDA against independently calculated goldens",
+    ));
     p.push(sweep("LpPool", lp_pool_cases()));
     p.push(sweep("CenterCropPad", center_crop_pad_cases()));
     p.push(sweep("Col2Im", col2im_cases()));
@@ -3242,6 +3397,73 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) -> Vec<Vec<u8>> {
         }
     }
     cuda
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn conv_transpose_native_cuda_conformance() {
+    let ep = require_cuda();
+    for case in conv_transpose_cases() {
+        run_case(&ep, &case);
+    }
+
+    // Both SAME modes crop an odd cell on opposite sides in height, and
+    // extend an odd cell on opposite sides in width (effective kernel < stride).
+    let inputs = [
+        float_input(DataType::Float32, &[1, 1, 1, 1], &[2.]),
+        float_input(DataType::Float32, &[1, 1, 3, 1], &[1., 2., 3.]),
+    ];
+    for (mode, expected) in [
+        ("SAME_UPPER", [0., 2., 0., 4.]),
+        ("SAME_LOWER", [4., 0., 6., 0.]),
+    ] {
+        let outputs = run_cuda(
+            &ep,
+            "ConvTranspose",
+            "",
+            22,
+            &inputs,
+            &[(DataType::Float32, vec![1, 1, 2, 2])],
+            &[
+                ("strides", Attribute::Ints(vec![2, 2])),
+                ("auto_pad", Attribute::String(mode.as_bytes().to_vec())),
+            ],
+        );
+        assert_eq!(
+            decode_floats(&outputs[0], DataType::Float32),
+            expected,
+            "{mode}"
+        );
+    }
+
+    // Explicit output_shape ignores supplied pads and still uses output_padding
+    // in the split. DOUBLE values here are deliberately not representable in f32.
+    let x = 1.0_f64 + 2.0_f64.powi(-40);
+    let outputs = run_cuda(
+        &ep,
+        "ConvTranspose",
+        "",
+        22,
+        &[
+            input(DataType::Float64, &[1, 1, 2], &[x, -2.0 * x]),
+            input(DataType::Float64, &[1, 1, 2], &[1.0_f64, 0.5]),
+        ],
+        &[(DataType::Float64, vec![1, 1, 4])],
+        &[
+            ("strides", Attribute::Ints(vec![2])),
+            ("output_shape", Attribute::Ints(vec![4])),
+            ("output_padding", Attribute::Ints(vec![1])),
+            ("pads", Attribute::Ints(vec![0, 2])),
+        ],
+    );
+    assert_eq!(
+        outputs[0],
+        [0.5 * x, -2.0 * x, -x, 0.0].map(f64::to_ne_bytes).concat(),
+        "explicit output_shape must shift the DOUBLE contribution without narrowing"
+    );
 }
 
 #[cfg_attr(

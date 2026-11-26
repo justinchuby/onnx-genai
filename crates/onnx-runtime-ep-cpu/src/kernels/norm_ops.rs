@@ -14,7 +14,7 @@ use crate::dispatch_float;
 use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::numel;
 
-trait NormAcc: ComputeDomain + PartialOrd {
+pub(super) trait NormAcc: ComputeDomain + PartialOrd {
     fn from_f32(value: f32) -> Self;
     fn sqrt(self) -> Self;
 }
@@ -66,104 +66,6 @@ fn require_channel_vector(op: &str, name: &str, shape: &[usize], len: usize) -> 
         )));
     }
     Ok(())
-}
-
-pub struct BatchNormFactory;
-
-impl KernelFactory for BatchNormFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let training_mode = node
-            .attr("training_mode")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0);
-        if training_mode != 0 {
-            return Err(EpError::KernelFailed(
-                "BatchNormalization: training_mode=1 is unsupported by the inference-only CPU EP"
-                    .into(),
-            ));
-        }
-        Ok(Box::new(BatchNormKernel {
-            epsilon: node
-                .attr("epsilon")
-                .and_then(|a| a.as_float())
-                .unwrap_or(1e-5),
-        }))
-    }
-}
-
-pub struct BatchNormKernel {
-    epsilon: f32,
-}
-
-impl Kernel for BatchNormKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("BatchNormalization", inputs, outputs, 5, 5, 1)?;
-        if outputs.len() != 1 {
-            return Err(EpError::KernelFailed(format!(
-                "BatchNormalization: inference mode produces exactly 1 output, got {}",
-                outputs.len()
-            )));
-        }
-        dispatch_float!(inputs[0].dtype, "BatchNormalization", T =>
-            batch_norm_typed::<T>(inputs, outputs, self.epsilon)
-        )
-    }
-
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
-    }
-}
-
-fn batch_norm_typed<T: NumericElem>(
-    inputs: &[TensorView],
-    outputs: &mut [TensorMut],
-    epsilon: f32,
-) -> Result<()>
-where
-    T::Acc: NormAcc,
-{
-    let shape = inputs[0].shape;
-    if shape.len() < 2 {
-        return Err(EpError::KernelFailed(
-            "BatchNormalization: X must have rank at least 2 (N,C,...)".into(),
-        ));
-    }
-    require_x_output_shape("BatchNormalization", &inputs[0], &outputs[0])?;
-    let channels = shape[1];
-    let scale = parameter::<T>("BatchNormalization", &inputs[1])?;
-    let bias = parameter::<T>("BatchNormalization", &inputs[2])?;
-    let mean = parameter::<T>("BatchNormalization", &inputs[3])?;
-    let variance = parameter::<T>("BatchNormalization", &inputs[4])?;
-    for (name, input, values) in [
-        ("scale", &inputs[1], &scale),
-        ("B", &inputs[2], &bias),
-        ("input_mean", &inputs[3], &mean),
-        ("input_var", &inputs[4], &variance),
-    ] {
-        require_channel_vector("BatchNormalization", name, input.shape, channels)?;
-        debug_assert_eq!(values.len(), channels);
-    }
-    let spatial: usize = shape[2..].iter().product();
-    if channels == 0 || spatial == 0 {
-        return Err(EpError::KernelFailed(
-            "BatchNormalization: channel and spatial dimensions must be non-empty".into(),
-        ));
-    }
-    let x = parameter::<T>("BatchNormalization", &inputs[0])?;
-    let epsilon = <T::Acc as NormAcc>::from_f32(epsilon);
-    let y = x
-        .iter()
-        .enumerate()
-        .map(|(i, &value)| {
-            let channel = (i / spatial) % channels;
-            value
-                .c_sub(mean[channel])
-                .c_div(variance[channel].c_add(epsilon).sqrt())
-                .c_mul(scale[channel])
-                .c_add(bias[channel])
-        })
-        .collect();
-    write_output::<T>(&mut outputs[0], y)
 }
 
 pub struct InstanceNormFactory;
@@ -464,7 +366,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::CpuExecutionProvider;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
     use onnx_runtime_loader::Model;
@@ -540,7 +442,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], opset)
             .unwrap()
-            .execute(&views, &mut [y.view_mut()])
+            .execute_prepared(&views, &mut [y.view_mut()])
             .unwrap();
         match dtype {
             DataType::BFloat16 => y.to_bf16_as_f32(),
@@ -689,7 +591,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 15)
             .unwrap()
-            .execute(
+            .execute_prepared(
                 &[
                     x.view(),
                     scale.view(),
@@ -722,7 +624,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 15)
             .unwrap()
-            .execute(
+            .execute_prepared(
                 &[
                     x.view(),
                     scale.view(),
@@ -753,7 +655,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 6)
             .unwrap()
-            .execute(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &[-1.0, 3.0, -1.5, -0.5]);
     }
@@ -778,7 +680,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 18)
             .unwrap()
-            .execute(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &[-1.0, 3.0, -1.5, -0.5]);
     }
@@ -803,7 +705,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 21)
             .unwrap()
-            .execute(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &[-1.0, 12.0, 17.0, 34.0]);
     }
@@ -835,7 +737,7 @@ mod tests {
         let err = ep
             .get_kernel(graph.node(node), &[], 15)
             .unwrap()
-            .execute(
+            .execute_prepared(
                 &[
                     x.view(),
                     param.view(),
@@ -865,7 +767,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 16)
             .unwrap()
-            .execute(&[x.view(), slope.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view(), slope.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &[-0.1, 2.0, -0.3, 4.0, -0.5, 2.0, -1.5, 4.0]);
     }
@@ -880,7 +782,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 16)
             .unwrap()
-            .execute(&[x.view(), slope.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view(), slope.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &[-0.5, -0.25, 0.0, 3.0]);
     }
@@ -895,7 +797,7 @@ mod tests {
         CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 16)
             .unwrap()
-            .execute(&[x.view(), slope.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view(), slope.view()], &mut [y.view_mut()])
             .unwrap();
         assert_eq!(y.to_f64(), vec![-16_777_217.0]);
     }

@@ -1001,9 +1001,12 @@ impl ComputeProxy {
         let a_shape = [self.m, self.k];
         let b_shape = [self.k, self.n];
         let out_shape = [self.m, self.n];
-        let a_strides = compute_contiguous_strides(&a_shape);
-        let b_strides = compute_contiguous_strides(&b_shape);
-        let out_strides = compute_contiguous_strides(&out_shape);
+        let a_strides = compute_contiguous_strides(&a_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let b_strides = compute_contiguous_strides(&b_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let out_strides = compute_contiguous_strides(&out_shape)
+            .expect("fixture shape has representable contiguous strides");
         let a_view = TensorView::new(
             DevicePtr(self.a.as_ptr()),
             DataType::Float32,

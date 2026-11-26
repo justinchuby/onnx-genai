@@ -338,6 +338,11 @@
           "const": "safetensors",
           "description": "Manifest-keyed safetensors parameter bundle.",
           "type": "string"
+        },
+        {
+          "const": "gguf",
+          "description": "Explicitly bound GGUF LoRA factor container.",
+          "type": "string"
         }
       ]
     },
@@ -2451,6 +2456,56 @@
       },
       "type": "object"
     },
+    "InfillOrder": {
+      "enum": [
+        "psm",
+        "spm"
+      ],
+      "type": "string"
+    },
+    "InfillSpec": {
+      "additionalProperties": false,
+      "description": "Model-authored fill-in-the-middle wire facts; filenames are caller-owned labels.",
+      "properties": {
+        "additional_stop_tokens": {
+          "description": "Additional exact tokenizer spellings terminating FIM generation.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "extra_context_template": {
+          "description": "Bounded Jinja template over input_extra (ordered filename/text objects).\nNative `/infill` prepends its result before the FIM control envelope, including\nfor an empty list. Other FIM entrypoints apply only the control roles.\nNo filesystem lookup.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "middle_token": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "order": {
+          "$ref": "#/$defs/InfillOrder",
+          "default": "psm"
+        },
+        "prefix_token": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "suffix_token": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "prefix_token",
+        "middle_token",
+        "suffix_token"
+      ],
+      "type": "object"
+    },
     "KeySequenceLengthsSpec": {
       "description": "Explicit compatibility rules for attention key-sequence-length metadata.",
       "properties": {
@@ -2467,6 +2522,38 @@
         }
       },
       "type": "object"
+    },
+    "KeyedWeightFileSpec": {
+      "additionalProperties": false,
+      "description": "One immutable keyed container supplying external initializers of an ONNX\ngraph. Tensor geometry and element/packed representation come from the\ngraph and container; the runtime never casts, reshapes or guesses a mapping.",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/KeyedWeightFormat"
+        },
+        "path": {
+          "description": "Package-relative file path, resolved beneath the admitted package root.",
+          "type": "string"
+        },
+        "renames": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Container tensor key -> ONNX initializer name. Unmapped keys retain\ntheir names; the loader rejects ambiguous matches and unmatched renames.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "path",
+        "format"
+      ],
+      "type": "object"
+    },
+    "KeyedWeightFormat": {
+      "enum": [
+        "gguf",
+        "safetensors"
+      ],
+      "type": "string"
     },
     "LiteralValue": {
       "anyOf": [
@@ -3150,6 +3237,17 @@
             "$ref": "#/$defs/ConstraintLanguageFacts"
           },
           "type": "array"
+        },
+        "infill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InfillSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit fill-in-the-middle control roles and extra-context serialization."
         },
         "tokenizer": {
           "anyOf": [
@@ -6974,6 +7072,16 @@
         }
       ],
       "description": "Authoritative generation defaults and the structural override surface."
+    },
+    "graph_weights": {
+      "additionalProperties": {
+        "items": {
+          "$ref": "#/$defs/KeyedWeightFileSpec"
+        },
+        "type": "array"
+      },
+      "description": "Keyed GGUF/SafeTensors containers for each package-relative ONNX graph.\nThe graph remains the source of executable semantics and tensor geometry.",
+      "type": "object"
     },
     "hardware_requirements": {
       "anyOf": [

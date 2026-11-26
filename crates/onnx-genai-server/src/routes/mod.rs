@@ -42,7 +42,7 @@ use crate::{
         ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob, ChatTopLogprob,
         CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
         EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector,
-        InputAudio, ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
+        InputAudio, ReasoningEffort, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -441,8 +441,7 @@ pub(crate) struct PreparedCompletion {
 pub(crate) enum CompletionGeneration {
     Plain(GenerateRequest),
     Fim {
-        prefix: String,
-        suffix: String,
+        tokens: Vec<u32>,
         options: GenerateOptions,
     },
 }

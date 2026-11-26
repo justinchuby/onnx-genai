@@ -107,7 +107,10 @@ fn exercise(packed: bool) {
         .collect::<Vec<_>>();
     let strides = shapes
         .iter()
-        .map(|s| compute_contiguous_strides(s))
+        .map(|s| {
+            compute_contiguous_strides(s)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let inputs = tensors
         .iter()
@@ -118,7 +121,8 @@ fn exercise(packed: bool) {
         })
         .collect::<Vec<_>>();
     let mut output_buffer = ep.allocate(8, 256).unwrap();
-    let output_strides = compute_contiguous_strides(&q_shape);
+    let output_strides = compute_contiguous_strides(&q_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut outputs = [TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         DataType::Float32,
@@ -318,7 +322,8 @@ fn exercise(packed: bool) {
     } else {
         vec![1, 0, 1, 1]
     };
-    let zero_strides = compute_contiguous_strides(&zero_shape);
+    let zero_strides = compute_contiguous_strides(&zero_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut empty_inputs = inputs.clone();
     empty_inputs[0] = TensorView::new(
         inputs[0].data,

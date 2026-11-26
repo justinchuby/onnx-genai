@@ -2,7 +2,7 @@
 use crate::byte_grammar::{
     GrammarByteBudgetExceeded, GrammarByteCursor, GrammarCandidate, GrammarTokenVocabulary,
 };
-use crate::byte_stream::{ByteStreamContract, ByteStreamState};
+use crate::byte_stream::{ByteStreamBufferExceeded, ByteStreamContract, ByteStreamState};
 use crate::json_prefix::{InvalidJsonEscape, JsonPrefix};
 use crate::logits::{Constraint, ConstraintPrefixError, ProcessorContext, TokenCandidate, TokenId};
 use crate::response_template::{
@@ -13,7 +13,10 @@ use crate::text_projection::{ProjectionKind, TextProjection, TextView};
 use crate::tokenization::{NonMonotonicText, TokenTextDecoder};
 use anyhow::{Context, ensure};
 use onnx_genai_ort::Tokenizer;
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -26,7 +29,7 @@ struct ResponseConstraintRecovery {
 }
 
 enum Codec {
-    Bytes(ByteStreamContract),
+    Bytes(Arc<ByteStreamContract>),
     Canonical(Box<Tokenizer>),
 }
 
@@ -55,24 +58,28 @@ impl DecoderState {
 
 #[derive(Clone, Copy)]
 enum Normalization {
+    CanonicalXml,
     Json,
     Literal,
 }
 impl Normalization {
     fn parse(self, text: &str) -> anyhow::Result<LogicalPrefix> {
         match self {
+            Self::CanonicalXml => Ok(LogicalPrefix::CanonicalXml(text.to_owned())),
             Self::Json => JsonPrefix::parse(text).map(LogicalPrefix::Json),
             Self::Literal => Ok(LogicalPrefix::Literal(text.to_owned())),
         }
     }
 }
 enum LogicalPrefix {
+    CanonicalXml(String),
     Json(JsonPrefix),
     Literal(String),
 }
 impl LogicalPrefix {
     fn canonical(&self) -> &str {
         match self {
+            Self::CanonicalXml(_) => "",
             Self::Json(prefix) => &prefix.canonical,
             Self::Literal(text) => text,
         }
@@ -83,7 +90,7 @@ impl LogicalPrefix {
     fn pending_piece_syntax_viable(&self, piece: &[u8]) -> bool {
         match self {
             Self::Json(prefix) => prefix.pending_piece_syntax_viable(piece),
-            Self::Literal(_) => true,
+            Self::CanonicalXml(_) | Self::Literal(_) => true,
         }
     }
     fn preview(
@@ -93,6 +100,26 @@ impl LogicalPrefix {
         pending: &[u8],
     ) -> anyhow::Result<GrammarCandidate> {
         match self {
+            Self::CanonicalXml(text) => {
+                let Some(projected) =
+                    onnx_genai_metadata::tool_protocol::canonical_xml_prefix(text)
+                else {
+                    return Ok(GrammarCandidate::Rejected { byte_offset: 0 });
+                };
+                if !pending.is_empty() && !projected.permits_pending_utf8 {
+                    return Ok(GrammarCandidate::Rejected { byte_offset: 0 });
+                }
+                for prefix in projected.alternatives {
+                    let mut bytes = prefix.into_bytes();
+                    bytes.extend_from_slice(pending);
+                    if let GrammarCandidate::Viable { complete } = cursor.preview_root(&bytes)? {
+                        return Ok(GrammarCandidate::Viable {
+                            complete: complete && projected.complete && pending.is_empty(),
+                        });
+                    }
+                }
+                Ok(GrammarCandidate::Rejected { byte_offset: 0 })
+            }
             Self::Json(prefix) => prefix.preview(cursor, committed, pending),
             Self::Literal(text) => {
                 if let Some(suffix) = text.strip_prefix(committed) {
@@ -119,9 +146,28 @@ struct State {
     ended: bool,
 }
 
-struct ConstraintTokens {
-    endings: Vec<TokenId>,
-    preserved: std::collections::BTreeSet<u32>,
+/// Token endings, preserved specials and the prepared decoded vocabulary are
+/// one resolved set of facts. Raw grammar cannot also carry decoded transforms.
+pub(crate) enum ConstraintTokens {
+    Raw(ByteStreamContract),
+    Decoded {
+        contract: Option<Arc<ByteStreamContract>>,
+        endings: Vec<TokenId>,
+        preserved: std::collections::BTreeSet<u32>,
+    },
+}
+impl ConstraintTokens {
+    pub(crate) fn decoded(
+        endings: Vec<TokenId>,
+        preserved: &std::collections::BTreeSet<u32>,
+        contract: Option<Arc<ByteStreamContract>>,
+    ) -> Self {
+        Self::Decoded {
+            contract,
+            endings,
+            preserved: preserved.clone(),
+        }
+    }
 }
 
 pub(crate) struct ContentConstraint {
@@ -144,8 +190,7 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         Self::new(
             tokenizer,
@@ -154,20 +199,52 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
+    pub(crate) fn raw_json_schema(
+        tokenizer: &Tokenizer,
+        schema: &serde_json::Value,
+        max_bytes: usize,
+        contract: ByteStreamContract,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            tokenizer,
+            GrammarByteCursor::json_schema(schema, max_bytes)?,
+            Normalization::Json,
+            ProjectionKind::Plain,
+            "",
+            max_bytes,
+            ConstraintTokens::Raw(contract.into_raw()),
+        )
+    }
+
+    pub(crate) fn xml_tool_call(
+        tokenizer: &Tokenizer,
+        grammar: &str,
+        projection_kind: ProjectionKind,
+        prefix: &str,
+        max_bytes: usize,
+        tokens: ConstraintTokens,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            tokenizer,
+            GrammarByteCursor::lark(grammar, max_bytes)?,
+            Normalization::CanonicalXml,
+            projection_kind,
+            prefix,
+            max_bytes,
+            tokens,
+        )
+    }
+
     pub(crate) fn text(
         tokenizer: &Tokenizer,
         grammar: &crate::config::TextGrammar,
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         let cursor = match grammar {
             crate::config::TextGrammar::Regex(pattern) => {
@@ -182,10 +259,7 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
     fn new(
@@ -197,14 +271,30 @@ impl ContentConstraint {
         max_bytes: usize,
         tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
-        let ConstraintTokens { endings, preserved } = tokens;
+        let (raw, decoded, endings, preserved) = match tokens {
+            ConstraintTokens::Raw(contract) => {
+                (Some(contract), None, Vec::new(), Default::default())
+            }
+            ConstraintTokens::Decoded {
+                contract,
+                endings,
+                preserved,
+            } => (None, contract, endings, preserved),
+        };
         let vocabulary = tokenizer
             .inner()
             .get_vocab(true)
             .values()
             .copied()
             .collect::<HashSet<_>>();
-        let codec = match ByteStreamContract::resolve_output(tokenizer, &preserved)? {
+        let contract = match raw {
+            Some(contract) => Some(Arc::new(contract)),
+            None => match decoded {
+                Some(contract) => Some(contract),
+                None => ByteStreamContract::resolve_output(tokenizer, &preserved)?.map(Arc::new),
+            },
+        };
+        let codec = match contract {
             Some(contract) => Codec::Bytes(contract),
             None => Codec::Canonical(Box::new(tokenizer.clone())),
         };
@@ -220,7 +310,10 @@ impl ContentConstraint {
             Ok(normalized)
         })().map_err(|source| ConstraintPrefixError { source })?;
         let plain_vocabulary = match (&projection_kind, &codec) {
-            (ProjectionKind::Plain, Codec::Bytes(contract)) => {
+            (ProjectionKind::Plain, Codec::Bytes(contract))
+                if !matches!(normalization, Normalization::CanonicalXml)
+                    && !contract.has_literal_replace() =>
+            {
                 Some(GrammarTokenVocabulary::new(&contract.pieces)?)
             }
             _ => None,
@@ -258,6 +351,58 @@ impl ContentConstraint {
         state.json.commit(state.normalized.canonical().as_bytes())?;
         state.ended = false;
         Ok(())
+    }
+
+    /// Restart a raw lazy JSON value at a captured byte offset, which can fall
+    /// inside a model token or an unfinished UTF-8 scalar. The caller has
+    /// already proved an identity byte decoder and serializes activation.
+    pub(crate) fn seed_raw_bytes(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lazy JSON state is poisoned; restart this completion"))?;
+        self.reset(&mut state)?;
+        let result = (|| {
+            ensure!(
+                state.decoder.is_identity()
+                    && matches!(self.projection_kind, ProjectionKind::Plain),
+                "lazy JSON raw replay requires a plain identity byte decoder; use a supported raw tokenizer contract"
+            );
+            let State {
+                projection,
+                json,
+                raw,
+                normalized,
+                ..
+            } = &mut *state;
+            ensure!(
+                Self::admit_preview(projection.with_preview(bytes, false, |view| {
+                    Self::inspect_grammar(
+                        view,
+                        json,
+                        raw,
+                        normalized.canonical(),
+                        false,
+                        self.normalization,
+                    )
+                }))?,
+                "lazy JSON trigger replay is not a viable JSON Schema prefix; include the captured trigger and its suffix in the schema value"
+            );
+            self.advance_bytes(&mut state, bytes, false)
+        })();
+        match result {
+            Err(operation) => {
+                if let Err(recovery) = self.reset(&mut state) {
+                    return Err(ResponseConstraintRecovery {
+                        operation,
+                        recovery,
+                    }
+                    .into());
+                }
+                Err(operation)
+            }
+            result => result,
+        }
     }
 
     fn inspect_grammar(
@@ -305,6 +450,35 @@ impl ContentConstraint {
         let terminal = self.endings.contains(&id);
         let mut fork = state.decoder.clone();
         let bytes = self.decode(&mut fork, id, terminal, true)?;
+        let retained = match &fork {
+            DecoderState::Bytes(decoder) => decoder.retained_bytes(),
+            _ => 0,
+        };
+        if state
+            .projection
+            .retained_bytes()
+            .checked_add(bytes.len())
+            .and_then(|size| size.checked_add(retained))
+            .is_none_or(|size| size > self.max_bytes)
+        {
+            return Err(ResponseBufferExceeded {
+                limit: self.max_bytes,
+            }
+            .into());
+        }
+        if !terminal
+            && let DecoderState::Bytes(decoder) = &fork
+            && decoder.has_literal_replace()
+            && decoder.retained_bytes() > 0
+        {
+            return self.literal_can_continue(state, bytes, decoder.clone());
+        }
+        let suffix = match &fork {
+            DecoderState::Bytes(decoder) if !terminal => {
+                Some((decoder.provisional_tail(self.max_bytes)?, decoder.clone()))
+            }
+            _ => None,
+        };
         let State {
             projection,
             json,
@@ -312,6 +486,25 @@ impl ContentConstraint {
             normalized,
             ..
         } = state;
+        if let Some((tail, decoder)) = suffix
+            && !tail.is_empty()
+        {
+            let mut provisional = bytes.clone();
+            provisional.extend(tail);
+            if Self::admit_preview(projection.with_preview(&provisional, false, |view| {
+                Self::inspect_grammar(
+                    view,
+                    json,
+                    raw,
+                    normalized.canonical(),
+                    false,
+                    self.normalization,
+                )
+            }))? {
+                return Ok(true);
+            }
+            return self.suffix_can_end(state, bytes, decoder);
+        }
         projection.with_preview(&bytes, terminal, |view| {
             Self::inspect_grammar(
                 view,
@@ -322,6 +515,269 @@ impl ContentConstraint {
                 self.normalization,
             )
         })
+    }
+
+    /// Explore actual eligible token continuations of delayed literal output.
+    /// A held pattern prefix is not an unconditional provisional text suffix.
+    fn literal_can_continue(
+        &self,
+        state: &mut State,
+        bytes: Vec<u8>,
+        decoder: ByteStreamState,
+    ) -> anyhow::Result<bool> {
+        use std::collections::VecDeque;
+        const MAX_STATES: usize = 4096;
+        const MAX_WORK: usize = 262144;
+        let memory_limit = self
+            .max_bytes
+            .saturating_mul(4)
+            .clamp(4096, 16 * 1024 * 1024);
+        let Codec::Bytes(contract) = &self.codec else {
+            unreachable!("literal state owns byte codec")
+        };
+        let mut ids = self.vocabulary.iter().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut catalogue_work = 0usize;
+        for id in &ids {
+            catalogue_work = catalogue_work
+                .checked_add(contract.pieces[*id as usize].len())
+                .and_then(|n| n.checked_add(64))
+                .context("literal continuation catalogue work overflow")?;
+        }
+        ensure!(
+            catalogue_work <= 256 * 1024 * 1024,
+            "literal continuation catalogue exceeds its 256 MiB work budget; reduce tokenizer vocabulary"
+        );
+        let mut pieces = HashSet::new();
+        ids.retain(|id| {
+            pieces.insert((
+                contract.kinds[*id as usize],
+                contract.pieces[*id as usize].as_slice(),
+                self.endings.contains(id),
+            ))
+        });
+        let mut queue = VecDeque::from([(bytes, decoder)]);
+        let mut visited = HashSet::new();
+        let mut memory = 0usize;
+        let mut work = 0usize;
+        let mut byte_work = 0usize;
+        let mut transform_work = crate::byte_stream::StreamWork::new(256 * 1024 * 1024);
+        while let Some((output, decoder)) = queue.pop_front() {
+            transform_work.charge(
+                output.len() + decoder.storage_bytes(),
+                "literal continuation EOF clone",
+            )?;
+            let mut terminal = output.clone();
+            terminal.extend(decoder.clone().finish_with_work(
+                self.max_bytes.saturating_sub(terminal.len()),
+                &mut transform_work,
+            )?);
+            if Self::admit_preview(state.projection.with_preview(&terminal, true, |view| {
+                Self::inspect_grammar(
+                    view,
+                    &mut state.json,
+                    &state.raw,
+                    state.normalized.canonical(),
+                    true,
+                    self.normalization,
+                )
+            }))? {
+                return Ok(true);
+            }
+            let mut effects = HashSet::new();
+            let mut effect_memory = 0usize;
+            for &id in &ids {
+                work = work
+                    .checked_add(1)
+                    .context("literal decoder viability work overflow")?;
+                ensure!(
+                    work <= MAX_WORK,
+                    "literal Replace continuation viability exceeds its {MAX_WORK}-transition budget; simplify decoder stages/patterns or use a tokenizer with fewer distinct continuations"
+                );
+                let piece = contract
+                    .pieces
+                    .get(id as usize)
+                    .context("literal continuation token is absent from byte vocabulary")?;
+                if piece.is_empty() && !self.endings.contains(&id) {
+                    continue;
+                }
+                byte_work = byte_work
+                    .checked_add(piece.len())
+                    .and_then(|n| n.checked_add(decoder.storage_bytes()))
+                    .and_then(|n| n.checked_add(output.len()))
+                    .context("literal decoder byte-work overflow")?;
+                ensure!(
+                    byte_work <= 256 * 1024 * 1024,
+                    "literal Replace continuation viability exceeds its 256 MiB byte-work budget; simplify decoder state or vocabulary continuations"
+                );
+                let mut next = decoder.clone();
+                let mut emitted = output.clone();
+                emitted.extend_from_slice(&next.step_with_work(
+                    piece,
+                    contract.kinds[id as usize],
+                    self.max_bytes.saturating_sub(emitted.len()),
+                    &mut transform_work,
+                )?);
+                let terminal = self.endings.contains(&id);
+                if terminal {
+                    emitted.extend(next.finish_with_work(
+                        self.max_bytes.saturating_sub(emitted.len()),
+                        &mut transform_work,
+                    )?);
+                }
+                if state
+                    .projection
+                    .retained_bytes()
+                    .checked_add(emitted.len())
+                    .and_then(|n| n.checked_add(next.retained_bytes()))
+                    .is_none_or(|n| n > self.max_bytes)
+                {
+                    continue;
+                }
+                if !Self::admit_preview(state.projection.with_preview(
+                    &emitted,
+                    terminal,
+                    |view| {
+                        Self::inspect_grammar(
+                            view,
+                            &mut state.json,
+                            &state.raw,
+                            state.normalized.canonical(),
+                            terminal,
+                            self.normalization,
+                        )
+                    },
+                ))? {
+                    continue;
+                }
+                if terminal || next.retained_bytes() == 0 {
+                    return Ok(true);
+                }
+                let effect = (emitted, next);
+                if effects.contains(&effect) {
+                    continue;
+                }
+                let effect_bytes = effect
+                    .0
+                    .len()
+                    .checked_add(effect.1.storage_bytes())
+                    .and_then(|n| n.checked_mul(4))
+                    .and_then(|n| n.checked_add(128))
+                    .context("literal decoder effect memory overflow")?;
+                effect_memory = effect_memory
+                    .checked_add(effect_bytes)
+                    .context("literal effect memory overflow")?;
+                ensure!(
+                    memory
+                        .checked_add(effect_memory)
+                        .is_some_and(|n| n <= memory_limit),
+                    "literal Replace continuation effects exceed {memory_limit}-byte search budget; simplify decoder composition"
+                );
+                effects.insert(effect.clone());
+                let (emitted, next) = effect;
+
+                if emitted == output && next == decoder {
+                    continue;
+                }
+                let key = (emitted, next);
+                if visited.contains(&key) {
+                    continue;
+                }
+                memory = memory
+                    .checked_add(
+                        4usize.saturating_mul(
+                            key.0.len() + key.1.storage_bytes() + size_of_val(&key),
+                        ) + 128,
+                    )
+                    .context("literal decoder viability memory overflow")?;
+                ensure!(
+                    visited.len() < MAX_STATES && memory <= memory_limit,
+                    "literal Replace continuation viability exceeds its {MAX_STATES}-state/{memory_limit}-byte budget; simplify decoder composition or retained patterns"
+                );
+                visited.insert(key.clone());
+                queue.push_back(key);
+            }
+        }
+        Ok(false)
+    }
+
+    /// When the full delayed tail is invalid, release only those prefixes which
+    /// an actual continuation of this decoder can expose before ending.
+    fn suffix_can_end(
+        &self,
+        state: &mut State,
+        bytes: Vec<u8>,
+        decoder: ByteStreamState,
+    ) -> anyhow::Result<bool> {
+        use std::collections::VecDeque;
+        const MAX_STATES: usize = 4096;
+        let memory_limit = self
+            .max_bytes
+            .saturating_mul(4)
+            .clamp(4096, 16 * 1024 * 1024);
+        let mut memory = 0usize;
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from([(bytes, decoder)]);
+        while let Some((bytes, decoder)) = queue.pop_front() {
+            let mut terminal = bytes.clone();
+            terminal.extend(decoder.clone().finish(self.max_bytes)?);
+            if Self::admit_preview(state.projection.with_preview(&terminal, true, |view| {
+                Self::inspect_grammar(
+                    view,
+                    &mut state.json,
+                    &state.raw,
+                    state.normalized.canonical(),
+                    true,
+                    self.normalization,
+                )
+            }))? {
+                return Ok(true);
+            }
+            for continuation in decoder.suffix_continuations() {
+                let mut next = decoder.clone();
+                let mut output = bytes.clone();
+                output.extend_from_slice(&next.step(
+                    &continuation,
+                    crate::byte_stream::BytePieceKind::Text,
+                    self.max_bytes,
+                )?);
+                if state
+                    .projection
+                    .retained_bytes()
+                    .checked_add(output.len())
+                    .and_then(|size| size.checked_add(next.retained_bytes()))
+                    .is_none_or(|size| size > self.max_bytes)
+                {
+                    continue;
+                }
+                if !Self::admit_preview(state.projection.with_preview(&output, false, |view| {
+                    Self::inspect_grammar(
+                        view,
+                        &mut state.json,
+                        &state.raw,
+                        state.normalized.canonical(),
+                        false,
+                        self.normalization,
+                    )
+                }))? {
+                    continue;
+                }
+                let key = (output, next);
+                if visited.contains(&key) {
+                    continue;
+                }
+                memory = memory.saturating_add(
+                    4 * (key.0.len() + key.1.storage_bytes() + std::mem::size_of_val(&key)) + 128,
+                );
+                anyhow::ensure!(
+                    visited.len() < MAX_STATES && memory <= memory_limit,
+                    "tokenizer.decoder trailing Strip viability exceeded its {MAX_STATES}-state/{memory_limit}-byte search budget; reduce Strip stop counts or simplify the composed Strip stages"
+                );
+                visited.insert(key.clone());
+                queue.push_back(key);
+            }
+        }
+        Ok(false)
     }
 
     fn token_allowed(&self, state: &mut State, id: TokenId) -> anyhow::Result<bool> {
@@ -336,6 +792,7 @@ impl ContentConstraint {
                     || error.is::<MissingResponseField>()
                     || error.is::<ResponseBufferExceeded>()
                     || error.is::<GrammarByteBudgetExceeded>()
+                    || error.is::<ByteStreamBufferExceeded>()
                     || error.is::<NonMonotonicText>()
                     || error.is::<InvalidJsonEscape>()
                     || error.is::<NonMonotonicProjection>() =>
@@ -357,7 +814,7 @@ impl ContentConstraint {
         }
         let mut decoder = state.decoder.clone();
         let pending = match (&self.codec, &mut decoder) {
-            (Codec::Bytes(_), DecoderState::Bytes(state)) => state.finish(),
+            (Codec::Bytes(_), DecoderState::Bytes(state)) => state.finish(self.max_bytes)?,
             (Codec::Canonical(tokenizer), DecoderState::Canonical(state)) => {
                 state.finish(tokenizer)?.into_bytes()
             }
@@ -397,9 +854,12 @@ impl ContentConstraint {
                     .pieces
                     .get(id as usize)
                     .context("content grammar token has no declared byte piece")?;
-                let mut bytes = state.step(piece).into_owned();
+                let mut bytes = state
+                    .step(piece, contract.kinds[id as usize], self.max_bytes)?
+                    .into_owned();
+                state.check_buffer(self.max_bytes)?;
                 if terminal {
-                    bytes.extend(state.finish());
+                    bytes.extend(state.finish(self.max_bytes.saturating_sub(bytes.len()))?);
                 }
                 Ok(bytes)
             }
@@ -420,14 +880,36 @@ impl ContentConstraint {
 
     fn advance(&self, state: &mut State, id: TokenId) -> anyhow::Result<()> {
         let bytes = self.decode(&mut state.decoder, id, self.endings.contains(&id), false)?;
-        state.projection.commit(&bytes)?;
-        let raw = if self.endings.contains(&id) {
+        self.advance_bytes(state, &bytes, self.endings.contains(&id))?;
+        state.history.push(id);
+        state.ended = self.endings.contains(&id);
+        Ok(())
+    }
+
+    fn advance_bytes(&self, state: &mut State, bytes: &[u8], terminal: bool) -> anyhow::Result<()> {
+        let retained = match &state.decoder {
+            DecoderState::Bytes(decoder) => decoder.retained_bytes(),
+            _ => 0,
+        };
+        if state
+            .projection
+            .retained_bytes()
+            .checked_add(bytes.len())
+            .and_then(|size| size.checked_add(retained))
+            .is_none_or(|size| size > self.max_bytes)
+        {
+            return Err(ResponseBufferExceeded {
+                limit: self.max_bytes,
+            }
+            .into());
+        }
+        state.projection.commit(bytes)?;
+        let raw = if terminal {
             state.projection.content(true)?
         } else {
             state.projection.content(false)?
         };
-        if projection_extension(&raw, &state.raw, self.endings.contains(&id), "content")?.is_some()
-        {
+        if projection_extension(&raw, &state.raw, terminal, "content")?.is_some() {
             let normalized = self.normalization.parse(&raw)?;
             if let Some(suffix) = normalized
                 .canonical()
@@ -442,8 +924,6 @@ impl ContentConstraint {
             state.raw = raw;
             state.normalized = normalized;
         }
-        state.history.push(id);
-        state.ended = self.endings.contains(&id);
         Ok(())
     }
 }
@@ -471,10 +951,18 @@ impl Constraint for ContentConstraint {
             if state.ended {
                 return Ok(vec![false; candidates.len()]);
             }
+            if candidates.is_empty() {
+                return Ok(Vec::new());
+            }
             if let (Some(vocabulary), Codec::Bytes(contract)) =
                 (&self.plain_vocabulary, &self.codec)
                 && state.decoder.is_identity()
                 && !state.normalized.has_pending_escape()
+                // A removed whitespace suffix closes the raw JSON lexeme.
+                // Extending its canonical bytes directly could admit `1 e2`.
+                && !(matches!(self.normalization, Normalization::Json)
+                    && state.raw.ends_with([' ', '\t', '\r', '\n'])
+                    && !state.normalized.canonical().ends_with([' ', '\t', '\r', '\n']))
             {
                 let pending = state
                     .projection
@@ -494,6 +982,10 @@ impl Constraint for ContentConstraint {
                             && let Some(piece) = piece.filter(|piece| {
                                 !piece.is_empty()
                                     && !piece.iter().any(|&byte| matches!(byte, b'\\' | 0x7f))
+                                    && !(matches!(self.normalization, Normalization::Json)
+                                        && piece.last().is_some_and(|byte| {
+                                            matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+                                        }))
                             })
                             && !(state.normalized.canonical().is_empty()
                                 && piece.first().is_some_and(u8::is_ascii_whitespace))
@@ -545,6 +1037,7 @@ impl Constraint for ContentConstraint {
         match self.normalization {
             Normalization::Json => "json_constraint",
             Normalization::Literal => "response_grammar_constraint",
+            Normalization::CanonicalXml => "xml_tool_constraint",
         }
     }
 }
@@ -590,6 +1083,47 @@ mod tests {
     }
 
     #[test]
+    fn raw_json_seed_handles_partial_utf8_rejection_and_reactivation() {
+        let tokenizer = tokenizer(true);
+        let preserved = tokenizer
+            .inner()
+            .get_vocab(true)
+            .values()
+            .copied()
+            .collect();
+        let constraint = ContentConstraint::json_schema(
+            &tokenizer,
+            &json!({"const":"é"}),
+            ProjectionKind::Plain,
+            "",
+            128,
+            crate::response_constraint::ConstraintTokens::decoded(vec![], &preserved, None),
+        )
+        .unwrap();
+        constraint.seed_raw_bytes(b"\"\xc3").unwrap();
+        assert!(!constraint.can_finish(&ProcessorContext::default()).unwrap());
+        let candidate = TokenCandidate {
+            token_id: 5,
+            text: String::new(),
+            is_eos: false,
+        };
+        assert_eq!(
+            constraint
+                .allowed_next_tokens(&ProcessorContext::default(), &[candidate])
+                .unwrap(),
+            [true]
+        );
+        assert!(constraint.seed_raw_bytes(b"\"wrong\"").is_err());
+        constraint.seed_raw_bytes("\"é\"".as_bytes()).unwrap();
+        assert!(constraint.can_finish(&ProcessorContext::default()).unwrap());
+        constraint.seed_raw_bytes(b"\"\\u00e9\"").unwrap();
+        assert!(constraint.can_finish(&ProcessorContext::default()).unwrap());
+        assert!(constraint.seed_raw_bytes(&[b' '; 129]).is_err());
+        constraint.seed_raw_bytes("\"é\"".as_bytes()).unwrap();
+        assert!(constraint.can_finish(&ProcessorContext::default()).unwrap());
+    }
+
+    #[test]
     fn logical_text_grammar_checks_ordinary_eos_without_special_registration() {
         let tokenizer = Tokenizer::from_file(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -602,8 +1136,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let eos = [TokenCandidate {
@@ -627,8 +1164,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let context = ProcessorContext {
@@ -671,13 +1211,13 @@ mod tests {
                     *prefix = "unowned prefix".to_owned();
                 }
                 assert!(
-                    build_processor_chain(&ambiguous, Some(&tokenizer), false)
+                    build_processor_chain(&ambiguous, Some(&tokenizer), false, None,)
                         .err()
                         .unwrap()
                         .to_string()
                         .contains("response_projection")
                 );
-                let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+                let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
                 let initial = mask(&chain, &[]);
                 assert!(initial[22].is_finite());
                 assert!(!initial[23].is_finite());
@@ -818,8 +1358,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     4096,
-                    vec![3],
-                    &Default::default(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 let mut reference = ContentConstraint::json_schema(
@@ -828,8 +1371,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     4096,
-                    vec![3],
-                    &Default::default(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 assert!(fast.plain_vocabulary.is_some());
@@ -863,6 +1409,216 @@ mod tests {
     }
 
     #[test]
+    fn json_trailing_strip_checks_unavoidable_tail_and_actual_terminal_decoding() {
+        let base = byte_tokenizer(
+            true,
+            &[
+                (4, "\"A\""),
+                (5, "<0xC3>"),
+                (6, "<0xA9>"),
+                (7, "é"),
+                (8, "x"),
+                (9, "\""),
+                (10, "\"A"),
+            ],
+        );
+        for character in ["é", "x"] {
+            let mut value: Value =
+                serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+            value["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},
+                {"type":"Strip","content":character,"start":0,"stop":1}]});
+            let scratch = tempfile::tempdir().unwrap();
+            let path = scratch.path().join("tokenizer.json");
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let tokenizer = Tokenizer::from_file(path).unwrap();
+            let constraint = ContentConstraint::json_schema(
+                &tokenizer,
+                &json!({"const":"A"}),
+                ProjectionKind::Plain,
+                "",
+                1024,
+                crate::response_constraint::ConstraintTokens::decoded(
+                    vec![3],
+                    &Default::default(),
+                    None,
+                ),
+            )
+            .unwrap();
+            let candidates = (0..32)
+                .map(|token_id| TokenCandidate {
+                    token_id,
+                    text: String::new(),
+                    is_eos: token_id == 3,
+                })
+                .collect::<Vec<_>>();
+            let allowed = |history: Vec<u32>| {
+                constraint
+                    .allowed_next_tokens(
+                        &ProcessorContext {
+                            generated_tokens: history,
+                            ..Default::default()
+                        },
+                        &candidates,
+                    )
+                    .unwrap()
+            };
+            if character == "é" {
+                assert!(allowed(vec![4])[5]);
+                let partial = allowed(vec![4, 5]);
+                assert!(!partial[3]);
+                assert!(partial[6]);
+                let full = allowed(vec![4, 5, 6]);
+                assert!(full[3]);
+                assert!(!full[5]);
+                assert!(!full[7]);
+                assert!(!full[8]);
+            } else {
+                let unfinished = allowed(vec![10]);
+                assert!(!unfinished[8]);
+                assert!(unfinished[9]);
+                let complete = allowed(vec![4]);
+                assert!(complete[8]);
+                assert!(allowed(vec![4, 8])[3]);
+                assert!(!allowed(vec![4, 8])[8]);
+                let bounded = ContentConstraint::json_schema(
+                    &tokenizer,
+                    &json!({"const":"A"}),
+                    ProjectionKind::Plain,
+                    "",
+                    3,
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
+                )
+                .unwrap();
+                let mask = bounded
+                    .allowed_next_tokens(
+                        &ProcessorContext {
+                            generated_tokens: vec![4],
+                            ..Default::default()
+                        },
+                        &candidates,
+                    )
+                    .unwrap();
+                assert!(mask[3]);
+                assert!(
+                    !mask[8],
+                    "retained decoder tails share the response byte budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_trailing_strip_can_release_a_partial_window_without_inventing_composed_endings() {
+        let base = byte_tokenizer(true, &[(4, "0"), (8, "x"), (9, "\""), (10, "\"A")]);
+        for (strips, history, allowed_id, expected) in [
+            (
+                json!([{ "type":"Strip","content":"x","start":0,"stop":1000}]),
+                vec![10],
+                8,
+                false,
+            ),
+            (
+                json!([{ "type":"Strip","content":"\"","start":0,"stop":1000}]),
+                vec![10, 9],
+                9,
+                true,
+            ),
+            (
+                json!([{ "type":"Strip","content":"\"","start":0,"stop":2}]),
+                vec![10, 9],
+                9,
+                true,
+            ),
+            (
+                json!([{ "type":"Strip","content":"x","start":0,"stop":1},{"type":"Strip","content":"\"","start":0,"stop":1}]),
+                vec![10, 9],
+                8,
+                false,
+            ),
+            (
+                json!([{ "type":"Strip","content":"\"","start":0,"stop":1},{"type":"Strip","content":"x","start":0,"stop":1}]),
+                vec![10, 9],
+                8,
+                true,
+            ),
+        ] {
+            let mut value: Value =
+                serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+            let mut stages = vec![json!({"type":"ByteFallback"}), json!({"type":"Fuse"})];
+            stages.extend(strips.as_array().unwrap().iter().cloned());
+            value["decoder"] = json!({"type":"Sequence","decoders":stages});
+            let scratch = tempfile::tempdir().unwrap();
+            let path = scratch.path().join("tokenizer.json");
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let tokenizer = Tokenizer::from_file(path).unwrap();
+            let constraint = ContentConstraint::json_schema(
+                &tokenizer,
+                &json!({"const":"A"}),
+                ProjectionKind::Plain,
+                "",
+                4096,
+                crate::response_constraint::ConstraintTokens::decoded(
+                    vec![3],
+                    &Default::default(),
+                    None,
+                ),
+            )
+            .unwrap();
+            let candidates = (0..32)
+                .map(|token_id| TokenCandidate {
+                    token_id,
+                    text: String::new(),
+                    is_eos: token_id == 3,
+                })
+                .collect::<Vec<_>>();
+            let actual = constraint
+                .allowed_next_tokens(
+                    &ProcessorContext {
+                        generated_tokens: history.clone(),
+                        ..Default::default()
+                    },
+                    &candidates,
+                )
+                .unwrap();
+            assert_eq!(actual[allowed_id], expected, "{strips}");
+            if strips.as_array().unwrap().len() == 1 && strips[0]["stop"] == 2 {
+                let pending = constraint
+                    .allowed_next_tokens(
+                        &ProcessorContext {
+                            generated_tokens: vec![10, 9, 9],
+                            ..Default::default()
+                        },
+                        &candidates,
+                    )
+                    .unwrap();
+                assert!(!pending[3]);
+                assert!(pending[9]);
+                let final_mask = constraint
+                    .allowed_next_tokens(
+                        &ProcessorContext {
+                            generated_tokens: vec![10, 9, 9, 9],
+                            ..Default::default()
+                        },
+                        &candidates,
+                    )
+                    .unwrap();
+                assert!(final_mask[3]);
+                let mut decoder = TokenTextDecoder::default();
+                let mut text = String::new();
+                for id in [10, 9, 9, 9] {
+                    text.push_str(&decoder.step(&tokenizer, id).unwrap());
+                }
+                text.push_str(&decoder.finish(&tokenizer).unwrap());
+                assert_eq!(text, "\"A\"");
+            }
+        }
+    }
+
+    #[test]
     fn json_decoder_panics_report_token_and_configuration_without_unwinding() {
         let base = byte_tokenizer(true, &[(4, " ")]);
         let mut value: Value =
@@ -881,7 +1637,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let error = build_processor_chain(&options, Some(&tokenizer), false)
+        let error = build_processor_chain(&options, Some(&tokenizer), false, None)
             .err()
             .unwrap();
         let message = format!("{error:#}");
@@ -948,7 +1704,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         for opening in [22u32, 23] {
             assert!(mask(&chain, &[])[opening as usize].is_finite());
             assert!(mask(&chain, &[opening])[4].is_finite());
@@ -977,7 +1733,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let chain = build_processor_chain(&declared_options, Some(&tokenizer), false).unwrap();
+        let chain =
+            build_processor_chain(&declared_options, Some(&tokenizer), false, None).unwrap();
         for opening in [22u32, 23] {
             assert!(mask(&chain, &[])[opening as usize].is_finite());
             assert!(mask(&chain, &[opening])[4].is_finite());
@@ -1021,8 +1778,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let mut reference = ContentConstraint::json_schema(
@@ -1031,8 +1791,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         assert!(fast.plain_vocabulary.is_some());
@@ -1046,6 +1809,9 @@ mod tests {
             .collect::<Vec<_>>();
         for history in [
             vec![],
+            vec![25],
+            vec![25, 26],
+            vec![25, 26, 26],
             vec![22],
             vec![22, 24],
             vec![22, 24, 25],
@@ -1096,7 +1862,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(mask(&chain, &[])[4].is_finite());
         let pending = mask(&chain, &[4, 5, 6, 6, 7]);
         assert!(pending[8].is_finite() && !pending[9].is_finite() && !pending[3].is_finite());
@@ -1108,7 +1874,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { prefix, .. }) = &mut options.constraint {
             *prefix = "\"A".into();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(
             mask(&chain, &[])[16].is_finite(),
             "ordinary EOS quote finishes the actual JSON text"
@@ -1116,7 +1882,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { prefix, .. }) = &mut options.constraint {
             *prefix = "\"A\"".into();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(
             !mask(&chain, &[])[16].is_finite(),
             "EOS roles do not erase ordinary quote bytes"
@@ -1143,7 +1909,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
             *schema = json!({"const":"A"}).to_string();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         for history in [
             vec![22],
             vec![22, 4],
@@ -1180,7 +1946,7 @@ mod tests {
                 &format!("A[r]old[/r]{}", &spelling[..split]),
                 &tokenizer,
             );
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             let mut history = Vec::new();
             for &id in &ids[split..] {
                 assert!(
@@ -1203,7 +1969,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
             *schema = json!({"const":"é"}).to_string();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         let first = mask(&chain, &[22]);
         assert!(first[4].is_finite());
         assert!(
@@ -1240,7 +2006,7 @@ mod tests {
             let prefix: String = "A[r]old[/r]".into();
             project(&mut options, template, &prefix, &tokenizer);
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(mask(&chain, &[22])[4].is_finite());
         assert!(!mask(&chain, &[22])[16].is_finite());
         assert!(mask(&chain, &[22, 4])[5].is_finite());
@@ -1255,7 +2021,7 @@ mod tests {
             if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
                 *schema = json!({"const":value}).to_string();
             }
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             assert_eq!(mask(&chain, &[22])[6].is_finite(), space_allowed);
             if space_allowed {
                 assert!(mask(&chain, &[22, 6])[23].is_finite());
@@ -1282,7 +2048,7 @@ mod tests {
                 let prefix: String = "A<c>".into();
                 project(&mut options, template, &prefix, &tokenizer);
             }
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             // C3 cannot extend X終, so the complete X closes content before it.
             assert!(mask(&chain, &[22, 23])[4].is_finite());
             assert!(mask(&chain, &[22, 23, 4])[5].is_finite());
@@ -1313,7 +2079,7 @@ mod tests {
             });
         }
         options.max_constraint_bytes = 64;
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         let initial = mask(&chain, &[]);
         assert!(
             !initial[3].is_finite(),
@@ -1343,7 +2109,7 @@ mod tests {
                         .to_owned();
                     project(&mut options, template, &prefix, &tokenizer);
                 }
-                let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+                let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
                 let mut logits = vec![0.0; 34];
                 chain
                     .process(&mut logits, &ProcessorContext::default())
@@ -1371,7 +2137,7 @@ mod tests {
     fn response_json_processor_replays_history_replacements_and_recovers_rejections() {
         let tokenizer = tokenizer(false);
         let options = options(&tokenizer);
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         for ids in [vec![], vec![25], vec![22], vec![25], vec![], vec![22]] {
             let context = ProcessorContext {
                 generated_tokens: ids,
@@ -1380,7 +2146,7 @@ mod tests {
             let mut actual = vec![0.0; 32];
             let mut expected = actual.clone();
             chain.process(&mut actual, &context).unwrap();
-            build_processor_chain(&options, Some(&tokenizer), false)
+            build_processor_chain(&options, Some(&tokenizer), false, None)
                 .unwrap()
                 .process(&mut expected, &context)
                 .unwrap();
@@ -1410,5 +2176,253 @@ mod tests {
             )
             .unwrap();
         assert!(logits[3].is_finite());
+    }
+    #[test]
+    fn literal_frontier_deduplicates_large_equivalent_vocab_without_losing_distinct_tokens() {
+        let base = byte_tokenizer(true, &[(4, "a"), (5, "b"), (6, "z")]);
+        let mut value: Value =
+            serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        let start = vocab.len();
+        for id in start..start + 50000 {
+            assert!(vocab.insert(format!("noise_{id}"), json!(id)).is_none());
+        }
+        value["decoder"] = json!({"type":"Sequence","decoders":[{"type":"Replace","pattern":{"Regex":"noise_[0-9]+"},"content":"!"},{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"ab"},"content":"7"}]});
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let constraint = ContentConstraint::json_schema(
+            &tokenizer,
+            &json!({"const":7}),
+            ProjectionKind::Plain,
+            "",
+            4096,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
+        )
+        .unwrap();
+        let candidates = [3u32, 4, 5, 6]
+            .into_iter()
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        let allows = |mask: &[bool], token_id| {
+            mask[candidates
+                .iter()
+                .position(|candidate| candidate.token_id == token_id)
+                .unwrap()]
+        };
+        let mask = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
+        assert!(allows(&mask, 4));
+        assert!(!allows(&mask, 3));
+        assert!(!allows(&mask, 6));
+        let context = ProcessorContext {
+            generated_tokens: vec![4],
+            ..Default::default()
+        };
+        let mask = constraint
+            .allowed_next_tokens(&context, &candidates)
+            .unwrap();
+        assert!(allows(&mask, 5));
+        assert!(!allows(&mask, 3));
+        assert!(!allows(&mask, 4));
+        assert!(!allows(&mask, 6));
+        let context = ProcessorContext {
+            generated_tokens: vec![4, 5],
+            ..Default::default()
+        };
+        assert!(constraint.can_finish(&context).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod canonical_xml_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cursor(mut schema: serde_json::Value) -> GrammarByteCursor {
+        schema["x-guidance"] = json!({"root_object_key_policy":{"min":1,"max":256}});
+        GrammarByteCursor::lark(&format!(
+            "start: \"<tool_call>\\n{{\\\"name\\\":\\\"lookup\\\",\\\"arguments\\\":\" arguments \"}}\\n</tool_call>\"\narguments: %json {schema}\n"
+        ), 65536).unwrap()
+    }
+    fn admitted(cursor: &mut GrammarByteCursor, text: &str, terminal: bool) -> bool {
+        matches!(LogicalPrefix::CanonicalXml(text.into()).preview(cursor, "", b"").unwrap(),
+            GrammarCandidate::Viable { complete } if !terminal || complete)
+    }
+    fn schema(value: serde_json::Value) -> serde_json::Value {
+        json!({"type":"object","properties":{"city":{"const":value}},"required":["city"],"additionalProperties":false})
+    }
+    const OPEN: &str = "<atem:invoke name=\"lookup\"><atem:parameter name=\"city\">";
+    const CLOSE: &str = "</atem:parameter></atem:invoke>";
+
+    #[test]
+    fn canonical_xml_masks_raw_json_looking_strings_before_selection() {
+        for (value, raw) in [
+            (json!("1"), "1"),
+            (json!("true"), "true"),
+            (json!("null"), "null"),
+            (json!("1x"), "1x"),
+            (json!("Paris"), "Paris"),
+        ] {
+            let mut grammar = cursor(schema(value));
+            assert!(
+                !admitted(&mut grammar, &format!("{OPEN}{raw}"), false),
+                "{raw}"
+            );
+            let good = format!("{OPEN}&quot;{raw}&quot;{CLOSE}");
+            for (index, _) in good.char_indices() {
+                assert!(
+                    admitted(&mut grammar, &good[..index], false),
+                    "{raw}: {}",
+                    &good[..index]
+                );
+            }
+            assert!(admitted(&mut grammar, &good, true), "{raw}");
+        }
+    }
+
+    #[test]
+    fn canonical_xml_closing_parameter_cannot_extend_a_fixed_json_number() {
+        let mut grammar = cursor(schema(json!(12)));
+        assert!(admitted(&mut grammar, &format!("{OPEN}1"), false));
+        assert!(!admitted(&mut grammar, &format!("{OPEN}1<"), false));
+        assert!(!admitted(
+            &mut grammar,
+            &format!("{OPEN}1</atem:param"),
+            false
+        ));
+        assert!(admitted(&mut grammar, &format!("{OPEN}12{CLOSE}"), true));
+        assert!(!admitted(
+            &mut grammar,
+            &format!("{OPEN}&quot;12&quot;{CLOSE}"),
+            true
+        ));
+    }
+
+    #[test]
+    fn canonical_xml_preserves_schema_roots_order_types_and_entities() {
+        let root = json!({"$defs":{"Args":{"type":"object","properties":{"z":{"const":" é<>&\"' "},"a":{"const":null}},"required":["z","a"],"additionalProperties":false}},"$ref":"#/$defs/Args"});
+        let mut grammar = cursor(root);
+        let fields = "<atem:parameter name=\"z\">&quot; é&lt;&gt;&amp;\\&quot;&apos; &quot;</atem:parameter><atem:parameter name=\"a\">null</atem:parameter>";
+        let good = format!("<atem:invoke name=\"lookup\">{fields}</atem:invoke>");
+        for (index, _) in good.char_indices() {
+            assert!(
+                admitted(&mut grammar, &good[..index], false),
+                "{}",
+                &good[..index]
+            );
+        }
+        assert!(admitted(&mut grammar, &good, true));
+        let reversed = "<atem:invoke name=\"lookup\"><atem:parameter name=\"a\">null</atem:parameter><atem:parameter name=\"z\">&quot; é&lt;&gt;&amp;\\&quot;&apos; &quot;</atem:parameter></atem:invoke>";
+        assert!(!admitted(&mut grammar, reversed, true));
+        assert!(matches!(
+            onnx_genai_metadata::tool_protocol::ToolProtocol::AtemXmlV1.parse(reversed),
+            onnx_genai_metadata::tool_protocol::ToolParseOutcome::CompleteSoFar(_)
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"wrong\">",
+            false
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"></atem:invoke>",
+            true
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter name=\"extra\">",
+            false
+        ));
+    }
+    #[test]
+    fn canonical_xml_cannot_enter_an_unencodable_property_name_prefix() {
+        let mut grammar = cursor(
+            json!({"type":"object","properties":{"":{"type":"integer"}},"additionalProperties":false}),
+        );
+        assert!(admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"></atem:invoke>",
+            true
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter",
+            false
+        ));
+    }
+
+    #[test]
+    fn canonical_xml_preserves_quoted_control_and_unicode_parameter_names() {
+        let key = "\"&<\0é";
+        let mut grammar = cursor(
+            json!({"type":"object","properties":{key:{"const":"</atem:invoke>"}},"required":[key],"additionalProperties":false}),
+        );
+        let good = "<atem:invoke name=\"lookup\"><atem:parameter name=\"&quot;&amp;&lt;\0é\">&quot;&lt;/atem:invoke&gt;&quot;</atem:parameter></atem:invoke>";
+        for (index, _) in good.char_indices() {
+            assert!(
+                admitted(&mut grammar, &good[..index], false),
+                "{:?}",
+                &good[..index]
+            );
+        }
+        assert!(admitted(&mut grammar, good, true));
+        let mut grammar = cursor(schema(json!("é")));
+        let text = format!("{OPEN}&quot;");
+        assert!(matches!(
+            LogicalPrefix::CanonicalXml(text)
+                .preview(&mut grammar, "", &[0xc3])
+                .unwrap(),
+            GrammarCandidate::Viable { complete: false }
+        ));
+    }
+    #[test]
+    fn canonical_xml_rejects_dead_partial_entities_before_the_semicolon() {
+        let mut grammar = cursor(schema(json!("1")));
+        assert!(admitted(&mut grammar, &format!("{OPEN}&"), false));
+        assert!(admitted(&mut grammar, &format!("{OPEN}&q"), false));
+        assert!(!admitted(&mut grammar, &format!("{OPEN}&a"), false));
+        assert!(!admitted(&mut grammar, &format!("{OPEN}&#"), false));
+        assert!(!admitted(&mut grammar, "<atem:invoke name=\"&a", false));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter name=\"&a",
+            false
+        ));
+    }
+    #[test]
+    fn canonical_xml_named_fields_preserve_cardinality_without_dynamic_names() {
+        let mut grammar = cursor(
+            json!({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"],"minProperties":2,"maxProperties":2}),
+        );
+        let good = "<atem:invoke name=\"lookup\"><atem:parameter name=\"a\">1</atem:parameter><atem:parameter name=\"b\">2</atem:parameter></atem:invoke>";
+        for (index, _) in good.char_indices() {
+            assert!(
+                admitted(&mut grammar, &good[..index], false),
+                "{}",
+                &good[..index]
+            );
+        }
+        assert!(admitted(&mut grammar, good, true));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"></atem:invoke>",
+            true
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter name=\"extra\">",
+            false
+        ));
     }
 }

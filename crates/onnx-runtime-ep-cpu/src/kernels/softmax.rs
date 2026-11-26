@@ -22,13 +22,18 @@
 //! logits (e.g. masked-attention `-inf`/`1e9` fills) never overflow.
 
 use crate::dtype::{
-    output_direct_write_eligible, slice_byte_range, to_dense_f32_widen, write_dense_f32_narrow,
+    can_borrow_dense, output_direct_write_eligible, to_dense_f32_widen, to_dense_f32_widen_into,
+    validate_f32_widen_input, validate_host_output, write_dense_f32_narrow,
 };
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::Node;
 
-use super::check_arity;
-use crate::strided::numel;
+use super::softmax_geometry::SoftmaxGeometry;
+#[cfg(test)]
+use crate::kernels::testutil::PreparedTestKernel;
 
 /// f32 Softmax kernel carrying the raw `axis` attribute and the opset semantics.
 pub struct SoftmaxKernel {
@@ -177,8 +182,28 @@ fn scale_mask_softmax_serial(
     scale: f32,
     mask: Option<MaskPlan<'_>>,
 ) {
+    scale_mask_softmax_serial_with_kernel(data, first_row, d, scale, mask, softmax_rows_serial);
+}
+
+// Static callback exposes actual row batching to correctness tests. Production
+// supplies the same row kernel as before, with no per-tile dynamic dispatch.
+fn scale_mask_softmax_serial_with_kernel(
+    data: &mut [f32],
+    first_row: usize,
+    d: usize,
+    scale: f32,
+    mask: Option<MaskPlan<'_>>,
+    softmax: impl Fn(&mut [f32], usize),
+) {
     let rows = data.len() / d;
     if rows == 0 {
+        return;
+    }
+    // Cache tiling serves the preceding scale/mask writes. With no transform,
+    // there are no such writes to retain: batch the complete worker run once,
+    // matching the out-of-place driver's row-kernel call count.
+    if scale == 1.0 && mask.is_none() {
+        softmax(data, d);
         return;
     }
     let rows_per_tile = (ROW_TILE_BYTES / (d * size_of::<f32>())).clamp(1, rows);
@@ -232,7 +257,7 @@ fn scale_mask_softmax_serial(
             }
             None => {}
         }
-        softmax_rows_serial(tile, d);
+        softmax(tile, d);
         row0 += tile_rows;
     }
 }
@@ -961,19 +986,42 @@ pub(crate) fn softmax_slices(
         softmax_rows(&x[..len], &mut out[..len], outer, axis_dim);
         return;
     }
+    softmax_strided_slices(out, |_, index| x[index], outer, axis_dim, inner);
+}
+
+/// The admitted snapshot is dense; reduction groups are disjoint and finish
+/// their maximum before overwriting any source element. Each exponential then
+/// reads only its own original input, followed by normalization of that group.
+fn softmax_slices_in_place(data: &mut [f32], outer: usize, axis_dim: usize, inner: usize) {
+    if inner == 1 {
+        scale_mask_softmax_rows(data, outer, axis_dim, 1.0, None);
+    } else {
+        softmax_strided_slices(data, |lane, index| lane[index], outer, axis_dim, inner);
+    }
+}
+
+// Share the exact original arithmetic with borrowed-input execution. Static
+// accessors avoid shared/mutable slice aliasing and per-element dynamic calls.
+fn softmax_strided_slices(
+    out: &mut [f32],
+    read: impl Fn(&[f32], usize) -> f32,
+    outer: usize,
+    axis_dim: usize,
+    inner: usize,
+) {
     for o in 0..outer {
         for i in 0..inner {
             let base = o * axis_dim * inner + i;
             let mut max = f32::NEG_INFINITY;
             for a in 0..axis_dim {
-                let v = x[base + a * inner];
+                let v = read(out, base + a * inner);
                 if v > max {
                     max = v;
                 }
             }
             let mut sum = 0.0f32;
             for a in 0..axis_dim {
-                let e = (x[base + a * inner] - max).exp();
+                let e = (read(out, base + a * inner) - max).exp();
                 out[base + a * inner] = e;
                 sum += e;
             }
@@ -985,89 +1033,201 @@ pub(crate) fn softmax_slices(
     }
 }
 
-impl Kernel for SoftmaxKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("Softmax", inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32_widen("Softmax", &inputs[0])?;
-        let shape = inputs[0].shape;
-        let rank = shape.len();
-        if rank == 0 {
-            return Err(EpError::KernelFailed(
-                "Softmax: input must have rank >= 1".into(),
-            ));
+impl SoftmaxKernel {
+    fn geometry(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<SoftmaxGeometry> {
+        SoftmaxGeometry::new("Softmax", self.axis, self.coerce_2d, inputs, outputs)
+    }
+    fn validate_views(input: &TensorView, output: &TensorMut) -> Result<()> {
+        validate_f32_widen_input("Softmax",input).map_err(|error|EpError::KernelFailed(format!("Softmax: X view is invalid: {error}; bind valid floating Host-accessible input storage")))?;
+        validate_host_output("Softmax", output)?;
+        for (name, base, offset, bytes, contiguous) in [
+            (
+                "X",
+                input.data.0 as usize,
+                input.byte_offset,
+                input.numel().checked_mul(input.dtype.byte_size()),
+                input.is_contiguous(),
+            ),
+            (
+                "Y",
+                output.data.0 as usize,
+                output.byte_offset,
+                output.numel().checked_mul(output.dtype.byte_size()),
+                output.is_contiguous(),
+            ),
+        ] {
+            if contiguous
+                && base
+                    .checked_add(offset)
+                    .and_then(|origin| bytes.and_then(|n| origin.checked_add(n)))
+                    .is_none()
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "Softmax: {name} address range wraps; bind valid Host storage for the complete tensor"
+                )));
+            }
         }
-        let axis = if self.axis < 0 {
-            self.axis + rank as i64
+        Ok(())
+    }
+    fn direct(input: &TensorView, output: &TensorMut, count: usize) -> Result<bool> {
+        if can_borrow_dense::<f32>(input) {
+            let start = input.data_ptr::<f32>() as usize;
+            let end = start.checked_add(count * size_of::<f32>()).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "Softmax: borrowed X address range wraps; bind valid Host storage".into(),
+                )
+            })?;
+            let range = start..end;
+            Ok(output_direct_write_eligible(
+                output,
+                count,
+                std::slice::from_ref(&range),
+            ))
         } else {
-            self.axis
-        };
-        if axis < 0 || axis as usize >= rank {
-            return Err(EpError::KernelFailed(format!(
-                "Softmax: axis {} out of range for rank {rank}",
-                self.axis
-            )));
-        }
-        let axis = axis as usize;
-        crate::trace::record_kernel_metrics(inputs, outputs, || {
-            let slices = if self.coerce_2d {
-                crate::trace::product(shape[..axis].iter().copied())
-            } else {
-                crate::trace::product(shape[..axis].iter().chain(&shape[axis + 1..]).copied())
-            };
-            // Per element: subtract, exp, sum and normalization multiply; one
-            // reciprocal per reduction slice. Max comparisons are not FLOPs.
-            (inputs[0].numel() as u64)
-                .saturating_mul(4)
-                .saturating_add(slices)
-        });
-
-        let len = numel(shape);
-        if len == 0 {
-            // Nothing to write, and `from_raw_parts_mut` below requires a
-            // non-null pointer even for a zero-length slice.
-            return Ok(());
-        }
-        // Softmax reads every input element before writing the corresponding
-        // output, so a f32 output buffer that does not alias the widened input
-        // can be written straight through - saving a full-tensor scratch
-        // allocation and copy on the dominant f32 path. When `x` borrows the
-        // input (no widening happened) the ranges can genuinely overlap, which
-        // is why the disjointness is checked rather than assumed.
-        let read_ranges = [slice_byte_range(x.as_ref())];
-        let direct = output_direct_write_eligible(&mut outputs[0], len, &read_ranges);
-        let mut owned;
-        let out: &mut [f32] = if direct {
-            // SAFETY: `output_direct_write_eligible` proved the buffer is a
-            // host-accessible contiguous Float32 tensor of exactly `len`
-            // elements whose byte range is disjoint from the input we read.
-            unsafe { std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), len) }
-        } else {
-            owned = vec![0.0f32; len];
-            &mut owned
-        };
-
-        if self.coerce_2d {
-            // opset ≤ 12: coerce to 2D `[d_0·…·d_{axis-1}, d_axis·…·d_{n-1}]`
-            // and softmax each row over the whole flattened trailing block.
-            let rows: usize = shape[..axis].iter().product();
-            let cols: usize = shape[axis..].iter().product();
-            // Trailing block is contiguous, so `inner == 1`.
-            softmax_slices(&x, out, rows, cols, 1);
-        } else {
-            // opset ≥ 13: normalize over the single `axis`, viewing the tensor
-            // as `[outer, axis_dim, inner]`.
-            let axis_dim = shape[axis];
-            let outer: usize = shape[..axis].iter().product();
-            let inner: usize = shape[axis + 1..].iter().product();
-            softmax_slices(&x, out, outer, axis_dim, inner);
-        }
-        if direct {
-            Ok(())
-        } else {
-            write_dense_f32_narrow("Softmax", &mut outputs[0], out)
+            // Materialization needs one full f32 payload even with direct Y.
+            // Admit that payload instead of allocating an ungoverned input Vec.
+            Ok(false)
         }
     }
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let metadata = inputs
+            .iter()
+            .map(|x| TensorMetadata::new(x.dtype, x.shape, !x.is_absent()))
+            .collect::<smallvec::SmallVec<[_; 1]>>();
+        let facts = outputs
+            .iter()
+            .map(OutputMetadata::from_view)
+            .collect::<smallvec::SmallVec<[_; 1]>>();
+        let geometry = self.geometry(&metadata, &facts)?;
+        Self::validate_views(&inputs[0], &outputs[0])?;
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            (geometry.count as u64)
+                .saturating_mul(4)
+                .saturating_add((geometry.outer as u64).saturating_mul(geometry.inner as u64))
+        });
+        if geometry.count == 0 {
+            return Ok(());
+        }
+        if Self::direct(&inputs[0], &outputs[0], geometry.count)? {
+            let x = to_dense_f32_widen("Softmax", &inputs[0])?;
+            // SAFETY: the classifier proves borrowed contiguous aligned f32 X
+            // and complete aligned contiguous Host f32 Y, with disjoint ranges.
+            let y = unsafe {
+                std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), geometry.count)
+            };
+            softmax_slices(&x, y, geometry.outer, geometry.width, geometry.inner);
+            Ok(())
+        } else {
+            // SAFETY: the executor lends exclusive, live, disjoint Host scratch.
+            // Complete binding validation precedes all input reads/output writes.
+            unsafe {
+                geometry.workspace.with_buffers(workspace, |[y]| {
+                    if can_borrow_dense::<f32>(&inputs[0]) {
+                        let x = to_dense_f32_widen("Softmax", &inputs[0])?;
+                        softmax_slices(&x, y, geometry.outer, geometry.width, geometry.inner);
+                    } else {
+                        // Finish the complete snapshot before touching real Y,
+                        // preserving arbitrary input/output overlap and conversion.
+                        to_dense_f32_widen_into("Softmax", &inputs[0], y)?;
+                        if output_direct_write_eligible(&outputs[0], geometry.count, &[]) {
+                            // SAFETY: the classifier proves complete aligned Host
+                            // f32 Y. Its backing is disjoint from exclusive scratch.
+                            let output = std::slice::from_raw_parts_mut(
+                                outputs[0].data_ptr_mut::<f32>(),
+                                geometry.count,
+                            );
+                            softmax_slices(
+                                y,
+                                output,
+                                geometry.outer,
+                                geometry.width,
+                                geometry.inner,
+                            );
+                            return Ok(());
+                        }
+                        softmax_slices_in_place(y, geometry.outer, geometry.width, geometry.inner);
+                    }
+                    write_dense_f32_narrow("Softmax", &mut outputs[0], y)
+                })
+            }
+        }
+    }
+}
 
+impl Kernel for SoftmaxKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        let geometry = self.geometry(inputs, outputs)?;
+        if geometry.count == 0 {
+            Ok(WorkspacePreparation::Ready(WorkspaceRequirement::NONE))
+        } else if geometry.output_dtype == onnx_runtime_ir::DataType::Float32
+            && inputs[0].dtype == onnx_runtime_ir::DataType::Float32
+        {
+            Ok(WorkspacePreparation::Deferred)
+        } else {
+            Ok(WorkspacePreparation::Ready(
+                geometry.workspace.requirement(),
+            ))
+        }
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        facts: &[OutputMetadata<'_>],
+        _cached: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        let geometry = self.geometry(metadata, facts)?;
+        if let ([input], [output]) = (inputs, outputs) {
+            if input.dtype != metadata[0].dtype
+                || input.shape != metadata[0].shape
+                || input.is_absent()
+                || output.is_absent()
+                || output.dtype != geometry.output_dtype
+                || output.shape != input.shape
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "Softmax: X/Y views {:?}/{:?} with dtypes {:?}/{:?} differ from workspace metadata; refresh metadata for the actual bindings",
+                    input.shape, output.shape, input.dtype, output.dtype
+                )));
+            }
+            Self::validate_views(input, output)?;
+            if geometry.count == 0 || Self::direct(input, output, geometry.count)? {
+                return Ok(WorkspaceExecutionPreparation::Ready(
+                    WorkspaceRequirement::NONE,
+                ));
+            }
+        }
+        // Missing real outputs cannot prove a direct route. Keep a complete
+        // conservative bound, including on an unresolved-output execution path.
+        Ok(WorkspaceExecutionPreparation::Ready(
+            geometry.workspace.requirement(),
+        ))
+    }
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
@@ -1083,7 +1243,7 @@ mod tests {
             axis,
             coerce_2d: false,
         }
-        .execute(&[x.view()], &mut [out.view_mut()])
+        .execute_prepared(&[x.view()], &mut [out.view_mut()])
         .unwrap();
     }
 
@@ -1092,7 +1252,7 @@ mod tests {
             axis,
             coerce_2d: true,
         }
-        .execute(&[x.view()], &mut [out.view_mut()])
+        .execute_prepared(&[x.view()], &mut [out.view_mut()])
         .unwrap();
     }
 
@@ -1176,7 +1336,7 @@ mod tests {
                 &[],
             )
             .unwrap()
-            .execute(&[x.view()], &mut [out.view_mut()])
+            .execute_prepared(&[x.view()], &mut [out.view_mut()])
             .unwrap();
         approx(
             &out.to_f32(),
@@ -1690,7 +1850,7 @@ mod vectorized_tests {
             axis: -1,
             coerce_2d: false,
         }
-        .execute(&[x.view()], &mut [direct.view_mut()])
+        .execute_prepared(&[x.view()], &mut [direct.view_mut()])
         .unwrap();
 
         // A stride-2 view over a doubled buffer is not contiguous, so
@@ -1707,7 +1867,7 @@ mod vectorized_tests {
             axis: -1,
             coerce_2d: false,
         }
-        .execute(&[strided.view()], &mut [owned.view_mut()])
+        .execute_prepared(&[strided.view()], &mut [owned.view_mut()])
         .unwrap();
 
         assert_eq!(direct.to_f32(), owned.to_f32());
@@ -1729,7 +1889,7 @@ mod vectorized_tests {
             axis: 1,
             coerce_2d: false,
         }
-        .execute(&[x.view()], &mut [out.view_mut()])
+        .execute_prepared(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         // Each (outer, inner) column of 3 must sum to one.
         for o in 0..2 {
@@ -1761,7 +1921,7 @@ mod vectorized_tests {
                 axis: -1,
                 coerce_2d: false,
             }
-            .execute(&[x.view()], &mut [out.view_mut()])
+            .execute_prepared(&[x.view()], &mut [out.view_mut()])
             .unwrap();
             out.to_f32()
         };
@@ -1770,7 +1930,8 @@ mod vectorized_tests {
         let in_ptr = shared.as_ptr() as *const std::ffi::c_void;
         let out_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
         let shape = [rows, cols];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let f32c = DataType::Float32;
         let cpu = DeviceId::cpu();
         let x = TensorView::new(DevicePtr(in_ptr), f32c, &shape, &strides, cpu);
@@ -1779,7 +1940,7 @@ mod vectorized_tests {
             axis: -1,
             coerce_2d: false,
         }
-        .execute(&[x], &mut [out])
+        .execute_prepared(&[x], &mut [out])
         .unwrap();
 
         assert_eq!(shared, disjoint);
@@ -1794,7 +1955,7 @@ mod vectorized_tests {
             axis: -1,
             coerce_2d: false,
         }
-        .execute(&[x.view()], &mut [out.view_mut()])
+        .execute_prepared(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         assert!(out.to_f32().is_empty());
     }
@@ -1884,4 +2045,44 @@ mod native_row_boundaries {
         assert!(checked_row_width(usize::MAX, 2).is_err());
         assert!(checked_row_width(1, 0).is_err());
     }
+    #[test]
+    fn packed_unaligned_float_output_uses_safe_staging() {
+        use crate::kernels::testutil::Owned;
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::{DataType, DeviceId};
+        let x = Owned::f32(&[2, 4], &[1., 2., 3., 4., -1., -2., 2., 3.]);
+        let mut expected = Owned::zeros_f32(&[2, 4]);
+        let kernel = SoftmaxKernel {
+            axis: -1,
+            coerce_2d: false,
+        };
+        kernel
+            .execute_prepared(&[x.view()], &mut [expected.view_mut()])
+            .unwrap();
+        let mut backing = [0xa5a5a5a5u32; 10];
+        let base = backing.as_mut_ptr().cast::<u8>();
+        let mut output = TensorMut::new(
+            DevicePtrMut(unsafe { base.add(1).cast() }),
+            DataType::Float32,
+            &[2, 4],
+            &[4, 1],
+            DeviceId::cpu(),
+        );
+        output.validate().unwrap();
+        kernel
+            .execute_prepared(&[x.view()], std::slice::from_mut(&mut output))
+            .unwrap();
+        for (i, want) in expected.to_f32().into_iter().enumerate() {
+            assert_eq!(
+                unsafe { base.add(1 + i * 4).cast::<f32>().read_unaligned() },
+                want
+            );
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(base, 40) };
+        assert_eq!(bytes[0], 0xa5);
+        assert!(bytes[33..].iter().all(|&b| b == 0xa5));
+    }
 }
+
+#[cfg(test)]
+mod workspace_tests;

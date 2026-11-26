@@ -98,6 +98,7 @@ impl GenerationClock {
     ) {
         self.step_started = Some(now);
         self.sample.get_or_insert(crate::config::GenerationTimings {
+            speculative: None,
             prompt_tokens: prompt_tokens.saturating_sub(cached_prompt_tokens),
             cached_prompt_tokens,
             generated_tokens: 0,
@@ -145,6 +146,12 @@ impl GenerationClock {
     fn pause_work_at(&mut self, now: std::time::Instant) {
         if let (Some(start), Some(sample)) = (self.step_started.take(), self.sample.as_mut()) {
             sample.generation_elapsed += now.duration_since(start);
+        }
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn record_speculative(&mut self, stats: crate::SpeculativeStats) {
+        if let Some(sample) = self.sample.as_mut() {
+            sample.speculative = Some(stats);
         }
     }
     pub(crate) fn snapshot(&self) -> Option<crate::config::GenerationTimings> {
@@ -412,10 +419,17 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
         chain,
         tokenizer,
         callback,
+        None,
     )?;
     Ok((token_id, finish))
 }
 
+pub(crate) type SelectedTokenFinalizer<'a> =
+    dyn FnMut(Option<&FinishReason>) -> anyhow::Result<()> + 'a;
+
+// Physical finalization must run after stop selection and before publication;
+// keep its fallible hook explicit at this shared commit boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_selected_token(
     state: &mut DecodeLoopState,
     prompt_tokens: &[TokenId],
@@ -424,11 +438,23 @@ pub(crate) fn commit_selected_token(
     chain: &ProcessorChain,
     tokenizer: &Tokenizer,
     callback: Option<&mut GenerateTokenCallback<'_>>,
+    before_publish: Option<&mut SelectedTokenFinalizer<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     if state.step == 0 {
         state.text_decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(
             &options.effective_preserved_tokens(),
         );
+        state
+            .text_decoder
+            .set_byte_limit(options.max_constraint_bytes);
+        if let Some(contract) = chain.publication_decoder() {
+            state
+                .text_decoder
+                .bind_literal_decoder(contract.clone(), options.max_constraint_bytes);
+            state
+                .text_decoder
+                .retain_shared_workspace(chain.publication_workspace());
+        }
     }
     state.generated_tokens.push(token_id);
     // Which token this step produced. Without it a timeline shows that a step
@@ -438,7 +464,10 @@ pub(crate) fn commit_selected_token(
     // decodes exactly as often as an untraced one.
     let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
     commit_span.set_arg("token_id", token_id);
-    let decode_text = callback.is_some() || !chain.is_empty() || state.custom_sampler.is_some();
+    let decode_text = callback.is_some()
+        || !chain.is_empty()
+        || state.custom_sampler.is_some()
+        || chain.publication_decoder().is_some();
     let mut token_text = if decode_text {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         state.text_decoder.step(tokenizer, token_id)?
@@ -469,6 +498,11 @@ pub(crate) fn commit_selected_token(
             finish_reason = finish_reason_after_token(token_id, options, chain, &context);
         }
     }
+    if let Some(finalize) = before_publish {
+        finalize(finish_reason.as_ref()).with_context(|| {
+            format!("finalize selected token {token_id} physical state before publication")
+        })?;
+    }
     state.clock.token_selected(state.generated_tokens.len());
     if let Some(callback) = callback {
         callback(GenerateToken {
@@ -493,13 +527,13 @@ pub(crate) fn finish_result(
     finish_reason: FinishReason,
     prefix_cache_hit_len: usize,
     logprobs: Option<&[TokenLogprob]>,
-    preserved_tokens: &std::collections::BTreeSet<TokenId>,
+    options: &GenerateOptions,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
         timings: None,
         retained_cache_tokens: 0,
-        text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
-        preserved_tokens: preserved_tokens.clone(),
+        text: crate::tokenization::decode_generation_output(tokenizer, generated_tokens, options)?,
+        preserved_tokens: options.effective_preserved_tokens(),
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         tool_calls: Vec::new(),
@@ -817,6 +851,7 @@ mod tests {
                     &ProcessorChain::new(),
                     &tokenizer,
                     Some(&mut callback),
+                    None,
                 )?;
                 assert_eq!(finish, stop_on_eos.then_some(FinishReason::EosToken));
                 assert_eq!(state.generated_tokens, [3]);
@@ -839,7 +874,7 @@ mod tests {
                         finish,
                         0,
                         None,
-                        &options.effective_preserved_tokens(),
+                        &options,
                     )?;
                     assert_eq!(result.token_ids, [3]);
                     assert_eq!(result.text, text);
@@ -857,7 +892,7 @@ mod tests {
             stop_sequences: vec![crate::logits::StopSequence::Text("tok22 tok22".into())],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None)?;
         let mut state = DecodeLoopState::new(0, None, None);
         let mut chunks = Vec::new();
         let mut callback = |token: GenerateToken| {
@@ -872,7 +907,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             None
         );
@@ -884,7 +920,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             Some(FinishReason::StopSequence { index: 0 })
         );
@@ -914,7 +951,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         let mut fallback_backend = MockBackend::new(true);
@@ -968,7 +1005,7 @@ mod tests {
                 seed: Some(seed),
                 ..Default::default()
             };
-            let chain = build_processor_chain(&options, None, false)?;
+            let chain = build_processor_chain(&options, None, false, None)?;
             let mut backend = MockBackend::with_logits(
                 false,
                 SampledOutcome::HardError,
@@ -1024,7 +1061,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         let mut na_backend = MockBackend::with_outcome(true, SampledOutcome::NotApplicable);
@@ -1089,7 +1126,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         // `HardError` outcome would panic-latch if ever reached; assert it isn't.
@@ -1125,7 +1162,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         assert!(chain.is_empty());
         let tokenizer = tokenizer()?;
 
@@ -1220,7 +1257,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
@@ -1272,7 +1309,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
@@ -1318,7 +1355,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);

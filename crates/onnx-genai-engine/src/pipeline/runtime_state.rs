@@ -127,6 +127,8 @@ pub(crate) struct WorkflowPlan {
     pub(crate) movable_emit_values: HashSet<String>,
     pub(crate) device_bridge_components: HashSet<String>,
     pub(crate) memory_strategy_plan: MemoryStrategyPlan,
+    pub(crate) audio_decode_limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
+    pub(crate) audio_memory: Option<crate::memory_authority::EngineMemoryAccounting>,
     pub(crate) decode_backend: EngineDecodeBackend,
     /// Canonical construction-time decision reused by every execution entry.
     pub(crate) execution_admission: super::WorkflowExecutionAdmission,

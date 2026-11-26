@@ -28,6 +28,8 @@ mod audio_input;
 mod auth;
 mod cli;
 mod completion_control;
+mod cors;
+pub use cors::{CorsConnectionInfo, CorsListeningAddress, CorsPolicy};
 mod driver;
 mod image_generation;
 mod lease;
@@ -39,6 +41,8 @@ mod model_hub;
 mod model_management;
 mod models_config;
 pub mod multimodal;
+mod ping;
+pub use ping::SsePingInterval;
 mod realtime;
 mod reasoning_request;
 mod registry;
@@ -78,7 +82,7 @@ pub use types::{
     ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction,
     ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse,
     EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat,
+    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaDocument, ResponseFormat,
     StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific,
     TranscriptInputTokenDetails, TranscriptResponse, TranscriptTokenUsage, Usage,
 };
@@ -251,11 +255,13 @@ pub fn app(state: AppState) -> Router {
     let router = router.route("/metrics", get(routes::prometheus_metrics));
     let replays = state.replays.clone();
     let api_keys = state.config.api_keys.clone();
+    let cors = state.config.cors.clone();
     router
         .fallback(webui::serve)
         .with_state(state)
         .layer(middleware::from_fn_with_state(replays, replay::intercept))
         .layer(middleware::from_fn_with_state(api_keys, auth::enforce))
+        .layer(middleware::from_fn_with_state(cors, cors::enforce))
         .layer(middleware::from_fn(trace_request))
 }
 
@@ -288,8 +294,21 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     // Authentication is opt-in through ServerConfig.api_keys. The CLI defaults
     // to loopback; operators choose keys or an authenticated reverse proxy.
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app(state)).await?;
+    serve_listener(listener, app(state)).await?;
     Ok(())
+}
+
+// Shared by public serving and the real wildcard-bind TCP regression: the test
+// exercises the production connection adapter, not a separately assembled one.
+pub(crate) async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    router: Router,
+) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<CorsConnectionInfo>(),
+    )
+    .await
 }
 
 #[cfg(test)]

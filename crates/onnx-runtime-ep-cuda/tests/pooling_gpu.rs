@@ -84,8 +84,10 @@ fn run_model_with(
             .htod(&input_bytes, cuptr(input_buf.as_ptr()))
             .unwrap();
     }
-    let input_strides = compute_contiguous_strides(&input_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let device = ep.device_id();
     let input = TensorView::new(
         DevicePtr(input_buf.as_ptr()),

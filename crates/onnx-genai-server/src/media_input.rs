@@ -82,16 +82,22 @@ fn decode_base64_image(encoded: &str, max_bytes: usize) -> anyhow::Result<Vec<u8
 pub(crate) struct MediaRequest {
     remaining: usize,
     budget_hint: &'static str,
+    audio_limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
     media: std::collections::HashMap<
         onnx_genai_metadata::EncodedMediaKind,
         std::collections::HashMap<String, std::sync::Arc<[u8]>>,
     >,
 }
 impl MediaRequest {
-    pub(crate) fn new(limit: std::num::NonZeroUsize, budget_hint: &'static str) -> Self {
+    pub(crate) fn new(
+        limit: std::num::NonZeroUsize,
+        budget_hint: &'static str,
+        audio_limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
+    ) -> Self {
         Self {
             remaining: limit.get(),
             budget_hint,
+            audio_limits,
             media: std::collections::HashMap::new(),
         }
     }
@@ -130,10 +136,11 @@ impl MediaRequest {
             onnx_genai_metadata::EncodedMediaKind::Image=>fetch_image(url,limit).await,
             onnx_genai_metadata::EncodedMediaKind::Audio=>decode_audio(url,limit),
         }.map_err(|error|ApiError::invalid_request(format!("{field} could not be loaded within the remaining {limit}-byte media budget ({}): {error:#}",self.budget_hint)))?;
+        let audio_limits = self.audio_limits;
         let bytes=tokio::task::spawn_blocking(move ||->anyhow::Result<Vec<u8>> {
             match kind {
                 onnx_genai_metadata::EncodedMediaKind::Image=>{ image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?.decode()?; }
-                onnx_genai_metadata::EncodedMediaKind::Audio=>{onnx_genai_preprocess::audio::decode_audio(&bytes)?;}
+                onnx_genai_metadata::EncodedMediaKind::Audio=>{onnx_genai_preprocess::audio::decode_audio(&bytes, audio_limits)?;}
             }
             Ok(bytes)
         }).await.map_err(|error|ApiError::internal(format!("validate {field}: media decoding task stopped: {error}; retry or inspect server logs")))?

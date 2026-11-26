@@ -151,7 +151,7 @@ pub enum SchemaVersionError {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 16);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 19);
 
 /// Every inference-metadata schema version this build reads.
 pub const SUPPORTED_SCHEMA_VERSIONS: SupportedSchemaVersions = SupportedSchemaVersions {
@@ -212,6 +212,15 @@ pub const DECISION_AUDIO_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 1
 /// The version introducing external named audio feature input programs.
 pub const AUDIO_FEATURE_INPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 16);
 
+/// The version introducing graph-scoped keyed weight container declarations.
+pub const GRAPH_WEIGHTS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 17);
+
+/// The version introducing explicitly bound GGUF LoRA adapters.
+pub const GGUF_ADAPTER_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 19);
+
+/// The version introducing explicit FIM control and extra-context serialization.
+pub const INFILL_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 18);
+
 /// A serialized feature whose presence is bounded by one schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaFeature {
@@ -226,6 +235,9 @@ pub enum SchemaFeature {
     MultimodalDecisions,
     DecisionAudio,
     AudioFeatureInputs,
+    GraphWeights,
+    InfillContext,
+    GgufAdapter,
 }
 
 impl SchemaFeature {
@@ -242,6 +254,9 @@ impl SchemaFeature {
             Self::MultimodalDecisions => MULTIMODAL_DECISION_SCHEMA_VERSION,
             Self::DecisionAudio => DECISION_AUDIO_SCHEMA_VERSION,
             Self::AudioFeatureInputs => AUDIO_FEATURE_INPUT_SCHEMA_VERSION,
+            Self::GraphWeights => GRAPH_WEIGHTS_SCHEMA_VERSION,
+            Self::InfillContext => INFILL_CONTEXT_SCHEMA_VERSION,
+            Self::GgufAdapter => GGUF_ADAPTER_SCHEMA_VERSION,
         }
     }
 
@@ -258,6 +273,9 @@ impl SchemaFeature {
             Self::RealtimeSessions => "session-scoped realtime audio/text quanta",
             Self::MultimodalDecisions => "ordered decision image inputs and authoritative usage",
             Self::DecisionAudio => "typed mixed decision media and spoken instructions",
+            Self::InfillContext => "explicit FIM control tokens and caller-supplied file context",
+            Self::GgufAdapter => "explicit GGUF LoRA adapter factor bindings",
+            Self::GraphWeights => "graph-scoped GGUF and SafeTensors initializer bindings",
             Self::AudioFeatureInputs => {
                 "externally executed audio programs bound to feature media inputs"
             }
@@ -280,6 +298,15 @@ impl SchemaFeature {
                  `publication_mode: provisional_revisions`"
             }
             Self::DecisionProfiles => "Declare decision prompting and answer policies explicitly",
+            Self::GgufAdapter => {
+                "Declare exact GGUF adapter source prefixes and ONNX target bindings"
+            }
+            Self::InfillContext => {
+                "Declare package.infill control tokens and extra-context template explicitly"
+            }
+            Self::GraphWeights => {
+                "Declare each graph artifact and its keyed weight paths, formats and explicit renames"
+            }
             Self::AudioFeatureInputs => {
                 "Declare the audio program output with the same name as its feature media input"
             }
@@ -332,6 +359,15 @@ pub fn gate_feature_use(
              {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
              document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
              (`commit_only` or `provisional_revisions`)"
+        )),
+        SchemaFeature::GgufAdapter => Err(format!(
+            "{path} requires minimum schema version {required}; re-emit the package with schema_version '{required}' and explicit GGUF LoRA target bindings, or choose a supported adapter format"
+        )),
+        SchemaFeature::InfillContext => Err(format!(
+            "{path} requires minimum schema version {required}; re-emit with schema_version '{required}' and an explicit FIM declaration, or omit package.infill"
+        )),
+        SchemaFeature::GraphWeights => Err(format!(
+            "{path} requires minimum schema version {required}; re-emit the package with schema_version '{required}' and explicit graph-scoped weight bindings, or use ordinary ONNX external data"
         )),
         SchemaFeature::AudioFeatureInputs => Err(format!(
             "{path} requires minimum schema version {required}; declare the named external audio feature binding in schema_version '{required}', or use an encoded-input workflow adapter"
@@ -475,7 +511,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.16");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.19");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -514,10 +550,10 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.17")).expect_err("1.17 is newer than this build");
+        let error = gate(Some("1.20")).expect_err("1.20 is newer than this build");
         let error = error.to_string();
         assert!(
-            error.contains("declares unsupported schema version v1.17"),
+            error.contains("declares unsupported schema version v1.20"),
             "{error}"
         );
         assert!(
@@ -576,7 +612,11 @@ mod tests {
             gate(Some("1.11")).expect("1.11"),
             DECISION_INPUT_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.16")).expect("1.16"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            gate(Some("1.16")).expect("1.16"),
+            AUDIO_FEATURE_INPUT_SCHEMA_VERSION
+        );
+        assert_eq!(gate(Some("1.19")).expect("1.19"), SUPPORTED_SCHEMA_VERSION);
     }
 
     #[test]

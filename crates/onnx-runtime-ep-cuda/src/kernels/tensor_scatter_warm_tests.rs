@@ -45,8 +45,10 @@ fn rewarm_preserves_success_pair_and_both_graph_owners() {
         // A uses explicit start=2 (wraps only in circular mode); B defaults to 0.
         let execute =
             |shape: &[usize], update_shape: &[usize], indexed: bool, output: *mut c_void| {
-                let strides = compute_contiguous_strides(shape);
-                let update_strides = compute_contiguous_strides(update_shape);
+                let strides = compute_contiguous_strides(shape)
+                    .expect("fixture shape has representable contiguous strides");
+                let update_strides = compute_contiguous_strides(update_shape)
+                    .expect("fixture shape has representable contiguous strides");
                 let mut inputs = vec![
                     TensorView::new(
                         DevicePtr(past.as_ptr()),

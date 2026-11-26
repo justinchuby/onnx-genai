@@ -871,6 +871,8 @@ pub struct EngineConfig {
     /// or `native` instead. An explicit `Ort` or `Native` value always takes
     /// precedence over the environment variable.
     pub decode_backend: EngineDecodeBackend,
+    /// Explicit authored model-package variant. Flat directories reject a selector.
+    pub package_variant: Option<String>,
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
@@ -919,6 +921,8 @@ pub struct EngineConfig {
     pub kv_connector: KvConnectorConfig,
     /// Vendor-neutral hot, warm, and cold resource ceilings (DESIGN §26.11).
     pub limits: ResourceLimits,
+    /// Finite raw/resident PCM policy, intersected with live host headroom before audio decoding.
+    pub audio_decode_limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
     /// Permit programmatic resource-limit changes after engine initialization.
     pub allow_runtime_override: bool,
     /// Static device/host weight placement policy.
@@ -945,6 +949,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             decode_backend: EngineDecodeBackend::Native,
+            package_variant: None,
             native_device: None,
             native_decode_batch: None,
             native_state_files: NativeStateFilePolicy::Disabled,
@@ -958,6 +963,8 @@ impl Default for EngineConfig {
             kv_cache_dtype: KvDType::F32,
             kv_connector: KvConnectorConfig::default(),
             limits: ResourceLimits::default(),
+            audio_decode_limits:
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
             allow_runtime_override: false,
             device_policy: DevicePolicy::Auto,
             // One encoder output for a handful of attachments. Big enough that
@@ -1332,6 +1339,11 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
+    /// Normal stop on a newly generated newline after this wall-clock prediction
+    /// budget, measured from the first selected token. None/zero disables it.
+    pub max_prediction_time: Option<std::time::Duration>,
+    /// Minimum space/tab characters after a generated newline; zero disables it.
+    pub minimum_indent: usize,
     /// Declared adapter composition per request row. Absence selects the base model.
     pub adapter_selection: Option<crate::pipeline::AdapterSelection>,
     /// Maximum tokens to produce after the prompt.
@@ -1434,6 +1446,8 @@ pub struct GenerateOptions {
 impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
+            max_prediction_time: None,
+            minimum_indent: 0,
             adapter_selection: None,
             max_new_tokens: 128,
             max_constraint_bytes: 4 * 1024 * 1024,
@@ -1508,11 +1522,54 @@ pub struct SamplingOverrides {
     pub top_k: Option<usize>,
 }
 
+/// A request's processor configuration failed compilation before execution.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid generation processor configuration: {source:#}")]
+pub struct ProcessorConfigurationError {
+    #[source]
+    source: anyhow::Error,
+}
+impl ProcessorConfigurationError {
+    pub(crate) fn classify(source: anyhow::Error) -> anyhow::Error {
+        // Preserve allocator/governor failures for serving resource policy; a
+        // valid configuration does not become invalid when capacity is scarce.
+        if source.chain().any(|cause| {
+            cause.is::<std::collections::TryReserveError>()
+                || cause.is::<onnx_runtime_memory_api::MemoryError>()
+                || cause.is::<crate::byte_stream::ProbeError>()
+        }) {
+            source
+        } else {
+            Self { source }.into()
+        }
+    }
+}
+
+/// Whether compilation owns contextual decoder state which a real serving
+/// worker must reserve before acknowledging stream admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessorAdmissionRequirement {
+    RequestLocal,
+    OwnedContextualDecoder,
+}
+
 impl GenerateOptions {
+    pub fn processor_admission_requirement(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> anyhow::Result<ProcessorAdmissionRequirement> {
+        Ok(
+            if crate::byte_stream::ByteStreamContract::requests_literal_stream(tokenizer)? {
+                ProcessorAdmissionRequirement::OwnedContextualDecoder
+            } else {
+                ProcessorAdmissionRequirement::RequestLocal
+            },
+        )
+    }
     /// Resolve request-local processor capabilities before admitting generation.
     /// The decoder builds its own mutable chain when execution starts.
     pub fn validate_processors(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
-        crate::processors::build_processor_chain(self, Some(tokenizer), false).map(drop)
+        crate::processors::build_processor_chain(self, Some(tokenizer), false, None).map(drop)
     }
 
     /// Validate explicit token biases against the admitted model vocabulary.
@@ -1737,13 +1794,34 @@ pub enum GrammarTrigger {
     PatternFull(String),
 }
 
+/// Explicit C++ classic-locale bracket collation, independent of the host.
+/// This selects bracket traits/range rules, not a different overall regex grammar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrammarCollation {
+    /// Preserve the existing libc++ classic-locale trigger contract.
+    #[default]
+    Libcxx,
+    /// Match libstdc++ classic-locale element names and primary equivalence.
+    Libstdcxx,
+}
+impl GrammarCollation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Libcxx => "libcxx",
+            Self::Libstdcxx => "libstdcxx",
+        }
+    }
+}
+
 /// A nonempty, bounded set of lazy activation conditions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrammarActivation {
     triggers: Vec<GrammarTrigger>,
+    collation: GrammarCollation,
 }
 impl GrammarActivation {
-    pub fn new(triggers: Vec<GrammarTrigger>) -> anyhow::Result<Self> {
+    pub fn new(triggers: Vec<GrammarTrigger>, collation: GrammarCollation) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !triggers.is_empty(),
             "lazy grammar has no triggers; provide at least one token, word or pattern trigger"
@@ -1752,7 +1830,10 @@ impl GrammarActivation {
             triggers.len() <= 1024,
             "lazy grammar exceeds 1024 triggers; combine patterns or use fewer triggers"
         );
-        Ok(Self { triggers })
+        Ok(Self {
+            triggers,
+            collation,
+        })
     }
     pub fn validate_with_tokenizer(
         &self,
@@ -1771,6 +1852,9 @@ impl GrammarActivation {
     ) -> anyhow::Result<()> {
         crate::gbnf::lazy::validate_words(tokenizer, self, preserved)
     }
+    pub fn collation(&self) -> GrammarCollation {
+        self.collation
+    }
     pub fn triggers(&self) -> &[GrammarTrigger] {
         &self.triggers
     }
@@ -1780,11 +1864,20 @@ impl GrammarActivation {
 /// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
+    /// Generate one canonical JSON-valued Atem XML call. The grammar describes
+    /// its logical tagged-JSON projection, with standalone parameter schemas.
+    XmlToolCall { grammar: String, prefix: String },
     /// llama.cpp GBNF over the raw newly generated stream, including channel
     /// markers and model-token references. Assistant prefill is not consumed.
     Gbnf {
         grammar: String,
         activation: Option<GrammarActivation>,
+    },
+    /// JSON Schema over newly generated raw bytes after a trigger. Before
+    /// activation output is unconstrained; assistant prefill is not consumed.
+    LazyJsonSchema {
+        schema: String,
+        activation: GrammarActivation,
     },
     /// Raw llguidance Lark over new model output, without assistant-prefill
     /// consumption or response-content projection. Keep the %llguidance header.
@@ -1857,7 +1950,11 @@ impl GenerateOptions {
         anyhow::ensure!(
             !matches!(
                 self.constraint,
-                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+                Some(
+                    GenerateConstraint::Gbnf { .. }
+                        | GenerateConstraint::RawLark { .. }
+                        | GenerateConstraint::LazyJsonSchema { .. }
+                )
             ) || self.stop_on_eos,
             "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );
@@ -2215,6 +2312,10 @@ pub struct PrioritizedGenerateResult {
 /// Why generation stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
+    /// A generated line failed its requested minimum indentation.
+    IndentationLimit,
+    /// Prediction time elapsed and a new newline was committed.
+    PredictionTimeLimit,
     /// The configured maximum number of new tokens was reached.
     MaxTokens,
     /// The configured EOS token was generated.
@@ -2298,6 +2399,9 @@ pub struct TokenLogprob {
 /// additional generation forward, matching llama.cpp's rate denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationTimings {
+    /// Actual speculative verification counters at this committed boundary.
+    /// Absent when no speculative verification has run.
+    pub speculative: Option<crate::SpeculativeStats>,
     pub prompt_tokens: usize,
     pub cached_prompt_tokens: usize,
     pub generated_tokens: usize,
@@ -2594,5 +2698,30 @@ mod generation_contract_tests {
             )
             .expect("no contract to violate");
         assert_eq!(options.temperature, 0.9);
+    }
+}
+
+#[cfg(test)]
+mod processor_error_classification_tests {
+    #[test]
+    fn allocation_failure_retains_its_type_instead_of_becoming_invalid_configuration() {
+        let error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        let classified = super::ProcessorConfigurationError::classify(
+            anyhow::Error::new(error).context("allocate valid compiled processor storage"),
+        );
+        assert!(
+            classified
+                .downcast_ref::<std::collections::TryReserveError>()
+                .is_some()
+        );
+        assert!(
+            classified
+                .downcast_ref::<super::ProcessorConfigurationError>()
+                .is_none()
+        );
+        let configuration = super::ProcessorConfigurationError::classify(anyhow::anyhow!(
+            "unsupported declared pattern"
+        ));
+        assert!(configuration.is::<super::ProcessorConfigurationError>());
     }
 }

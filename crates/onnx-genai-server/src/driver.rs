@@ -195,6 +195,7 @@ pub(crate) enum DriverCommand {
     SynthesizeSpeech {
         request: Box<GenerateRequest>,
         audio_output: String,
+        format: onnx_genai_engine::AudioOutputFormat,
         reply: oneshot::Sender<anyhow::Result<EncodedAudio>>,
         permit: WorkerPermit,
     },
@@ -205,8 +206,7 @@ pub(crate) enum DriverCommand {
         track_metrics: bool,
     },
     GenerateFim {
-        prefix: String,
-        suffix: String,
+        tokens: Vec<u32>,
         fim_config: FimConfig,
         options: Box<GenerateOptions>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
@@ -319,6 +319,15 @@ impl DriverFailure {
     }
 
     pub(crate) fn from_engine_error(error: &anyhow::Error) -> Self {
+        if error
+            .chain()
+            .any(|source| source.is::<onnx_genai_engine::ProcessorConfigurationError>())
+        {
+            return Self {
+                message: format!("{error:#}"),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
         if let Some(prefix) = error
             .chain()
             .find_map(|source| source.downcast_ref::<onnx_genai_engine::ConstraintPrefixError>())
@@ -1308,6 +1317,7 @@ impl EngineDriver {
         &self,
         request: GenerateRequest,
         audio_output: String,
+        format: onnx_genai_engine::AudioOutputFormat,
     ) -> Result<EncodedAudio, GenerateSubmitError> {
         let (commands, permit) = self.reserve_stateless_command()?;
         let (reply, response) = oneshot::channel();
@@ -1316,6 +1326,7 @@ impl EngineDriver {
             .send(DriverCommand::SynthesizeSpeech {
                 request: Box::new(request),
                 audio_output,
+                format,
                 reply,
                 permit,
             })
@@ -1407,8 +1418,7 @@ impl EngineDriver {
 
     pub(crate) async fn generate_fim(
         &self,
-        prefix: String,
-        suffix: String,
+        tokens: Vec<u32>,
         fim_config: FimConfig,
         options: GenerateOptions,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
@@ -1418,8 +1428,7 @@ impl EngineDriver {
         crate::metrics::generation_queued();
         if commands
             .send(DriverCommand::GenerateFim {
-                prefix,
-                suffix,
+                tokens,
                 fim_config,
                 options: Box::new(options),
                 admission,
@@ -2414,8 +2423,7 @@ fn handle_driver_command(
             },
         ),
         DriverCommand::GenerateFim {
-            prefix,
-            suffix,
+            tokens,
             fim_config,
             options,
             admission,
@@ -2424,8 +2432,7 @@ fn handle_driver_command(
         } => run_fim_generation(
             engine,
             completion,
-            prefix,
-            suffix,
+            tokens,
             fim_config,
             *options,
             (admission, events, permit),
@@ -2437,13 +2444,14 @@ fn handle_driver_command(
         DriverCommand::SynthesizeSpeech {
             request,
             audio_output,
+            format,
             reply,
             permit,
         } => {
             let _permit = permit;
             let result = engine
                 .run_pipeline_outputs(PipelineGenerateRequest::new(*request))
-                .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output));
+                .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output, format));
             complete_driver_reply(engine, completion, reply, result, _permit);
         }
         DriverCommand::GenerateImage {
@@ -2861,8 +2869,7 @@ fn run_generation(
 fn run_fim_generation(
     engine: &mut Engine,
     completion: &mut Option<crate::slots::SlotExecution>,
-    prefix: String,
-    suffix: String,
+    tokens: Vec<u32>,
     fim_config: FimConfig,
     options: GenerateOptions,
     delivery: (
@@ -2885,10 +2892,11 @@ fn run_fim_generation(
                 let _ = sender.send(Ok(()));
             }
         };
-        engine.generate_fim_with_config_and_callbacks(
-            prefix,
-            suffix,
-            options,
+        engine.generate_fim_request_with_config_and_callbacks(
+            GenerateRequest {
+                prompt: onnx_genai_engine::GeneratePrompt::TokenIds(tokens),
+                options,
+            },
             &fim_config,
             Some(control),
             Some(&mut admitted),
@@ -3572,8 +3580,13 @@ mod admission_tests {
         let spec =
             crate::audio_input::AudioInputSpec::from_encoded_input("audio_bytes".into(), &program)
                 .unwrap();
-        let input = MultimodalInput::from_samples(&spec, &[0.0f32; 16], 16_000)
-            .expect("an encoded-audio spec binds the samples it is handed");
+        let input = MultimodalInput::from_samples(
+            &spec,
+            &[0.0f32; 16],
+            16_000,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .expect("an encoded-audio spec binds the samples it is handed");
 
         // Assert the precondition rather than trusting the test's name: a
         // request whose inputs went missing is prompt-only, takes the
@@ -3589,8 +3602,13 @@ mod admission_tests {
             !probe.inputs.is_empty(),
             "this test is only about the branch a tensor-carrying request takes"
         );
-        let input = MultimodalInput::from_samples(&spec, &[0.0f32; 16], 16_000)
-            .expect("an encoded-audio spec binds the samples it is handed");
+        let input = MultimodalInput::from_samples(
+            &spec,
+            &[0.0f32; 16],
+            16_000,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .expect("an encoded-audio spec binds the samples it is handed");
 
         let mut request = GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![1]));
         request.options.max_new_tokens = 1;
@@ -3853,6 +3871,25 @@ mod admission_tests {
                 vec![1, 2, 3]
             );
             assert_eq!(finished.timings, samples.last().copied());
+            let timing = finished.timings.unwrap();
+            let wire = crate::timings::render(timing);
+            if speculative {
+                let stats = timing.speculative.expect("verified prompt-lookup counters");
+                assert_eq!(stats, engine.last_speculative_stats());
+                assert!(stats.proposed_tokens > 0);
+                assert_eq!(wire["draft_n"], stats.proposed_tokens);
+                assert_eq!(wire["draft_n_accepted"], stats.accepted_tokens);
+                assert!(
+                    samples
+                        .iter()
+                        .filter_map(|sample| sample.speculative)
+                        .all(|sample| sample.proposed_tokens <= stats.proposed_tokens)
+                );
+            } else {
+                assert!(timing.speculative.is_none());
+                assert!(wire.get("draft_n").is_none());
+                assert!(wire.get("draft_n_accepted").is_none());
+            }
             assert_eq!(
                 finished.timings.unwrap().prompt_elapsed,
                 progress[1].elapsed

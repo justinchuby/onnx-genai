@@ -390,6 +390,9 @@ fn infer_control_flow(
     };
 
     if let Some(outputs) = outputs {
+        if matches!(node.op_type.as_str(), "If" | "Loop" | "Scan") {
+            validate_control_flow_schema(node, version, &outputs, types, containers)?;
+        }
         apply_cf_outputs(graph, node, outputs, types, shape_data, containers);
     }
     if remaining_subgraph_nodes > 0 {
@@ -486,6 +489,254 @@ enum CfOutput {
     Unresolved,
 }
 
+fn validate_control_flow_schema(
+    node: &Node,
+    version: u64,
+    outputs: &[CfOutput],
+    types: &HashMap<ValueId, TypeInfo>,
+    containers: &HashMap<ValueId, ValueType>,
+) -> Result<(), ShapeInferError> {
+    let first_schema_value_input = match node.op_type.as_str() {
+        "Loop" => 2,
+        "Scan" => 0,
+        _ => node.inputs.len(),
+    };
+    for (slot, input) in node
+        .inputs
+        .iter()
+        .enumerate()
+        .skip(first_schema_value_input)
+    {
+        let Some(input) = *input else { continue };
+        if let Some(value_type) = containers.get(&input) {
+            validate_control_flow_value(
+                node,
+                version,
+                "input",
+                slot,
+                value_type,
+                node.op_type != "Scan",
+            )?;
+        } else if let Some(type_info) = types.get(&input) {
+            validate_concrete_control_flow_dtype(node, version, "input", slot, type_info.dtype)?;
+        }
+    }
+
+    let loop_carried = if node.op_type == "Loop" {
+        node.inputs.len().saturating_sub(2)
+    } else {
+        0
+    };
+    for (slot, output) in outputs.iter().enumerate() {
+        match output {
+            CfOutput::Container(value_type) => {
+                let container_allowed = match node.op_type.as_str() {
+                    "If" => true,
+                    "Loop" => slot < loop_carried,
+                    "Scan" => false,
+                    _ => true,
+                };
+                validate_control_flow_value(
+                    node,
+                    version,
+                    "output",
+                    slot,
+                    value_type,
+                    container_allowed,
+                )?;
+            }
+            CfOutput::Typed(type_info) => {
+                validate_concrete_control_flow_dtype(
+                    node,
+                    version,
+                    "output",
+                    slot,
+                    type_info.dtype,
+                )?;
+            }
+            CfOutput::UnknownRank(dtype) => {
+                validate_concrete_control_flow_dtype(node, version, "output", slot, *dtype)?;
+            }
+            CfOutput::Unresolved => {
+                let Some(output) = node.outputs.get(slot).copied().flatten() else {
+                    continue;
+                };
+                if let Some(value_type) = containers.get(&output) {
+                    let container_allowed = match node.op_type.as_str() {
+                        "If" => true,
+                        "Loop" => slot < loop_carried,
+                        "Scan" => false,
+                        _ => true,
+                    };
+                    validate_control_flow_value(
+                        node,
+                        version,
+                        "output",
+                        slot,
+                        value_type,
+                        container_allowed,
+                    )?;
+                } else if let Some(type_info) = types.get(&output) {
+                    validate_concrete_control_flow_dtype(
+                        node,
+                        version,
+                        "output",
+                        slot,
+                        type_info.dtype,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_control_flow_value(
+    node: &Node,
+    version: u64,
+    role: &str,
+    slot: usize,
+    value_type: &ValueType,
+    container_allowed: bool,
+) -> Result<(), ShapeInferError> {
+    if !container_allowed {
+        return Err(control_flow_schema_error(
+            node,
+            version,
+            role,
+            slot,
+            format!("{value_type:?}"),
+            "this position is tensor-only",
+        ));
+    }
+    match value_type {
+        ValueType::Tensor(tensor) => {
+            validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)
+        }
+        ValueType::Sequence(element) => match element.as_ref() {
+            ValueType::Tensor(tensor) => {
+                validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)
+            }
+            _ => Err(control_flow_schema_error(
+                node,
+                version,
+                role,
+                slot,
+                format!("{value_type:?}"),
+                "control-flow sequences must contain tensors",
+            )),
+        },
+        ValueType::Optional(element) => match element.as_ref() {
+            ValueType::Tensor(tensor) => {
+                validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)
+            }
+            ValueType::Sequence(sequence_element) => match sequence_element.as_ref() {
+                ValueType::Tensor(tensor) => {
+                    validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)?;
+                    if optional_sequence_element_dtype_is_ir4(tensor.dtype) {
+                        Ok(())
+                    } else {
+                        Err(control_flow_schema_error(
+                            node,
+                            version,
+                            role,
+                            slot,
+                            format!("{value_type:?}"),
+                            &format!(
+                                "optional sequences are limited to IRv4 tensor element types, got {:?}",
+                                tensor.dtype
+                            ),
+                        ))
+                    }
+                }
+                _ => Err(control_flow_schema_error(
+                    node,
+                    version,
+                    role,
+                    slot,
+                    format!("{value_type:?}"),
+                    "optional control-flow sequences must contain tensors",
+                )),
+            },
+            _ => Err(control_flow_schema_error(
+                node,
+                version,
+                role,
+                slot,
+                format!("{value_type:?}"),
+                "control-flow optionals must contain a tensor or sequence of tensors",
+            )),
+        },
+        ValueType::Map(_, _) => Err(control_flow_schema_error(
+            node,
+            version,
+            role,
+            slot,
+            format!("{value_type:?}"),
+            "maps are not admitted by the control-flow schema",
+        )),
+    }
+}
+
+fn validate_concrete_control_flow_dtype(
+    node: &Node,
+    version: u64,
+    role: &str,
+    slot: usize,
+    dtype: DataType,
+) -> Result<(), ShapeInferError> {
+    if dtype != DataType::Undefined {
+        return Ok(());
+    }
+    Err(control_flow_schema_error(
+        node,
+        version,
+        role,
+        slot,
+        format!("{dtype:?}"),
+        "tensor dtype must be concrete; leave unresolved values unknown instead of declaring Undefined",
+    ))
+}
+
+fn optional_sequence_element_dtype_is_ir4(dtype: DataType) -> bool {
+    matches!(
+        dtype,
+        DataType::Float32
+            | DataType::Uint8
+            | DataType::Int8
+            | DataType::Uint16
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::String
+            | DataType::Bool
+            | DataType::Float16
+            | DataType::Float64
+            | DataType::Uint32
+            | DataType::Uint64
+            | DataType::Complex64
+            | DataType::Complex128
+            | DataType::BFloat16
+    )
+}
+
+fn control_flow_schema_error(
+    node: &Node,
+    version: u64,
+    role: &str,
+    slot: usize,
+    actual: String,
+    requirement: &str,
+) -> ShapeInferError {
+    ShapeInferError::Invalid {
+        op: node.op_type.clone(),
+        detail: format!(
+            "opset {version} {role} #{slot} resolves to {actual}, which its ONNX schema rejects: \
+             {requirement}; update the model opset or use a schema-permitted value type"
+        ),
+    }
+}
+
 fn infer_if_outputs(
     graph: &Graph,
     node: &Node,
@@ -535,6 +786,14 @@ fn infer_if_outputs(
                 let mapped =
                     map_container_to_parent(&unified, &then_result.parent_symbols, interner);
                 outputs.push(CfOutput::Container(mapped));
+                continue;
+            }
+            (Some(_), None) if !else_branch.value_type_is_known(else_id) => {
+                outputs.push(CfOutput::Unresolved);
+                continue;
+            }
+            (None, Some(_)) if !then_branch.value_type_is_known(then_id) => {
+                outputs.push(CfOutput::Unresolved);
                 continue;
             }
             (Some(_), None) | (None, Some(_)) => {
@@ -1065,9 +1324,7 @@ fn infer_loop_outputs(
         // A loop-carried dependency (slot < carried) can be a container: its
         // body carried-output container type flows to the Loop output. Scan
         // outputs stack tensors, so they are never containers.
-        if slot < carried
-            && let Some(value_type) = result.report.containers.get(&body_output)
-        {
+        if let Some(value_type) = result.report.containers.get(&body_output) {
             let mapped = map_container_to_parent(value_type, &result.parent_symbols, interner);
             outputs.push(CfOutput::Container(mapped));
             continue;
@@ -1148,9 +1405,7 @@ fn infer_scan_outputs(
         };
         // A loop-state slot (slot < num_state) can be a container; scan-output
         // slots stack tensors and are never containers.
-        if slot < num_state
-            && let Some(value_type) = result.report.containers.get(&body_output)
-        {
+        if let Some(value_type) = result.report.containers.get(&body_output) {
             let mapped = map_container_to_parent(value_type, &result.parent_symbols, interner);
             outputs.push(CfOutput::Container(mapped));
             continue;
@@ -1539,4 +1794,85 @@ fn seed_next_symbol(graph: &Graph) -> u32 {
         }
     }
     max.saturating_add(1)
+}
+
+#[cfg(test)]
+mod control_flow_schema_tests {
+    use super::*;
+    use onnx_runtime_ir::NodeId;
+
+    fn schema_node(op_type: &str) -> Node {
+        Node::new(NodeId(0), op_type, Vec::new(), Vec::new())
+    }
+
+    fn tensor_value(dtype: DataType) -> ValueType {
+        ValueType::Tensor(TensorType::new(dtype, Vec::new()))
+    }
+
+    #[test]
+    fn optional_tensor_dtype_is_not_opset_gated() {
+        let node = schema_node("If");
+        let int4 = ValueType::Optional(Box::new(tensor_value(DataType::Int4)));
+        validate_control_flow_value(&node, 18, "output", 0, &int4, true)
+            .expect("standalone If admits implemented Optional<Tensor<int4>> storage");
+    }
+
+    #[test]
+    fn optional_sequence_keeps_ir4_tensor_element_types() {
+        let node = schema_node("Loop");
+        let float = ValueType::Optional(Box::new(ValueType::sequence(tensor_value(
+            DataType::Float32,
+        ))));
+        validate_control_flow_value(&node, 25, "output", 0, &float, true)
+            .expect("Optional<Sequence<Tensor<float>>> is admitted");
+
+        let float8 = ValueType::Optional(Box::new(ValueType::sequence(tensor_value(
+            DataType::Float8E4M3FN,
+        ))));
+        let error = validate_control_flow_value(&node, 25, "output", 0, &float8, true)
+            .expect_err("optional sequences retain the IRv4 tensor-element set");
+        assert!(
+            error
+                .to_string()
+                .contains("optional sequences are limited to IRv4")
+        );
+    }
+
+    #[test]
+    fn container_tensor_leaves_require_a_concrete_dtype() {
+        let node = schema_node("If");
+        for value_type in [
+            tensor_value(DataType::Undefined),
+            ValueType::sequence(tensor_value(DataType::Undefined)),
+            ValueType::Optional(Box::new(tensor_value(DataType::Undefined))),
+        ] {
+            let error = validate_control_flow_value(&node, 18, "output", 0, &value_type, true)
+                .expect_err("container tensor leaves cannot declare Undefined");
+            let message = error.to_string();
+            assert!(
+                message.contains("Undefined") && message.contains("dtype must be concrete"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_scan_outputs_are_tensor_only() {
+        let node = Node::new(
+            NodeId(0),
+            "Loop",
+            vec![None, None, Some(ValueId(0))],
+            vec![ValueId(1), ValueId(2)],
+        );
+        let outputs = vec![
+            CfOutput::Unresolved,
+            CfOutput::Container(ValueType::sequence(tensor_value(DataType::Float32))),
+        ];
+        let error =
+            validate_control_flow_schema(&node, 25, &outputs, &HashMap::new(), &HashMap::new())
+                .expect_err("Loop scan outputs cannot be containers");
+        assert!(
+            error.to_string().contains("output #1") && error.to_string().contains("tensor-only")
+        );
+    }
 }

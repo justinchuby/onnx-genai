@@ -196,6 +196,20 @@ pub(crate) async fn decide(
     let mut owner = crate::media_input::MediaRequest::new(
         state.config.max_decision_media_bytes,
         "--max-decision-media-bytes",
+        if media_urls
+            .iter()
+            .any(|url| url.kind == onnx_genai_metadata::EncodedMediaKind::Audio)
+        {
+            crate::audio_input::decode_limits(&handle, state.config.max_decoded_audio_bytes)
+                .await
+                .map_err(|error| {
+                    ApiError::invalid_request(format!("media audio memory admission: {error:#}"))
+                })?
+        } else {
+            onnx_genai_preprocess::audio::AudioDecodeLimits {
+                max_decoded_bytes: state.config.max_decoded_audio_bytes,
+            }
+        },
     );
     let mut media = Vec::with_capacity(media_urls.len());
     for url in &media_urls {

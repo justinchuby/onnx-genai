@@ -20,8 +20,9 @@
 #[path = "../benches/common/mod.rs"]
 mod common;
 
-use common::{FloatDType, Tensor};
-use onnx_runtime_ep_api::{ExecutionProvider, TensorMut, TensorView};
+use common::{FloatDType, PreparedKernel, Tensor};
+use half::bf16;
+use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
 
@@ -61,7 +62,7 @@ fn build_tensors(inputs: &[Inp], dtype: FloatDType) -> Vec<Tensor> {
         .collect()
 }
 
-fn run_case(case: &OpCase, dtype: FloatDType) -> Vec<f32> {
+fn try_run_case(case: &OpCase, dtype: FloatDType) -> onnx_runtime_ep_api::Result<Vec<f32>> {
     let mut node = Node::new(NodeId(0), case.op, vec![], vec![]);
     node.domain = case.domain.to_string();
     for (name, value) in &case.attrs {
@@ -78,19 +79,27 @@ fn run_case(case: &OpCase, dtype: FloatDType) -> Vec<f32> {
         })
         .collect();
 
-    let kernel = CpuExecutionProvider::new()
-        .get_kernel(&node, &input_shapes, case.opset)
-        .unwrap_or_else(|e| panic!("{} ({}): get_kernel failed: {e:?}", case.op, dtype.name()));
+    let cpu = CpuExecutionProvider::new();
+    let kernel = cpu.get_kernel(&node, &input_shapes, case.opset)?;
 
     let inputs = build_tensors(&case.inputs, dtype);
     let mut output = Tensor::zeros(dtype, &case.out_shape);
 
     let views: Vec<TensorView<'_>> = inputs.iter().map(|t| t.view()).collect();
-    let mut out_view: [TensorMut<'_>; 1] = [output.view_mut()];
-    kernel
-        .execute(&views, &mut out_view)
-        .unwrap_or_else(|e| panic!("{} ({}): execute failed: {e:?}", case.op, dtype.name()));
-    output.to_f32()
+    let mut out_view = [output.view_mut()];
+    let mut kernel = PreparedKernel::new(&cpu, kernel, &views, &out_view);
+    kernel.execute(&views, &mut out_view)?;
+    Ok(output.to_f32())
+}
+
+fn run_case(case: &OpCase, dtype: FloatDType) -> Vec<f32> {
+    try_run_case(case, dtype).unwrap_or_else(|e| {
+        panic!(
+            "{} ({}): native kernel failed: {e:?}",
+            case.op,
+            dtype.name()
+        )
+    })
 }
 
 fn assert_bf16_matches_f32(case: &OpCase) {
@@ -144,6 +153,19 @@ fn unary(op: &'static str, opset: u64, values: Vec<f32>, abs_tol: f32) -> OpCase
     }
 }
 
+fn unary_vector(op: &'static str, opset: u64, values: Vec<f32>, abs_tol: f32) -> OpCase {
+    let len = values.len();
+    OpCase {
+        op,
+        domain: "",
+        opset,
+        attrs: vec![],
+        inputs: vec![Inp::F(vec![len], values)],
+        out_shape: vec![len],
+        abs_tol,
+    }
+}
+
 fn binary(op: &'static str, opset: u64, abs_tol: f32) -> OpCase {
     OpCase {
         op,
@@ -174,6 +196,53 @@ fn reduce(op: &'static str, values: Vec<f32>, abs_tol: f32) -> OpCase {
     }
 }
 
+fn trig_cases() -> impl Iterator<Item = OpCase> {
+    [
+        ("Sin", sample6()),
+        ("Cos", sample6()),
+        ("Tan", sample6()),
+        ("Atan", sample6()),
+        ("Sinh", sample6()),
+        ("Cosh", sample6()),
+        ("Asin", unit6()),
+        ("Acos", unit6()),
+        ("Atanh", unit6()),
+        ("Asinh", sample6()),
+        ("Acosh", vec![1.5, 2.0, 3.0, 1.25, 4.0, 2.5]),
+    ]
+    .into_iter()
+    .map(|(op, values)| unary(op, 22, values, 0.03))
+}
+
+#[test]
+fn trig_bf16_native_opset_boundary() {
+    let ep = CpuExecutionProvider::new();
+    for mut case in trig_cases() {
+        let node = Node::new(NodeId(0), case.op, vec![], vec![]);
+        let shapes = [onnx_runtime_ir::static_shape([2, 3])];
+        let bf16 = [DataType::BFloat16];
+        assert!(
+            ep.supports_op(&node, 22, &shapes, &bf16, &[])
+                .is_supported()
+        );
+        assert_bf16_matches_f32(&case);
+
+        case.opset = 21;
+        let claim = ep.supports_op(&node, 21, &shapes, &bf16, &[]);
+        let reason = format!("{} does not accept BF16 (BFloat16) at opset 21", case.op);
+        assert!(claim.reason().is_some_and(|s| s.contains(&reason)));
+        let error = try_run_case(&case, FloatDType::Bf16).unwrap_err();
+        assert!(error.to_string().contains(&reason), "{error}");
+
+        for dtype in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            assert!(
+                ep.supports_op(&node, 21, &shapes, &[dtype], &[])
+                    .is_supported()
+            );
+        }
+    }
+}
+
 fn cases() -> Vec<OpCase> {
     let mut v = Vec::new();
 
@@ -184,21 +253,8 @@ fn cases() -> Vec<OpCase> {
     v.push(unary("Sqrt", 13, positive6(), 0.02));
     v.push(unary("Exp", 13, sample6(), 0.05));
     v.push(unary("Log", 13, positive6(), 0.05));
-    for op in ["Sin", "Cos", "Tan", "Atan", "Sinh", "Cosh", "Tanh"] {
-        v.push(unary(op, 13, sample6(), 0.03));
-    }
-    for op in ["Asin", "Acos", "Atanh"] {
-        v.push(unary(op, 13, unit6(), 0.03));
-    }
-    for op in ["Asinh", "Acosh"] {
-        // Acosh domain is x >= 1.
-        let vals = if op == "Acosh" {
-            vec![1.5, 2.0, 3.0, 1.25, 4.0, 2.5]
-        } else {
-            sample6()
-        };
-        v.push(unary(op, 13, vals, 0.03));
-    }
+    v.push(unary("Tanh", 13, sample6(), 0.03));
+    v.extend(trig_cases());
     v.push(unary("Erf", 13, sample6(), 0.02));
 
     // ---- Activations (to_dense_f32_widen) ----
@@ -476,6 +532,81 @@ fn no_op_rejects_bf16_at_runtime() {
             out.len(),
             case.out_shape
         );
+    }
+}
+
+#[test]
+fn opset_22_activations_match_independent_bf16_goldens() {
+    let values = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
+    let cases = [
+        (
+            OpCase {
+                op: "Elu",
+                domain: "",
+                opset: 22,
+                attrs: vec![("alpha", Attribute::Float(1.0))],
+                inputs: vec![Inp::F(vec![5], values.clone())],
+                out_shape: vec![5],
+                abs_tol: 0.0,
+            },
+            values
+                .iter()
+                .map(|&x| if x >= 0.0 { x } else { x.exp_m1() })
+                .collect::<Vec<_>>(),
+        ),
+        (
+            OpCase {
+                op: "HardSigmoid",
+                domain: "",
+                opset: 22,
+                attrs: vec![
+                    ("alpha", Attribute::Float(0.2)),
+                    ("beta", Attribute::Float(0.5)),
+                ],
+                inputs: vec![Inp::F(vec![5], values.clone())],
+                out_shape: vec![5],
+                abs_tol: 0.0,
+            },
+            values
+                .iter()
+                .map(|&x| (0.2 * x + 0.5).clamp(0.0, 1.0))
+                .collect(),
+        ),
+        (
+            OpCase {
+                op: "Selu",
+                domain: "",
+                opset: 22,
+                attrs: vec![],
+                inputs: vec![Inp::F(vec![5], values.clone())],
+                out_shape: vec![5],
+                abs_tol: 0.0,
+            },
+            values
+                .iter()
+                .map(|&x| 1.050701 * if x >= 0.0 { x } else { 1.6732632 * x.exp_m1() })
+                .collect(),
+        ),
+        (
+            unary_vector("Softplus", 22, values.clone(), 0.0),
+            values.iter().map(|&x| (1.0 + x.exp()).ln()).collect(),
+        ),
+        (
+            unary_vector("Softsign", 22, values.clone(), 0.0),
+            values.iter().map(|&x| x / (1.0 + x.abs())).collect(),
+        ),
+    ];
+
+    for (case, expected) in &cases {
+        let actual = run_case(case, FloatDType::Bf16);
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let expected = bf16::from_f32(expected).to_f32();
+            assert!(
+                (actual - expected).abs() <= 0.02,
+                "{}[{index}]: got {actual}, expected bf16 golden {expected}",
+                case.op
+            );
+        }
     }
 }
 

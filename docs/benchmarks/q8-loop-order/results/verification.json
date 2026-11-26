@@ -1,0 +1,8 @@
+{
+  "calibrations": 16,
+  "independent_oracle_fixtures": 16,
+  "processes": 64,
+  "qualified_cells": 2,
+  "summary_reproduced": true,
+  "windows": 704
+}

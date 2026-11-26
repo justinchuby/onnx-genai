@@ -249,76 +249,10 @@ pub struct SymbolConstraints {
     pub divisible_by: Option<usize>,  // must be multiple of (for tiling)
 }
 
-/// Layout — first-class strides on every value.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TensorLayout {
-    /// Physical strides in elements. None = contiguous row-major.
-    pub strides: Option<Vec<i64>>,
-    /// Memory format hint.
-    pub format: MemoryFormat,
-    /// Alignment requirement in bytes.
-    pub alignment: usize,
-}
+// Layout is defined by the shared IR implementation, including fallible
+// resolved_strides/transpose and checked contiguous suffix construction.
+pub use onnx_runtime_ir::{MemoryFormat, TensorLayout};
 
-impl TensorLayout {
-    /// Create contiguous layout for given shape.
-    pub fn contiguous(shape: &[usize]) -> Self {
-        Self { strides: None, format: MemoryFormat::Contiguous, alignment: 64 }
-    }
-
-    /// Check if actual strides match contiguous.
-    pub fn is_contiguous(&self, shape: &[usize]) -> bool {
-        match &self.strides {
-            None => true,
-            Some(s) => {
-                let expected = Self::compute_contiguous_strides(shape);
-                s == &expected
-            }
-        }
-    }
-
-    /// Compute contiguous strides for a shape (row-major).
-    pub fn compute_contiguous_strides(shape: &[usize]) -> Vec<i64> {
-        let mut strides = vec![1i64; shape.len()];
-        for i in (0..shape.len().saturating_sub(1)).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1] as i64;
-        }
-        strides
-    }
-
-    /// Transpose: reorder strides without copying data.
-    pub fn transpose(&self, shape: &[usize], perm: &[usize]) -> Self {
-        let strides = self.strides.as_ref()
-            .map(|s| perm.iter().map(|&p| s[p]).collect())
-            .unwrap_or_else(|| {
-                let cs = Self::compute_contiguous_strides(shape);
-                perm.iter().map(|&p| cs[p]).collect()
-            });
-        Self { strides: Some(strides), format: MemoryFormat::Custom, alignment: self.alignment }
-    }
-
-    /// Total storage size in bytes (max offset reachable by strides).
-    pub fn storage_size(&self, shape: &[usize], dtype: DataType) -> usize {
-        let elem_size = dtype.byte_size().max(1);
-        match &self.strides {
-            None => shape.iter().product::<usize>() * elem_size,
-            Some(strides) => {
-                let max_offset: i64 = shape.iter().zip(strides.iter())
-                    .map(|(&dim, &stride)| (dim.saturating_sub(1)) as i64 * stride.abs())
-                    .sum();
-                (max_offset as usize + 1) * elem_size
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum MemoryFormat {
-    Contiguous,
-    ChannelsLast,    // NHWC
-    Blocked(usize),  // e.g. 16-wide for VNNI/AMX
-    Custom,
-}
 ```
 
 ### 3.3 Graph Structure
@@ -828,20 +762,15 @@ serialization assumes contiguous.
 ### 5.2 Stride Arithmetic
 
 ```rust
-/// Compute row-major contiguous strides for a shape.
-pub fn compute_contiguous_strides(shape: &[usize]) -> Vec<i64> {
-    let n = shape.len();
-    let mut strides = vec![1i64; n];
-    for i in (0..n.saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1] as i64;
-    }
-    strides
-}
+// One checked implementation serves allocated results and existing buffers.
+pub use onnx_runtime_ir::{
+    ContiguousStridePlan, compute_contiguous_strides, is_contiguous,
+};
 
-/// Check if strides represent contiguous row-major layout.
-pub fn is_contiguous(shape: &[usize], strides: &[i64]) -> bool {
-    let expected = compute_contiguous_strides(shape);
-    strides == &expected[..]
+fn refill_strides(out: &mut Vec<i64>, shape: &[usize]) -> Result<(), onnx_runtime_ir::IrError> {
+    let plan = ContiguousStridePlan::new(shape)?;
+    out.resize(shape.len(), 0);
+    plan.write(out)
 }
 
 /// Compute output shape for numpy-style broadcasting.
@@ -889,19 +818,19 @@ impl Tensor {
     }
 
     /// Import from DLPack. Zero-copy — we take ownership of the managed tensor.
-    pub fn from_dlpack(managed: DLManagedTensor) -> Self {
+    pub fn from_dlpack(managed: DLManagedTensor) -> Result<Self> {
         let dl = &managed.dl_tensor;
         let shape: Vec<usize> = unsafe {
             slice::from_raw_parts(dl.shape, dl.ndim as usize)
         }.iter().map(|&x| x as usize).collect();
 
         let strides = if dl.strides.is_null() {
-            TensorLayout::compute_contiguous_strides(&shape)
+            compute_contiguous_strides(&shape)?
         } else {
             unsafe { slice::from_raw_parts(dl.strides, dl.ndim as usize) }.to_vec()
         };
 
-        Self {
+        Ok(Self {
             data: DevicePtr::from_raw(dl.data),
             dtype: DataType::from_dl_dtype(dl.dtype),
             shape,
@@ -909,7 +838,7 @@ impl Tensor {
             device: DeviceId::from_dl_device(dl.device),
             offset: dl.byte_offset as usize,
             _dlpack_handle: Some(managed), // prevent deleter until we're done
-        }
+        })
     }
 }
 
@@ -2374,45 +2303,33 @@ pub fn default_passes() -> Vec<Box<dyn OptimizationPass>> {
 
 ### 18.2 Fusion Pattern Matching
 
+`OpFusion` runs in an EP's custom-pass registry, so its private fused operators
+are introduced only by a provider that implements them. Generic session passes
+remain provider-independent. Recognition and rewriting use the IR pattern
+engine; the pass scans eligible regions to a fixpoint and refreshes affected
+matches after each rewrite.
+
 ```rust
-pub struct OpFusion;
+OpFusion::new().run(graph, context)?;
+```
 
-impl OptimizationPass for OpFusion {
-    fn name(&self) -> &str { "OpFusion" }
+The explicit-match API uses the same read-only context for eligibility and
+application. Initializer-backed coefficients and axes can therefore resolve
+inline or mapped bytes without copying weights:
 
-    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> Result<()> {
-        let patterns = vec![
-            FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm"),
-            FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias"),
-            FusionPattern::new("LayerNorm", &["ReduceMean", "Sub", "Pow", "ReduceMean", "Add", "Sqrt", "Div", "Mul", "Add"], "LayerNormalization"),
-            FusionPattern::new("Residual+LayerNorm", &["Add", "LayerNormalization"], "FusedResidualLayerNorm"),
-            FusionPattern::new("GELU", &["Mul", "Pow", "Mul", "Add", "Mul", "Tanh", "Add", "Mul"], "Gelu"),
-        ];
-
-        for pattern in &patterns {
-            while let Some(match_) = pattern.find_match(graph) {
-                pattern.apply_fusion(graph, &match_)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-pub struct FusionPattern {
-    name: String,
-    /// Op sequence to match (must form a connected subgraph).
-    ops: Vec<String>,
-    /// Replacement op type.
-    replacement: String,
-}
-
-impl FusionPattern {
-    /// Find the next match in the graph (DFS from each node).
-    pub fn find_match(&self, graph: &Graph) -> Option<PatternMatch>;
-    /// Apply the fusion: remove matched nodes, insert replacement.
-    pub fn apply_fusion(&self, graph: &mut Graph, match_: &PatternMatch) -> Result<()>;
+```rust
+let pattern = FusionPattern::layernorm();
+if let Some(matched) = pattern.find_match(graph, context)? {
+    pattern.apply_fusion(graph, &matched, context)?;
 }
 ```
+
+`find_match` returns `Result<Option<PatternMatch>>`: invalid graphs, matcher
+errors and exhausted budgets propagate as errors. A caller applying an explicit
+match must not mutate the graph between recognition and application. Unresolved
+or overridable literals decline semantic fusion. LayerNorm additionally proves
+complete suffix reduction, nonempty normalized width and affine broadcasting
+that cannot expand the activation shape.
 
 ---
 

@@ -667,6 +667,14 @@ on the original graph and `GroupedMatMul` node. It reports a topology near
 miss, an eligibility rejection, or the first escaping value and its use,
 without logging every candidate or printing initializer contents.
 
+Standalone CPU can also combine two such affine projections with the closed
+opset-29 routing, clipped interleaved SwiGLU, and weighted reduction region
+emitted by Mobius QMoE. Admission requires static FLOAT activation and router
+geometry, selected-logit Softmax after reverse-axis TopK, unbiased projections,
+and the original inactive-route mask. Graph outputs and lexical captures of
+intermediates prevent the full rewrite. CUDA decode and prefill keep the
+separate routing and activation operations; the ORT plugin does not opt in.
+
 LayerNorm eligibility proves a square with immutable exponent 2, exact scalar
 coefficient payloads, rank-preserving broadcasts, and matching kept-dimension
 reductions over a complete normalized suffix. The affine tensors must represent
