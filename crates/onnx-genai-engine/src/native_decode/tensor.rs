@@ -21,9 +21,9 @@ pub(super) fn copy_step_tensor(
         return Ok(source.try_clone()?);
     }
     anyhow::ensure!(
-        source.device.is_host_accessible(),
+        source.device().is_host_accessible(),
         "CPU routed input requires explicit Host transfer, got {:?}",
-        source.device
+        source.device()
     );
     Ok(allocator.copy_tensor(source)?)
 }
