@@ -8369,7 +8369,7 @@ mod literal_rollback_tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        for retained_run in [false, true] {
+        for (retained_run, short_source) in [(false, false), (false, true), (true, false)] {
             let root = tempfile::tempdir()?;
             let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
             if retained_run {
@@ -8379,6 +8379,13 @@ mod literal_rollback_tests {
             }
             let path = root.path().join("tokenizer.json");
             let mut tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            if short_source {
+                // Ensure the active failure is expansion, not the raw-input bound.
+                let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+                assert_eq!(vocab.remove("@source@"), Some(serde_json::json!(22)));
+                vocab.insert("a".into(), serde_json::json!(22));
+                tokenizer["decoder"]["decoders"][2]["pattern"] = serde_json::json!({"String":"a"});
+            }
             tokenizer["decoder"]["decoders"][2]["content"] = serde_json::json!("12345678");
             std::fs::write(path, serde_json::to_vec(&tokenizer)?)?;
             let config = EngineConfig {
@@ -8436,7 +8443,14 @@ mod literal_rollback_tests {
                     Some(&mut callback),
                 )
                 .expect_err("active decoder expansion/run must exceed its explicit buffer");
-            assert!(format!("{error:#}").contains("budget"), "{error:#}");
+            if retained_run || short_source {
+                assert!(format!("{error:#}").contains("budget"), "{error:#}");
+            } else {
+                assert!(
+                    error.is::<crate::byte_stream::ByteStreamBufferExceeded>(),
+                    "raw input delta must retain its typed budget error: {error:#}"
+                );
+            }
             assert!(
                 forwards.load(Ordering::SeqCst) > 0,
                 "failure must follow real Native execution/KV advance"
