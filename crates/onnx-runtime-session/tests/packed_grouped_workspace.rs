@@ -11,8 +11,7 @@ fn bytes(t: usize) -> u64 {
     if t == 0 {
         0
     } else {
-        (((4 * t + 64) * 4).next_multiple_of(align_of::<usize>()) + 2 * t * size_of::<usize>())
-            as u64
+        ((4 * t * 4).next_multiple_of(align_of::<usize>()) + 2 * t * size_of::<usize>()) as u64
     }
 }
 fn model(int32: bool, echo: bool) -> Vec<u8> {
@@ -129,7 +128,7 @@ fn check(output: &Tensor, t: usize) {
     );
 }
 #[test]
-fn metadata_ready_budget_is_exact_and_dynamic_requests_reuse_one_retained_peak() {
+fn live_budget_is_exact_and_dynamic_requests_reuse_one_retained_peak() {
     for int32 in [false, true] {
         for budget in [bytes(3) - 1, bytes(3)] {
             let (mut session, books, pool, manager) = setup(budget, int32, false);
@@ -142,6 +141,8 @@ fn metadata_ready_budget_is_exact_and_dynamic_requests_reuse_one_retained_peak()
                     assert!(
                         session
                             .prepare_with_device_bindings(&inputs, &mut [])
+                            .unwrap()
+                            .require_complete()
                             .is_err()
                     );
                     assert!(session.run(&inputs).is_err());
@@ -152,7 +153,11 @@ fn metadata_ready_budget_is_exact_and_dynamic_requests_reuse_one_retained_peak()
                 let report = session
                     .prepare_with_device_bindings(&inputs, &mut [])
                     .unwrap();
-                assert_eq!(report.require_complete().unwrap().step().bytes, bytes(t));
+                if t == 0 {
+                    assert_eq!(report.require_complete().unwrap().step().bytes, 0);
+                } else {
+                    assert!(report.require_complete().is_err());
+                }
                 for _ in 0..2 {
                     let outputs = session.run(&inputs).unwrap();
                     check(&outputs[0], t);
@@ -212,16 +217,16 @@ fn fixed_outer_strides_reach_packed_without_full_activation_snapshot() {
     let report = session
         .prepare_with_device_bindings(&inputs, std::slice::from_mut(&mut binding))
         .unwrap();
-    assert_eq!(report.require_complete().unwrap().step().bytes, bytes(t));
-    let identity = manager.snapshot().unwrap().allocations[0].identity;
+    assert!(report.require_complete().is_err());
+    let mut identity = None;
     for tokens in [3, 1, 3] {
         binding.set_logical_shape(vec![tokens, 64]).unwrap();
-        // Reserve against physical symbolic capacity even at a smaller logical
-        // prefix; the ordinary route input supplies the matching capacity fact.
+        // Preparation validates physical symbolic capacity even at a smaller
+        // logical prefix; live dispatch admits the actual row workspace.
         let report = session
             .prepare_with_device_bindings(&inputs, std::slice::from_mut(&mut binding))
             .unwrap();
-        assert_eq!(report.require_complete().unwrap().step().bytes, bytes(t));
+        assert!(report.require_complete().is_err());
         let current = banks(tokens, false);
         let current = [("weights", &current[0]), ("routes", &current[1])];
         let output = session
@@ -230,7 +235,10 @@ fn fixed_outer_strides_reach_packed_without_full_activation_snapshot() {
         check(output[0].as_ref().unwrap(), tokens);
         let snapshot = manager.snapshot().unwrap();
         assert_eq!(snapshot.allocations.len(), 1);
-        assert_eq!(snapshot.allocations[0].identity, identity);
+        assert_eq!(
+            snapshot.allocations[0].identity,
+            *identity.get_or_insert(snapshot.allocations[0].identity)
+        );
         assert_eq!(books.used(Tier::Host), bytes(t));
     }
     drop(binding);
@@ -313,7 +321,7 @@ fn ordinary_logical_prefix_binding_uses_the_same_static_capacity_rule() {
     let report = session
         .prepare_with_device_bindings(&inputs, std::slice::from_mut(&mut binding))
         .unwrap();
-    assert_eq!(report.require_complete().unwrap().step().bytes, bytes(3));
+    assert!(report.require_complete().is_err());
     let output = session
         .run_with_device_bindings(&inputs, std::slice::from_mut(&mut binding))
         .unwrap();

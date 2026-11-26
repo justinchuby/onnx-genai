@@ -5,15 +5,15 @@
   "architecture": "glm_moe_dsa",
   "use_dsa": true,
   "emission": [
-    "pkg.nxrt::IndexShare",
+    "pkg.nxrt._private::IndexShare",
     "com.microsoft::QMoE"
   ],
   "prompt_ids": [
     123
   ],
   "files": {
-    "model.onnx.textproto": 850675,
-    "inference_metadata.yaml": 37460,
+    "model.onnx.textproto": 850702,
+    "inference_metadata.yaml": 14554,
     "tokenizer.json": 4680
   }
 }

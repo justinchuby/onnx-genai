@@ -38,10 +38,16 @@ fn requirement(k: &Packed, x: &[TensorView], y: &TensorMut) -> WorkspaceRequirem
         .iter()
         .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
         .collect::<Vec<_>>();
-    k.workspace_requirement(&m, &[OutputMetadata::tensor(y.dtype, y.shape)])
-        .unwrap()
-        .require_ready()
-        .unwrap()
+    k.workspace_requirement_for_execution(
+        x,
+        std::slice::from_ref(y),
+        &m,
+        &[OutputMetadata::tensor(y.dtype, y.shape)],
+        None,
+    )
+    .unwrap()
+    .require_ready()
+    .unwrap()
 }
 fn bytes(values: usize, routes: usize) -> usize {
     (values * 4).next_multiple_of(align_of::<usize>()) + routes * size_of::<usize>()
@@ -102,7 +108,10 @@ fn every_profile_and_strided_x_routes_match_previous_accumulation_bits() {
                 let mut output = Owned::zeros_f32(&[2, 2, 2]);
                 assert_eq!(
                     requirement(&k, &inputs, &output.view_mut()).bytes,
-                    bytes(8 + 2 * width, 4) as u64
+                    bytes(
+                        8 + Rows::new(PACKED_OP, "X", &inputs[0]).unwrap().scratch_len(),
+                        4
+                    ) as u64
                 );
                 assert!(k.supports_strided_input(0) && k.supports_strided_input(2));
                 assert!(!k.supports_strided_input(1));
@@ -122,33 +131,37 @@ fn every_profile_and_strided_x_routes_match_previous_accumulation_bits() {
 fn short_or_misaligned_lane_refuses_before_value_reads_or_initialization() {
     let k = kernel(Format::Q4_0, [3, 2, 64]);
     let f = fixture(Format::Q4_0);
-    let mut inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
-    inputs[0].data = DevicePtr(4usize as *const std::ffi::c_void);
-    inputs[1].data = DevicePtr(8usize as *const std::ffi::c_void);
-    inputs[2].data = DevicePtr(8usize as *const std::ffi::c_void);
-    let mut y = Owned::f32(&[2, 2, 2], &[123.; 8]);
-    let req = requirement(&k, &inputs, &y.view_mut());
-    let mut backing = vec![0xaaaaaaaaaaaaaaaau128; (req.bytes as usize).div_ceil(16) + 1];
-    let ptr = backing.as_mut_ptr().cast::<u8>();
-    for lane in [
-        None,
-        Some(WorkspaceView::new(
-            DevicePtrMut(ptr.cast()),
-            req.bytes as usize - 1,
-        )),
-        Some(WorkspaceView::new(
-            DevicePtrMut(unsafe { ptr.add(1).cast() }),
-            req.bytes as usize,
-        )),
-    ] {
-        assert!(
-            k.execute_with_workspace(&inputs, &mut [y.view_mut()], lane)
-                .is_err()
-        );
-        assert!(backing.iter().all(|&v| v == 0xaaaaaaaaaaaaaaaau128));
-        assert_eq!(y.to_f32(), [123.; 8]);
+    for mode in [0, 2, 4] {
+        let x = Repacked::new(&f[0], mode);
+        let mut inputs = [x.view(), f[1].view(), f[2].view()];
+        inputs[0].data = DevicePtr(4usize as *const std::ffi::c_void);
+        inputs[1].data = DevicePtr(8usize as *const std::ffi::c_void);
+        inputs[2].data = DevicePtr(8usize as *const std::ffi::c_void);
+        let mut y = Owned::f32(&[2, 2, 2], &[123.; 8]);
+        let req = requirement(&k, &inputs, &y.view_mut());
+        let mut backing = vec![0xaaaaaaaaaaaaaaaau128; (req.bytes as usize).div_ceil(16) + 1];
+        let ptr = backing.as_mut_ptr().cast::<u8>();
+        for lane in [
+            None,
+            Some(WorkspaceView::new(
+                DevicePtrMut(ptr.cast()),
+                req.bytes as usize - 1,
+            )),
+            Some(WorkspaceView::new(
+                DevicePtrMut(unsafe { ptr.add(1).cast() }),
+                req.bytes as usize,
+            )),
+        ] {
+            assert!(
+                k.execute_with_workspace(&inputs, &mut [y.view_mut()], lane)
+                    .is_err()
+            );
+            assert!(backing.iter().all(|&v| v == 0xaaaaaaaaaaaaaaaau128));
+            assert_eq!(y.to_f32(), [123.; 8]);
+        }
     }
 }
+
 #[test]
 fn y_publication_follows_all_three_aliased_sources_and_keeps_padding_untouched() {
     let k = kernel(Format::Q4_0, [3, 2, 64]);
@@ -331,7 +344,7 @@ fn one_retained_packed_workspace_has_no_warm_issuer_callbacks_and_trims_exactly(
     let inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
     let mut y = Owned::zeros_f32(&[2, 2, 2]);
     let request = requirement(&k, &inputs, &y.view_mut());
-    assert_eq!(request.bytes, expected as u64);
+    assert_eq!(request.bytes, bytes(8, 4) as u64);
     let first = provider
         .allocate_workspace(expected, request.alignment, request.role())
         .unwrap();
@@ -354,15 +367,25 @@ fn one_retained_packed_workspace_has_no_warm_issuer_callbacks_and_trims_exactly(
         (before.0 + 1, before.1 + 1)
     );
     let calls = (books.claims(), books.releases());
-    for _ in 0..4096 {
-        let request = requirement(&k, &inputs, &y.view_mut());
-        assert_eq!(request.bytes, expected as u64);
+    let strided_x = Repacked::new(&f[0], 2);
+    let strided_inputs = [strided_x.view(), f[1].view(), f[2].view()];
+    for iteration in 0..4096 {
+        let inputs = if iteration % 2 == 0 {
+            inputs.as_slice()
+        } else {
+            &strided_inputs
+        };
+        let request = requirement(&k, inputs, &y.view_mut());
+        assert_eq!(
+            request.bytes,
+            bytes(if iteration % 2 == 0 { 8 } else { 72 }, 4) as u64
+        );
         let mut allocation = provider
-            .allocate_workspace(expected, request.alignment, request.role())
+            .allocate_workspace(request.bytes as usize, request.alignment, request.role())
             .unwrap();
         assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
         let workspace = WorkspaceView::new(DevicePtrMut(allocation.as_mut_ptr()), allocation.len());
-        k.execute_with_workspace(&inputs, &mut [y.view_mut()], Some(workspace))
+        k.execute_with_workspace(inputs, &mut [y.view_mut()], Some(workspace))
             .unwrap();
         provider.deallocate_workspace(allocation).unwrap();
     }
@@ -376,4 +399,77 @@ fn one_retained_packed_workspace_has_no_warm_issuer_callbacks_and_trims_exactly(
     pool.trim_idle(u64::MAX).unwrap();
     assert_eq!(books.used(Tier::Host), 0);
     assert_eq!(manager.process_used(Tier::Host), 0);
+}
+
+#[test]
+fn metadata_cache_refines_every_format_for_actual_rows_and_rejects_stale_geometry() {
+    for &format in Format::ALL {
+        let depth = 2 * format.block().0;
+        let k = kernel(format, [3, 2, depth]);
+        let f = fixture(format);
+        let mut metadata = f
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, &v.shape, true))
+            .collect::<Vec<_>>();
+        let facts = [OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        }];
+        let cached = Some(k.workspace_requirement(&metadata, &facts).unwrap());
+        assert_eq!(cached, Some(WorkspacePreparation::Deferred));
+        let mut y = Owned::zeros_f32(&[2, 2, 2]);
+        for mode in [0, 2, 1, 3, 5, 4, 0] {
+            let x = Repacked::new(&f[0], mode);
+            let inputs = [x.view(), f[1].view(), f[2].view()];
+            let row = Rows::new(PACKED_OP, "X", &inputs[0]).unwrap().scratch_len();
+            let req = k
+                .workspace_requirement_for_execution(
+                    &inputs,
+                    &[y.view_mut()],
+                    &metadata,
+                    &facts,
+                    cached,
+                )
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            assert_eq!(
+                req.bytes,
+                bytes(8 + row, 4) as u64,
+                "{} mode={mode}",
+                format.name()
+            );
+            let mut backing = vec![0u128; (req.bytes as usize).div_ceil(16)];
+            let lane = WorkspaceView::new(
+                DevicePtrMut(backing.as_mut_ptr().cast()),
+                req.bytes as usize,
+            );
+            k.execute_with_workspace(&inputs, &mut [y.view_mut()], Some(lane))
+                .unwrap();
+            assert_eq!(bits(y.to_f32()), bits(reference(&k, &inputs)));
+        }
+        let inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
+        let mut wrong_y = Owned::zeros_f32(&[2, 2, 3]);
+        assert!(
+            k.workspace_requirement_for_execution(
+                &inputs,
+                &[wrong_y.view_mut()],
+                &metadata,
+                &facts,
+                cached
+            )
+            .is_err()
+        );
+        let wrong_shape = [1, depth];
+        metadata[0].shape = &wrong_shape;
+        assert!(
+            k.workspace_requirement_for_execution(
+                &inputs,
+                &[y.view_mut()],
+                &metadata,
+                &facts,
+                cached
+            )
+            .is_err()
+        );
+    }
 }

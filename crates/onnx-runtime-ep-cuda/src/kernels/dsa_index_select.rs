@@ -1,4 +1,4 @@
-//! `pkg.nxrt::DsaIndexSelect` v1: device-resident query-dependent sparse index
+//! `pkg.nxrt._private::DsaIndexSelect` v1: device-resident query-dependent sparse index
 //! selection for the GLM-5.2 DSA / IndexShare indexer.
 //!
 //! The frozen CPU reference in

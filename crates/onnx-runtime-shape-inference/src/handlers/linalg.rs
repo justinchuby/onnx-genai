@@ -756,7 +756,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Gemm", 1, gemm);
     reg.register("", "Det", 11, det);
     reg.register(
-        "pkg.nxrt",
+        "pkg.nxrt._private",
         "BlockQuantizedMatMul",
         1,
         packed_quantized_matmul,

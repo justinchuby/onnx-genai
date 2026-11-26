@@ -518,6 +518,22 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Equal"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && input_dtypes.contains(&DataType::String)
+        {
+            let since = crate::kernels::logical::EQUAL_STRING_SINCE;
+            if opset < since {
+                deny!(
+                    "Equal does not accept tensor(string) at opset {opset}; export at opset {since} or later, or supply matching non-string operands"
+                );
+            }
+            if input_dtypes != [DataType::String, DataType::String] {
+                deny!(
+                    "Equal requires two tensor(string) operands when either operand is String; got {input_dtypes:?}"
+                );
+            }
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
         {
@@ -652,6 +668,12 @@ impl ExecutionProvider for CpuExecutionProvider {
             ));
         }
         passes
+    }
+
+    fn host_payload_funding(&self) -> Option<onnx_runtime_ep_api::HostPayloadFunding> {
+        self.resources
+            .buffer_memory()
+            .map(crate::CpuBufferMemory::host_payload_funding)
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
@@ -1179,7 +1201,7 @@ mod tests {
             })
             .collect();
         let mut node = Node::new(NodeId(0), "CompressedSparseAttention", inputs, outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(1));
         node.attributes
@@ -2243,7 +2265,7 @@ mod tests {
         }
     }
 
-    /// Builds a `pkg.nxrt::DsaIndexSelect` node plus the `(shapes, dtypes)`
+    /// Builds a `pkg.nxrt._private::DsaIndexSelect` node plus the `(shapes, dtypes)`
     /// claim metadata for a compatible baseline: batch=1, q_seq=2, heads=2,
     /// head_dim=4, key_seq=3, top_k=2. Each shape/dtype axis matches
     /// `DsaIndexSelectKernel::derive_dims`'s cross-input contract exactly, so
@@ -2265,7 +2287,7 @@ mod tests {
             static_shape([]),
         );
         let mut node = Node::new(NodeId(0), "DsaIndexSelect", inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes.insert("top_k".into(), Attribute::Int(2));
         node.attributes
             .insert("scale".into(), Attribute::Float(1.0));

@@ -10,9 +10,9 @@ tiny dimensions. It is pinned to Mobius commit MOBIUS_COMMIT (see below).
 Two variants share this script:
 
 * Default (``config.use_dsa=True``): DeepSeek Sparse Attention lowered to two
-  ``pkg.nxrt::IndexShare`` nodes per DSA layer, with routed MoE experts fused
+  ``pkg.nxrt._private::IndexShare`` nodes per DSA layer, with routed MoE experts fused
   into one ``com.microsoft::QMoE`` node per MoE layer. Native-CUDA/CPU only
-  (stock ORT has no ``pkg.nxrt::IndexShare`` implementation).
+  (stock ORT has no ``pkg.nxrt._private::IndexShare`` implementation).
 * ``--full-attention`` (``config.use_dsa=False``, mirroring the Mobius CLI's
   ``--glm-full-attention`` feature): plain dense MLA with no IndexShare nodes
   at all, exported to ``../tiny-glm52-full-attention/`` by default. Still uses
@@ -184,6 +184,18 @@ def build(*, mobius_root: Path, output_dir: Path, full_attention: bool) -> dict:
         task=_default_task_for_model(model_type),
         execution_provider="cpu",
     )
+    # The pinned external exporter predates the runtime's private-domain rename.
+    # Author current fixtures; this is not a runtime compatibility registration.
+    for exported in package.values():
+        export_graph = exported.graph
+        for node in export_graph:
+            if node.op_type in {'IndexShare'} and node.domain == "pkg.nxrt":
+                node.domain = "pkg.nxrt._private"
+        if not any(node.domain == "pkg.nxrt" for node in export_graph):
+            version = export_graph.opset_imports.pop("pkg.nxrt", None)
+            if version is not None:
+                export_graph.opset_imports["pkg.nxrt._private"] = version
+
     rng = np.random.default_rng(SEED)
     for model in package.values():
         _fill_weights(model, rng)
@@ -222,7 +234,7 @@ def build(*, mobius_root: Path, output_dir: Path, full_attention: bool) -> dict:
     # Fixed, human-readable order (not the arbitrary alphabetical order of
     # `node_ops`): IndexShare (DSA-specific) before QMoE (present in both
     # modes), matching this fixture's documented emission order.
-    _EMISSION_ORDER = ["pkg.nxrt::IndexShare", "com.microsoft::QMoE"]
+    _EMISSION_ORDER = ["pkg.nxrt._private::IndexShare", "com.microsoft::QMoE"]
     emission = [op for op in _EMISSION_ORDER if op in node_ops]
     expected = _EMISSION_ORDER if not full_attention else ["com.microsoft::QMoE"]
     if emission != expected:

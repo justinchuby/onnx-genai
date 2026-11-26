@@ -3924,7 +3924,7 @@ mod tests {
     use onnx_runtime_ir::{Dim, Node, NodeId, ValueId};
 
     #[test]
-    fn affine_moe_is_not_admitted_by_cuda_optimizer() {
+    fn reversed_masked_affine_moe_is_not_admitted_by_cuda_optimizer() {
         let passes = cuda_optimization_passes(None);
         assert!(
             passes
@@ -3934,6 +3934,11 @@ mod tests {
         // The current CUDA QMoE would pick different ties, normalize over a
         // different set of logits, and multiply inactive contributions.
         assert!(!passes.iter().any(|pass| pass.name() == "AffineMoeFusion"));
+        assert!(
+            !passes
+                .iter()
+                .any(|pass| pass.name() == "AffineSoftmaxFirstMoeFusion")
+        );
     }
 
     /// Falsifiable guard against re-introducing the parallel-test env race this

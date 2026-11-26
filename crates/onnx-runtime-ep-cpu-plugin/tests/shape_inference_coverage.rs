@@ -100,13 +100,13 @@ const DECLINED: &[(&str, &str)] = &[
     ("com.microsoft", "FusedAttention"),
     ("com.microsoft", "FusedGemm"),
     ("com.microsoft", "FusedMatMulBias"),
-    ("pkg.nxrt", "BlockQuantizedMatMul"),
-    ("pkg.nxrt", "BlockQuantizedMoE"),
-    ("pkg.nxrt", "CompressedSparseAttention"),
-    ("pkg.nxrt", "IndexShare"),
-    ("pkg.nxrt", "PackedVarlenAttention"),
-    ("pkg.nxrt", "SparseKvGather"),
-    ("pkg.nxrt", "VarlenAttention"),
+    ("pkg.nxrt._private", "BlockQuantizedMatMul"),
+    ("pkg.nxrt._private", "BlockQuantizedMoE"),
+    ("pkg.nxrt._private", "CompressedSparseAttention"),
+    ("pkg.nxrt._private", "IndexShare"),
+    ("pkg.nxrt._private", "PackedVarlenAttention"),
+    ("pkg.nxrt._private", "SparseKvGather"),
+    ("pkg.nxrt._private", "VarlenAttention"),
     // ── 3. Inferrable but unwritten. These appear in real input graphs, we
     //       have a kernel, and we hand them to ORT anyway. This is the work.
     //
@@ -144,19 +144,19 @@ const DECLINED: &[(&str, &str)] = &[
 /// The NCHWc layout pass is compiled only with the reference linked, so these
 /// six are absent from the registry of every shipped build. They belong to
 /// group 2 above: `CpuNchwcLayoutPropagation` emits them into the private
-/// `pkg.nxrt` domain *after* capability, so no model ever presents one and
+/// `pkg.nxrt._private` domain *after* capability, so no model ever presents one and
 /// `GetCapability` is never asked about them. Kept in a separate list rather
 /// than folded into `DECLINED`, because in a default build naming them would
 /// fail the opposite assertion — they are not declined there, they do not
 /// exist.
 #[cfg(feature = "mlas")]
 const DECLINED_WITH_REFERENCE: &[(&str, &str)] = &[
-    ("pkg.nxrt", "NchwcAveragePool"),
-    ("pkg.nxrt", "NchwcConv"),
-    ("pkg.nxrt", "NchwcGlobalAveragePool"),
-    ("pkg.nxrt", "NchwcMaxPool"),
-    ("pkg.nxrt", "NchwcReorderToBlocked"),
-    ("pkg.nxrt", "NchwcReorderToNchw"),
+    ("pkg.nxrt._private", "NchwcAveragePool"),
+    ("pkg.nxrt._private", "NchwcConv"),
+    ("pkg.nxrt._private", "NchwcGlobalAveragePool"),
+    ("pkg.nxrt._private", "NchwcMaxPool"),
+    ("pkg.nxrt._private", "NchwcReorderToBlocked"),
+    ("pkg.nxrt._private", "NchwcReorderToNchw"),
 ];
 
 /// Ops registered only so a test can exercise the registry machinery. They are
@@ -198,7 +198,7 @@ fn declines(op_type: &str, domain: &str) -> bool {
         );
     }
 
-    if (domain, op_type) == ("pkg.nxrt", "DsaIndexSelect") {
+    if (domain, op_type) == ("pkg.nxrt._private", "DsaIndexSelect") {
         let inputs = (0..4).map(|i| Some(ValueId(i))).collect();
         let mut node = Node::new(NodeId(0), op_type, inputs, vec![ValueId(100)]);
         node.domain = domain.to_string();

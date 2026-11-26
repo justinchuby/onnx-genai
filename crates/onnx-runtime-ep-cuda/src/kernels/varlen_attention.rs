@@ -1,8 +1,8 @@
 //! Unpadded-compute variable-length attention driven by ONNX Attention-24
-//! `nonpad_kv_seqlen` (`pkg.nxrt::VarlenAttention` v1).
+//! `nonpad_kv_seqlen` (`pkg.nxrt._private::VarlenAttention` v1).
 //!
 //! This is a runtime-invented op (registered in [`onnx_runtime_ir::RUNTIME_DOMAIN`]
-//! = `pkg.nxrt`, **not** `com.microsoft` or the default ONNX domain). It runs
+//! = `pkg.nxrt._private`, **not** `com.microsoft` or the default ONNX domain). It runs
 //! scaled dot-product attention over a *padded rectangular* ragged batch
 //! (`[batch, seq, ...]`, the layout continuous/ragged batching produces today)
 //! but consumes the opset-24 `nonpad_kv_seqlen` per-batch valid-token count to
@@ -12,7 +12,7 @@
 //! kernel bounds its key loop at `nonpad_kv_seqlen[b]`, so a skewed-length batch
 //! spends no compute on padded keys.
 //!
-//! ## Relationship to `pkg.nxrt::PackedVarlenAttention` (#86)
+//! ## Relationship to `pkg.nxrt._private::PackedVarlenAttention` (#86)
 //!
 //! [`super::packed_varlen_attention`] is the *packed* half of #86: it takes a
 //! padding-free token layout with explicit `cu_seqlens` cumulative offsets. This
@@ -242,7 +242,7 @@ fn error(message: impl Into<String>) -> EpError {
 }
 
 /// Claim-time denial for the varlen positional/dtype contract. Mirrors the
-/// other `pkg.nxrt` ops: reject unsupported dtypes up front so the planner falls
+/// other `pkg.nxrt._private` ops: reject unsupported dtypes up front so the planner falls
 /// back cleanly instead of failing at execute.
 pub(crate) fn unsupported_reason(
     node: &Node,

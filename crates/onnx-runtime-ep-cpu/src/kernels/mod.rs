@@ -182,7 +182,7 @@ static NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static STRING_ONLY: &[DataType] = &[DataType::String];
 static STRING_BOOL_DTYPES: &[DataType] = &[DataType::String, DataType::Bool];
 static STRING_I64_DTYPES: &[DataType] = &[DataType::String, DataType::Int64];
-/// Exact dtype union for `pkg.nxrt::DsaIndexSelect` edges.
+/// Exact dtype union for `pkg.nxrt._private::DsaIndexSelect` edges.
 ///
 /// Inputs 0..=2 accept the three compute floats, input 3 is f32, and the sole
 /// output is int64. Per-slot constraints below keep the input union from
@@ -321,7 +321,7 @@ pub fn input_dtype_constraints_for_op(
         ("STFT", "") => STFT_SLOTS,
         ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_SLOTS,
         ("RegexFullMatch", "") | ("StringSplit", "") => TEXT_STRING_INPUT,
         ("StringConcat", "") => STRING_CONCAT_INPUTS,
         _ => &[],
@@ -343,7 +343,7 @@ pub fn output_dtype_constraints_for_op(
     match (op_type, domain) {
         ("DFT", "") => DFT_OUTPUTS,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_OUTPUTS,
         ("RegexFullMatch", "") => REGEX_OUTPUTS,
         ("StringSplit", "") => STRING_SPLIT_OUTPUTS,
         _ => &[],
@@ -589,10 +589,10 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("MoE", "com.microsoft") => FLOAT_COMPUTE_DTYPES,
         ("QMoE", "com.microsoft") => F32_ONLY,
 
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_DTYPES,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_DTYPES,
 
-        // Remaining pkg.nxrt custom ops: f32-only (fail closed).
-        (_, "pkg.nxrt") => F32_ONLY,
+        // Remaining pkg.nxrt._private custom ops: f32-only (fail closed).
+        (_, onnx_runtime_ir::RUNTIME_DOMAIN) => F32_ONLY,
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
@@ -1117,7 +1117,7 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
     (reg, descriptors)
 }
 
-/// Derive one [`CpuOpDescriptor`] per entry in `reg`.
+/// Derive one [`CpuOpDescriptor`] per plugin-visible entry in `reg`.
 ///
 /// Reads the registry itself rather than a list accumulated during
 /// registration. Those two had drifted: `register_cnn_ops` takes `&mut
@@ -1130,11 +1130,12 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 /// `KernelRegistryEntry` list, and `node_passes_dtype_filter` fails closed on
 /// an op with no entry, so every one of those 18 was claimed by `supports_op`
 /// and then dropped at capability time -- handing it to ORT's CPU EP, which is
-/// exactly what this EP must never do. Deriving from the registry makes the
-/// two sets identical by construction instead of by convention.
+/// exactly what this EP must never do. Deriving from [`OpRegistry::plugin_keys`]
+/// keeps ordinary registrations aligned while allowing explicit native-only
+/// revisions whose storage ABI the shipped plugin must not advertise.
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
-        .keys()
+        .plugin_keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| {
@@ -1243,7 +1244,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(matmul_nbits::MatMulNBitsFactory::new(resources.clone())),
     );
     rec.register(
-        OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory::new(
             derived_weights.clone(),
@@ -1251,7 +1252,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         )),
     );
     rec.register(
-        OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory::new(
             derived_weights.clone(),
@@ -1259,22 +1260,22 @@ pub(crate) fn build_cpu_registry_with_resources(
         )),
     );
     rec.register(
-        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        OpKey::new("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(index_share::IndexShareFactory),
     );
     rec.register(
-        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        OpKey::new("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dsa_index_select::DsaIndexSelectFactory),
     );
     rec.register(
-        OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(varlen_attention::VarlenAttentionFactory),
     );
     rec.register(
-        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory),
     );
@@ -1284,12 +1285,16 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(packed_multi_head_attention::PackedMultiHeadAttentionFactory),
     );
     rec.register(
-        OpKey::new("SparseKvGather", "pkg.nxrt", 1),
+        OpKey::new("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
     );
     rec.register(
-        OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        OpKey::new(
+            "CompressedSparseAttention",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(compressed_sparse_attention::CompressedSparseAttentionFactory),
     );
@@ -1611,21 +1616,30 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::TanhFactory),
     );
-    rec.register(
-        OpKey::new("Cast", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: false }),
-    );
-    rec.register(
-        OpKey::new("Cast", "", 28),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: true }),
-    );
+    for opset in [1, 28] {
+        rec.register(
+            OpKey::new("Cast", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastFactory { opset }),
+        );
+    }
     rec.register(
         OpKey::new("CastLike", "", 15),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastLikeFactory),
+        Box::new(cast::CastLikeFactory { opset: 15 }),
     );
+    for opset in [19, 24] {
+        rec.register_native_only(
+            OpKey::new("Cast", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastFactory { opset }),
+        );
+        rec.register_native_only(
+            OpKey::new("CastLike", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastLikeFactory { opset }),
+        );
+    }
     rec.register(
         OpKey::new("BitCast", "", 26),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3052,9 +3066,8 @@ pub(crate) mod testutil {
             let n: usize = shape.iter().product();
             let strides = compute_contiguous_strides(shape)
                 .expect("fixture shape has representable contiguous strides");
-            let esize = dtype.byte_size();
             Self {
-                bytes: vec![0u8; n * esize],
+                bytes: vec![0u8; dtype.storage_bytes(n)],
                 shape: shape.to_vec(),
                 strides,
                 dtype,
@@ -3171,7 +3184,7 @@ mod tests {
 
     #[test]
     fn dsa_index_select_advertises_exact_mixed_edge_dtypes() {
-        let dtypes = supported_dtypes_for_op("DsaIndexSelect", "pkg.nxrt");
+        let dtypes = supported_dtypes_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(
             dtypes,
             &[
@@ -3182,7 +3195,8 @@ mod tests {
             ]
         );
 
-        let constraints = input_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt");
+        let constraints =
+            input_dtype_constraints_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(constraints.len(), 4);
         assert_eq!(constraints[0], (0, FLOAT_COMPUTE_DTYPES));
         assert_eq!(constraints[1], (1, FLOAT_COMPUTE_DTYPES));
@@ -3190,7 +3204,7 @@ mod tests {
         assert_eq!(constraints[3], (3, F32_ONLY));
 
         assert_eq!(
-            output_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt"),
+            output_dtype_constraints_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN),
             &[(0, I64_ONLY)]
         );
     }
@@ -3672,7 +3686,7 @@ mod tests {
         // the `com.microsoft::RotaryEmbedding` contrib alias adds one,
         // `com.microsoft::MultiHeadAttention` (separate-QKV SDPA) adds one, and
         // `com.microsoft::Attention` (packed-QKV SDPA) adds one.
-        // The six `pkg.nxrt` NCHWc blocked-layout ops (reorder to/from blocked,
+        // The six `pkg.nxrt._private` NCHWc blocked-layout ops (reorder to/from blocked,
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed). Standard
@@ -3690,11 +3704,12 @@ mod tests {
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
         // MeanVarianceNormalization-29 adds one registration.
+        // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
         // Opset-29 LinearAttention adds one standalone registration.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 126
+                + 130
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
@@ -3741,19 +3756,56 @@ mod tests {
         assert!(reg.lookup("QLinearMatMul", "", 10).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
-        assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("BlockQuantizedMoE", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("IndexShare", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("VarlenAttention", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("PackedVarlenAttention", "pkg.nxrt", 1).is_some());
+        assert_eq!(onnx_runtime_ir::RUNTIME_DOMAIN, "pkg.nxrt._private");
+        for key in reg
+            .keys()
+            .filter(|key| key.domain == onnx_runtime_ir::RUNTIME_DOMAIN)
+        {
+            assert!(
+                reg.lookup(&key.op_type, "pkg.nxrt", key.since_version)
+                    .is_none(),
+                "old private domain must not alias {} at opset {}",
+                key.op_type,
+                key.since_version
+            );
+        }
+        assert!(reg.lookup("MoE", "com.microsoft", 1).is_some());
+        assert!(reg.lookup("GroupedMatMul", "", 29).is_some());
+        assert!(
+            reg.lookup("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
         assert!(
             reg.lookup("PackedMultiHeadAttention", "com.microsoft", 1)
                 .is_some()
         );
-        assert!(reg.lookup("SparseKvGather", "pkg.nxrt", 1).is_some());
         assert!(
-            reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)
+            reg.lookup("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
                 .is_some()
+        );
+        assert!(
+            reg.lookup(
+                "CompressedSparseAttention",
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1
+            )
+            .is_some()
         );
         assert!(reg.lookup("Conv", "", 21).is_some());
         assert!(
@@ -3936,7 +3988,8 @@ mod tests {
 
     #[test]
     fn fail_closed_pkg_nxrt_ops_get_f32_only() {
-        let dtypes = supported_dtypes_for_op("BlockQuantizedMatMul", "pkg.nxrt");
+        let dtypes =
+            supported_dtypes_for_op("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(dtypes, &[DataType::Float32]);
     }
 
@@ -3973,7 +4026,15 @@ mod tests {
             .map(|version| ("RoiAlign", "", version));
         #[cfg(not(feature = "ops-cnn"))]
         let roi_align = std::iter::empty();
-        let expected = roi_align.chain([("LinearAttention", "", 29)]).collect();
+        let expected = roi_align
+            .chain([
+                ("Cast", "", 19),
+                ("Cast", "", 24),
+                ("CastLike", "", 19),
+                ("CastLike", "", 24),
+                ("LinearAttention", "", 29),
+            ])
+            .collect();
         assert_eq!(missing, expected);
         assert_eq!(
             descriptors.len() + missing.len(),
@@ -4020,6 +4081,44 @@ mod tests {
             a.iter().map(key).collect::<Vec<_>>(),
             b.iter().map(key).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn packed_cast_dtypes_do_not_expand_plugin_descriptors() {
+        let (registry, descriptors) = build_cpu_registry_with_descriptors();
+        for opset in [21, 25] {
+            assert!(registry.supports("Cast", "", opset));
+            assert!(registry.supports("CastLike", "", opset));
+        }
+        let cast_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "Cast")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        let cast_like_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "CastLike")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        assert_eq!(cast_versions, vec![1, 28]);
+        assert_eq!(cast_like_versions, vec![15]);
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| matches!(descriptor.op_type.as_str(), "Cast" | "CastLike"))
+        {
+            for packed in [
+                DataType::Uint4,
+                DataType::Int4,
+                DataType::Uint2,
+                DataType::Int2,
+            ] {
+                assert!(
+                    !descriptor.supported_dtypes.contains(&packed),
+                    "CPU ORT plugin descriptor {:?} must not advertise standalone packed dtype {packed:?}",
+                    descriptor.op_type
+                );
+            }
+        }
     }
 }
 

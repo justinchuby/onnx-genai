@@ -1,13 +1,13 @@
 //! CUDA implementation of `com.microsoft::MultiHeadAttention` (opset 1).
 //!
 //! This is a **thin adapter over the shared SDPA core**
-//! ([`super::attention::run_attention_phase2a`]), exactly mirroring the CPU EP's
+//! ([`super::attention::run_attention_blas_softmax`]), exactly mirroring the CPU EP's
 //! `multi_head_attention.rs` (the conformance oracle): it parses/validates the
 //! separate-Q/K/V MHA inputs, normalizes the Whisper-style layouts, projects the
 //! optional `bias`, concatenates any past-KV cache into dense `BNSH` device
 //! buffers, folds `attention_bias` and `key_padding_mask` into a single additive
 //! mask, then hands the `QKᵀ → scale → +bias → +mask → softmax → ·V` math to the
-//! Phase-2a cuBLASLt → softmax → cuBLASLt engine. Every layout transform runs as
+//! cuBLASLt → softmax → cuBLASLt engine. Every layout transform runs as
 //! an NVRTC kernel; only the (small, integer) `key_padding_mask` round-trips
 //! through the host, matching ORT's `PrepareMask`.
 //!
@@ -40,8 +40,8 @@
 //! ## Declined (clean claim-time / execute-time errors, never a miscompute)
 //!
 //! * Packed-QKV (rank-5 query) / packed-KV, and DecoderMaskedMHA extras.
-//! * `v_head_size != qk_head_size`: the shared Phase-2a core assumes a single
-//!   head dimension for Q/K/V/O (measured from `run_attention_phase2a`, which
+//! * `v_head_size != qk_head_size`: the shared cuBLASLt/softmax core assumes a single
+//!   head dimension for Q/K/V/O (measured from `run_attention_blas_softmax`, which
 //!   sizes the P·V GEMM and the output stride with the Q/K head dim `d`).
 //! * `bias` / `attention_bias` / `past_*` whose dtype differs from the query
 //!   dtype (the device transforms read them at the query element width).
@@ -51,7 +51,7 @@
 //! A *fully* key-padded row (`key_padding_mask` masking every key) adds the
 //! `mask_filter_value` (`-10000`) constant to every logit; under softmax the
 //! constant cancels, so ORT/the CPU oracle resolve it to `softmax(raw scores)`.
-//! The shared Phase-2a softmax writes each masked logit (`raw − 10000`) back to
+//! The shared cuBLASLt/softmax softmax writes each masked logit (`raw − 10000`) back to
 //! the score buffer between its two passes; at f16/bf16 the mantissa step near
 //! 10000 is 8, so every value rounds to exactly `-10000` and the row collapses
 //! to a uniform distribution. This matches the CPU oracle at f32 but not at
@@ -71,8 +71,8 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::attention::{
-    AttentionDtype, PHASE2A_SCRATCH_ALIGN, Phase2aScratch, phase2a_scratch_layout,
-    run_attention_phase2a,
+    AttentionDtype, BLAS_SOFTMAX_SCRATCH_ALIGN, BlasSoftmaxScratch, blas_softmax_scratch_layout,
+    run_attention_blas_softmax,
 };
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
@@ -412,7 +412,7 @@ impl MhaGeometry {
 #[derive(Clone, Copy, Debug)]
 struct MhaWorkspace {
     regions: WorkspaceLayout<7>,
-    phase2a: WorkspaceLayout<2>,
+    blas_softmax: WorkspaceLayout<2>,
 }
 
 impl MhaWorkspace {
@@ -420,14 +420,20 @@ impl MhaWorkspace {
         let elem = g.dtype.element_size() as usize;
         let region = |elements, width, name| {
             let bytes = checked_bytes(elements, width, name)?;
-            Layout::from_size_align(bytes, PHASE2A_SCRATCH_ALIGN).map_err(|_| {
+            Layout::from_size_align(bytes, BLAS_SOFTMAX_SCRATCH_ALIGN).map_err(|_| {
                 mha_error(format!(
                     "{name} workspace layout exceeds addressable capacity; reduce the input shape"
                 ))
             })
         };
-        let phase2a = phase2a_scratch_layout(g.dtype, g.batch, g.heads, g.q_seq, g.total_seq)
-            .map_err(|error| mha_error(format!("Phase-2a workspace planning failed: {error}")))?;
+        let blas_softmax =
+            blas_softmax_scratch_layout(g.dtype, g.batch, g.heads, g.q_seq, g.total_seq).map_err(
+                |error| {
+                    mha_error(format!(
+                        "cuBLASLt/softmax workspace planning failed: {error}"
+                    ))
+                },
+            )?;
         let regions = WorkspaceLayout::new([
             region(g.q_elements, elem, "query BNSH")?,
             region(
@@ -451,11 +457,15 @@ impl MhaWorkspace {
                 std::mem::size_of::<f32>(),
                 "padding upload",
             )?,
-            Layout::from_size_align(phase2a.bytes(), phase2a.alignment())
-                .map_err(|_| mha_error("Phase-2a workspace layout exceeds addressable capacity"))?,
+            Layout::from_size_align(blas_softmax.bytes(), blas_softmax.alignment()).map_err(
+                |_| mha_error("cuBLASLt/softmax workspace layout exceeds addressable capacity"),
+            )?,
         ])
         .map_err(|error| mha_error(format!("composite workspace planning failed: {error}")))?;
-        Ok(Self { regions, phase2a })
+        Ok(Self {
+            regions,
+            blas_softmax,
+        })
     }
 
     fn requirement(&self) -> Result<WorkspaceRequirement> {
@@ -1423,9 +1433,10 @@ impl MultiHeadAttentionKernel {
             o_region,
             mask_region,
             pad_region,
-            phase2a_region,
+            blas_softmax_region,
         ] = layout.bind(workspace)?;
-        let phase2a_scratch = Phase2aScratch::bind(&layout.phase2a, Some(phase2a_region))?;
+        let blas_softmax_scratch =
+            BlasSoftmaxScratch::bind(&layout.blas_softmax, Some(blas_softmax_region))?;
 
         // Resolve key_padding_mask on the host (small, integer) exactly like
         // ORT's PrepareMask, into an additive [B, S, total] f32 buffer.
@@ -1610,7 +1621,7 @@ impl MultiHeadAttentionKernel {
 
             // The shared core can fail after submitting an earlier phase, so arm
             // stream-ordered cleanup before entering it.
-            run_attention_phase2a(
+            run_attention_blas_softmax(
                 &self.runtime,
                 attn_dtype,
                 num_heads,
@@ -1633,7 +1644,7 @@ impl MultiHeadAttentionKernel {
                 0,
                 0,
                 0.0,
-                phase2a_scratch,
+                blas_softmax_scratch,
             )?;
 
             let (batch_i, heads_i, sq_i, dim_i) = (
@@ -1690,10 +1701,10 @@ impl Kernel for MultiHeadAttentionKernel {
     }
 
     fn capture_support(&self) -> CaptureSupport {
-        // The Phase-2a core and final output transpose require stream completion.
+        // The cuBLASLt/softmax core and final output transpose require stream completion.
         // Prepared backing does not make these synchronization points capturable.
         CaptureSupport::unsupported(
-            "cuda_ep MultiHeadAttention retains non-capturable Phase-2a, padding and output-transpose synchronization paths",
+            "cuda_ep MultiHeadAttention retains non-capturable cuBLASLt/softmax, padding and output-transpose synchronization paths",
         )
     }
 }
@@ -2029,7 +2040,7 @@ mod tests {
                                     } else {
                                         0
                                     },
-                                    mask_bytes.next_multiple_of(PHASE2A_SCRATCH_ALIGN)
+                                    mask_bytes.next_multiple_of(BLAS_SOFTMAX_SCRATCH_ALIGN)
                                         + crate::blas::WORKSPACE_BYTES,
                                 ]
                             );
@@ -2037,12 +2048,16 @@ mod tests {
                             for region in views.into_iter().filter(|view| view.bytes() != 0) {
                                 let start = region.ptr().0 as usize;
                                 assert!(
-                                    start >= end && start.is_multiple_of(PHASE2A_SCRATCH_ALIGN)
+                                    start >= end
+                                        && start.is_multiple_of(BLAS_SOFTMAX_SCRATCH_ALIGN)
                                 );
                                 end = start + region.bytes();
                                 assert!(end <= base + layout.regions.bytes());
                             }
-                            assert!(Phase2aScratch::bind(&layout.phase2a, Some(views[6])).is_ok());
+                            assert!(
+                                BlasSoftmaxScratch::bind(&layout.blas_softmax, Some(views[6]))
+                                    .is_ok()
+                            );
                         }
                     }
                 }

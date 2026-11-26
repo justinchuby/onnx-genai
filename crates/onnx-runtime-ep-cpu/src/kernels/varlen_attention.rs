@@ -1,4 +1,4 @@
-//! CPU reference kernel for `pkg.nxrt::VarlenAttention` v1.
+//! CPU reference kernel for `pkg.nxrt._private::VarlenAttention` v1.
 //!
 //! Q/K/V use token-major packed layouts (`[total_tokens, heads, dim]`).
 //! `cu_seqlens_q` and `cu_seqlens_kv` delimit each sequence, so the shared SDPA

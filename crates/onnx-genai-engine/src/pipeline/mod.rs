@@ -2717,7 +2717,7 @@ mod speculative_admission_tests {
         assert_candidate_tree_refusal(
             WorkflowRuntime::from_dir_with_session_options(
                 &fixture,
-                EngineConfig::default(),
+                crate::fixture_engine_config(),
                 SessionOptions::default(),
             ),
             "WorkflowRuntime::from_dir_with_session_options",
@@ -2730,7 +2730,7 @@ mod speculative_admission_tests {
         assert_candidate_tree_refusal(
             WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                 &fixture,
-                EngineConfig::default(),
+                crate::fixture_engine_config(),
                 SessionOptions::default(),
                 Arc::new(NeverCalledAuthorityProvider),
             ),

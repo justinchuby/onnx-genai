@@ -247,7 +247,7 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
         0.0,
     )
     .unwrap()
-    .with_backend(GroupQueryAttentionBackend::Phase2a);
+    .with_backend(GroupQueryAttentionBackend::NoFlashPrefill);
 
     let query: Vec<f16> = (0..QUERY_HEADS * HEAD_DIM)
         .map(|index| f16::from_f32(((index * 17 % 97) as f32 - 48.0) / 1024.0))

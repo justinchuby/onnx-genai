@@ -655,7 +655,7 @@ mod tests {
                 );
             }
             std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-            let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+            let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
             let (mut session, _) = engine.open_realtime_session(
                 RealtimeMode::Realtime,
                 &[],
@@ -706,7 +706,7 @@ mod tests {
             .replace("node { input: \"generating\" output: \"candidate_tokens\"", "node { input: \"decoding\" output: \"candidate_tokens\"")
             .replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"tokens_out\" output: \"emitted_id\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" i: 0 type: INT } }\nnode { input: \"emitted_id\" input: \"three\" output: \"ending\" op_type: \"Equal\" }\nnode { input: \"ending\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -752,7 +752,7 @@ mod tests {
                 "node { input: \"zero\" output: \"count\" op_type: \"Identity\" }",
             );
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -801,7 +801,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
 }"#)
             .replace("output: \"audio_out\" op_type: \"Add\"", "output: \"raw_audio\" op_type: \"Add\"");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -844,7 +844,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
         let metadata = std::fs::read_to_string(root.join("inference_metadata.yaml"))?
             .replace("eos_token_id: [3]", "eos_token_id: []");
         std::fs::write(package.path().join("inference_metadata.yaml"), metadata)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -908,7 +908,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -939,7 +939,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
         }
         let graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?.replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"output_token_budget\" input: \"count\" output: \"limit_equal\" op_type: \"Equal\" }\nnode { input: \"limit_equal\" input: \"responding\" output: \"limit_done\" op_type: \"And\" }\nnode { input: \"limit_done\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -976,7 +976,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
     -> anyhow::Result<()> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -1018,7 +1018,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
     fn native_realtime_applies_response_grammar_before_selecting_tokens() -> anyhow::Result<()> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -1055,7 +1055,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
     fn native_realtime_quanta_keep_state_and_drop_closes_the_session() -> anyhow::Result<()> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config())?;
         let closed_id;
         {
             let (mut session, initial) = engine.open_realtime_session(

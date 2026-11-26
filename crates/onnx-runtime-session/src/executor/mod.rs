@@ -38,7 +38,7 @@
 //! A [`TensorView`] carries no backing length, so it cannot self-check storage
 //! bounds. This executor owns every buffer, so it is the layer that *can*: for
 //! **every** input and output view of **every** node it calls
-//! [`strided::view_in_bounds`] (or, for sub-byte dtypes, the `storage_bytes`
+//! [`strided::view_in_bounds`] (or, for sub-byte dtypes, the bit-range
 //! equivalent in [`view_bounds`]) against the **run-scoped resolved** buffer and
 //! refuses to dispatch on failure. That check is the sole thing that makes
 //! ep-cpu's unchecked pointer derefs sound.

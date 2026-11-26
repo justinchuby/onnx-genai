@@ -1,5 +1,7 @@
 //! Batched static-cache generation path.
 
+use crate::LogitsRow;
+
 use crate::config::{
     EngineDecodeBackend, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
     GenerateResult,
@@ -91,7 +93,7 @@ struct ContinuousBatchRow {
 enum RowPending {
     /// Full host logits; the row's processor chain and sampler run in
     /// `advance_row`.
-    HostLogits(Vec<f32>),
+    HostLogits(LogitsRow),
     /// The token id already selected entirely on the device.
     DeviceToken(TokenId),
 }
@@ -1102,9 +1104,9 @@ impl<'a> ContinuousBatchManager<'a> {
             RowPending::DeviceToken(token_id) => token_id,
             RowPending::HostLogits(mut logits) => {
                 let context = row.processor_context();
-                let probabilities = ProbabilitySnapshot::capture(&row.options, &logits);
+                let probabilities = ProbabilitySnapshot::capture(&row.options, &logits)?;
                 let token_id = select_next_token_with_rng(
-                    &mut logits,
+                    logits.try_mut()?,
                     &context,
                     &row.options,
                     &row.chain,
@@ -1228,7 +1230,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     self.routed_stats.bytes += host.len() as u128 * u128::from(LOGIT_BYTES);
                     self.routed_stats.rows_host_copied += 1;
                 }
-                row.pending = Some(RowPending::HostLogits(host));
+                row.pending = Some(RowPending::HostLogits(LogitsRow::from_host_row(host)));
             }
         }
         Ok(())
