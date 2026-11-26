@@ -320,14 +320,14 @@ fn ogg_opus_budget_bounds_initial_packet_raw_work_and_host_headroom() {
 
 #[test]
 fn opus_other_containers_chaining_and_truncated_end_fail_explicitly() {
-    for suffix in ["mp4"] {
-        let bytes = std::fs::read(root().join(format!("unsupported-opus.{suffix}"))).unwrap();
+    {
+        let bytes = std::fs::read(root().join("unsupported-opus.mp4")).unwrap();
         let error = decode_audio(&bytes, limit(1024 * 1024))
             .unwrap_err()
             .to_string();
         assert!(
             error.contains("Opus presentation in") && error.contains("unsupported by this build"),
-            "{suffix}: {error}"
+            "mp4: {error}"
         );
     }
     let quantized = std::fs::read(root().join("unsupported-opus.webm")).unwrap();
