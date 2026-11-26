@@ -776,7 +776,8 @@ jobs:
 
       # onnx-genai, -capi, -cli, -engine, -ort and -server were executed by no
       # required status check: `Fast (Linux x86_64)` derives its set as
-      # everything *minus* these (they pull the ort-sys download), the test
+      # everything *minus* these (their tests require explicit ORT reference
+      # execution), the test
       # steps above are all `-p onnx-runtime-ep-cpu`, and `CLI ORT` -- the only
       # lane that ran them -- is advisory. That is how #1982 landed a red
       # `shape_dispatch_gate` on `main` with every required check green, and it
@@ -786,7 +787,7 @@ jobs:
       # moved rather than duplicated: that step is now Windows-only, so the
       # tests run on exactly the same platforms as before, one of them now
       # under a check that can actually block a merge. The two clippy steps
-      # above already build this graph `--all-targets`, ORT download included,
+      # above already build this graph `--all-targets`,
       # so what is added here is codegen, linking and the run itself.
       #
       # NXRT_REQUIRE_ORT_TESTS mirrors the `CLI ORT` job env. No test in these
@@ -799,6 +800,15 @@ jobs:
         run: |
           df -h "$GITHUB_WORKSPACE"
           du -sh target
+      - name: Provision explicit ORT reference runtime
+        shell: bash
+        run: |
+          reference_dir="$RUNNER_TEMP/nxrt-ort-reference"
+          cargo run --locked -p onnx-genai-ort-sys --example provision_runtime -- "$reference_dir"
+          reference_lib="$(python -c 'import pathlib,sys; print((pathlib.Path(sys.argv[1]) / "lib").resolve())' "$reference_dir")"
+          echo "ONNX_GENAI_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
+          echo "NXRT_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
+          echo "$reference_lib" >> "$GITHUB_PATH"
       - name: Test ORT-backed workspace crates
         env:
           NXRT_REQUIRE_ORT_TESTS: "1"
@@ -905,8 +915,8 @@ jobs:
       - name: Fetch the locked dependency graph
         run: cargo fetch --locked
       # Never replace these explicit packages with bare `cargo test` or
-      # `--workspace`: that selects onnx-genai-ort-sys, whose build script
-      # downloads a native ONNX Runtime distribution. The package list is
+      # `--workspace`: that selects onnx-genai-ort-sys, whose reference tests
+      # require a separately provisioned ONNX Runtime distribution. The list is
       # derived from cargo metadata and the commented deny-list in
       # `.github/scripts/workspace_test_packages.py`, so new offline workspace
       # crates are tested by default.
@@ -1191,33 +1201,22 @@ jobs:
             cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
           fi
 
-      # The portable lane must stay offline, but the CLI is the user-facing ORT
-      # entry point and its generation contract tests catch token-budget regressions.
-      # Keep this isolated so the native ORT download is intentional, pinned by
-      # ort-sys checksums, and paid only by the crate that needs it.
+      # Build the Native-default CLI without downloading an ORT runtime. This
+      # reference test lane provisions its pinned comparison library explicitly.
       - name: Build onnx-genai-cli
         run: cargo build --locked -p onnx-genai-cli
-      - name: Expose downloaded ORT on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Provision explicit ORT reference runtime
+        shell: bash
         run: |
-          $ort = Get-ChildItem -Path target\debug\build -Recurse -Filter onnxruntime.dll |
-            Where-Object { $_.FullName -like '*ort-prebuilt*' } |
-            Select-Object -First 1
-          if (-not $ort) {
-            throw 'onnx-genai-ort-sys did not leave a downloaded onnxruntime.dll under target\debug\build'
-          }
-          Copy-Item $ort.FullName target\debug\onnxruntime.dll -Force
-          Copy-Item $ort.FullName target\debug\deps\onnxruntime.dll -Force
-          # cargo-llvm-cov may use its own target directory; pre-stage the same ORT DLL
-          # there and run coverage with --no-clean so it is not removed before tests.
-          New-Item -ItemType Directory -Force target\llvm-cov-target\debug\deps | Out-Null
-          Copy-Item $ort.FullName target\llvm-cov-target\debug\onnxruntime.dll -Force
-          Copy-Item $ort.FullName target\llvm-cov-target\debug\deps\onnxruntime.dll -Force
-          $ort.DirectoryName >> $env:GITHUB_PATH
+          reference_dir="$RUNNER_TEMP/nxrt-ort-reference"
+          cargo run --locked -p onnx-genai-ort-sys --example provision_runtime -- "$reference_dir"
+          reference_lib="$(python -c 'import pathlib,sys; print((pathlib.Path(sys.argv[1]) / "lib").resolve())' "$reference_dir")"
+          echo "ONNX_GENAI_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
+          echo "NXRT_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
+          echo "$reference_lib" >> "$GITHUB_PATH"
       - name: Test onnx-genai-cli with coverage
         run: cargo llvm-cov --locked --no-clean --codecov --output-path codecov-cli-ort.json -p onnx-genai-cli
-      # These crates depend on the downloaded ONNX Runtime distribution above.
+      # These crates use the explicitly provisioned ONNX Runtime reference above.
       # The set is still derived from the workspace inventory, not hand-copied
       # here; adding a new ORT-backed crate means classifying it in the script.
       # Serialize because several integration tests temporarily select sessions
@@ -1258,8 +1257,8 @@ jobs:
       # interop unverified for that run. The job still fails if either step
       # fails, so no gate is weakened.
       #
-      # Tradeoff: this also runs after a *setup* failure — if the ORT download
-      # in `Build onnx-genai-cli` fails, this step now goes red for that
+      # Tradeoff: this also runs after a *setup* failure — if explicit ORT reference
+      # provisioning fails, this step now goes red for that
       # reason rather than being skipped. It cannot false-green, so the cost is
       # an extra red on an already-red job.
       - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
