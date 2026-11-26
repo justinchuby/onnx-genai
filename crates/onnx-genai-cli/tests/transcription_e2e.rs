@@ -162,10 +162,14 @@ fn native_generative_stdin_and_feature_attachment_enforce_the_selected_pcm_polic
     // 32-frame clip. The PCM policy conservatively charges float32 units for
     // that capacity plus mono/staging: (1152 + 32 + 32) * 4 = 4864 bytes.
     // An 8 KiB positive budget covers that normal reservation and stays finite.
+    // This fixture forbids prompt conditioning. Raw mode keeps the required
+    // empty generate prompt empty rather than adding the default chat wrapper;
+    // its transcription contract still owns the actual decoder prompt tokens.
     for (maximum, accepted) in [("16", false), ("8192", true)] {
         let output = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
             .arg("generate")
             .arg(model("transcription_features"))
+            .arg("--raw")
             .arg("--prompt")
             .arg("")
             .arg("--audio")
