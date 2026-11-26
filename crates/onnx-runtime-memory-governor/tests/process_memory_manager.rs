@@ -1791,6 +1791,54 @@ fn context_termination_waits_for_manager_publication_and_rejects_new_work() {
 }
 
 #[test]
+fn context_closure_waits_for_all_scope_guards_including_unwinding() {
+    let fixture = Fixture::new(DeviceKey::HOST, 4096, unlimited());
+    let scope = fixture
+        .manager
+        .bind_registered(&fixture.mechanism)
+        .unwrap()
+        .context_scope();
+    let first = scope.enter().unwrap();
+    let second = scope.enter().unwrap();
+    fixture.manager.retire_context(&fixture.context).unwrap();
+    assert!(matches!(
+        scope.enter(),
+        Err(AllocationTransactionError::TerminatedContext(_))
+    ));
+    fixture
+        .manager
+        .invalidate_device(DeviceKey::HOST, "loss after retirement")
+        .unwrap();
+    let manager = fixture.manager.clone();
+    let context = fixture.context.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let confirmation = thread::spawn(move || {
+        let result = manager.confirm_context_terminated(&context);
+        tx.send(()).unwrap();
+        result
+    });
+    drop(first);
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(20))
+            .is_err(),
+        "the second admitted scope must still prevent termination"
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = second;
+        panic!("injected scope unwind");
+    }));
+    assert!(panic.is_err());
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("unwinding the final scope must unblock termination");
+    confirmation.join().unwrap().unwrap();
+    assert!(matches!(
+        scope.enter(),
+        Err(AllocationTransactionError::TerminatedContext(_))
+    ));
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+}
+
+#[test]
 fn manager_can_drop_before_a_live_allocation_settles() {
     let fixture = Fixture::new(DeviceKey::HOST, 4096, unlimited());
     let allocation = fixture.allocate(128);
