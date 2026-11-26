@@ -1035,6 +1035,31 @@ impl Engine {
         }))
     }
 
+    pub(crate) fn reserve_literal_decoder_workspace(
+        &self,
+        tokenizer: &Tokenizer,
+        options: &GenerateOptions,
+    ) -> anyhow::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        crate::byte_stream::reserve_workspace(tokenizer, options, self.governor.memory())
+    }
+    fn build_governed_processor_chain(
+        &self,
+        options: &GenerateOptions,
+        custom_sampler: bool,
+    ) -> anyhow::Result<crate::ProcessorChain> {
+        let tokenizer = self.require_tokenizer()?;
+        let lease = self.reserve_literal_decoder_workspace(tokenizer, options)?;
+        let decoder = crate::byte_stream::prepare_literal_output(
+            tokenizer,
+            &options.effective_preserved_tokens(),
+        )
+        .map_err(crate::ProcessorConfigurationError::classify)?;
+        let mut chain = build_processor_chain(options, Some(tokenizer), custom_sampler, decoder)
+            .map_err(crate::ProcessorConfigurationError::classify)?;
+        chain.retain_decoder_workspace(lease);
+        Ok(chain)
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         self.max_context_for_request(options)
     }
@@ -1070,7 +1095,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         // Speculation is an optimization. Until its accepted-token callback can
         // carry a normal host stop, tool-aware requests use the ordinary
@@ -2594,11 +2619,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(
-            &options,
-            Some(self.require_tokenizer()?),
-            custom_sampler.is_some(),
-        )?;
+        let chain = self.build_governed_processor_chain(&options, custom_sampler.is_some())?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -3751,7 +3772,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         crate::pipeline::WorkflowGenerationCursor::validate_per_token_capability(&self.workflow)?;
         let mut state = self
             .sessions
@@ -4382,7 +4403,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
@@ -8329,5 +8350,137 @@ mod end_token_policy_tests {
                 .contains("effective eos_token_id")
         );
         assert!(EndTokenPolicy::new(vec![3], Some(4)).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod literal_rollback_tests {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/build_literal_decoder.rs"
+        ));
+    }
+    #[test]
+    fn native_literal_active_budget_failure_restores_kv_and_same_session_retry()
+    -> anyhow::Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for (retained_run, short_source) in [(false, false), (false, true), (true, false)] {
+            let root = tempfile::tempdir()?;
+            let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+            if retained_run {
+                fixture::invalid_group(root.path(), &fixtures, false);
+            } else {
+                fixture::build(root.path(), &fixtures, false);
+            }
+            let path = root.path().join("tokenizer.json");
+            let mut tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            if short_source {
+                // Ensure the active failure is expansion, not the raw-input bound.
+                let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+                assert_eq!(vocab.remove("@source@"), Some(serde_json::json!(22)));
+                vocab.insert("a".into(), serde_json::json!(22));
+                tokenizer["decoder"]["decoders"][2]["pattern"] = serde_json::json!({"String":"a"});
+            }
+            tokenizer["decoder"]["decoders"][2]["content"] = serde_json::json!("12345678");
+            std::fs::write(path, serde_json::to_vec(&tokenizer)?)?;
+            let config = EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            };
+            let mut engine = Engine::from_dir(root.path(), config.clone())?;
+            let session = engine.create_session()?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+            request.options.max_new_tokens = if retained_run { 3 } else { 1 };
+            request.options.greedy = true;
+            request.options.temperature = 0.;
+            request.options.stop_on_eos = false;
+            request.options.max_constraint_bytes = 4096;
+            if !retained_run {
+                request
+                    .options
+                    .logit_bias
+                    .insert(22, crate::logits::LogitBias::Add(1000.));
+            }
+            assert_eq!(
+                engine.generate_in_session(session, request.clone())?.text,
+                "12345678"
+            );
+            let before = engine.native_session.as_mut().unwrap().snapshot_past()?;
+            let length = engine.native_session.as_ref().unwrap().current_len();
+            let tokens = engine.native_sessions[&session].tokens.clone();
+            let host = engine.resource_snapshot().host_ram.used;
+            assert!(
+                !before.host_contents().is_empty() || before.cpu_kv_snapshot().is_some(),
+                "oracle must contain actual materialized Native KV"
+            );
+            let forwards = Arc::new(AtomicUsize::new(0));
+            let observed = forwards.clone();
+            let control = crate::GenerationControl::new().with_checkpoint(move |boundary| {
+                if boundary == crate::GenerationBoundary::AfterDecoderForward {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            let mut visible = String::new();
+            let mut callback = |token: crate::GenerateToken| {
+                visible.push_str(&token.text);
+                Ok(())
+            };
+            let mut failing = request.clone();
+            failing.options.max_constraint_bytes = 7;
+            let error = engine
+                .generate_in_session_with_control_callbacks(
+                    session,
+                    failing,
+                    control,
+                    None,
+                    Some(&mut callback),
+                )
+                .expect_err("active decoder expansion/run must exceed its explicit buffer");
+            if retained_run || short_source {
+                assert!(format!("{error:#}").contains("budget"), "{error:#}");
+            } else {
+                assert!(
+                    error.is::<crate::byte_stream::ByteStreamBufferExceeded>(),
+                    "raw input delta must retain its typed budget error: {error:#}"
+                );
+            }
+            assert!(
+                forwards.load(Ordering::SeqCst) > 0,
+                "failure must follow real Native execution/KV advance"
+            );
+            assert!(
+                visible.is_empty(),
+                "failed transform must not publish a partial response"
+            );
+            let after = engine.native_session.as_mut().unwrap().snapshot_past()?;
+            assert_eq!(after.host_contents(), before.host_contents());
+            assert_eq!(after.cpu_kv_snapshot(), before.cpu_kv_snapshot());
+            assert_eq!(
+                engine.native_session.as_ref().unwrap().current_len(),
+                length
+            );
+            assert_eq!(engine.native_sessions[&session].tokens, tokens);
+            assert_eq!(engine.scheduler.running_count(), 0);
+            assert_eq!(
+                engine.resource_snapshot().host_ram.used,
+                host,
+                "failed active turn releases decoder workspace/snapshot leases"
+            );
+            let recovered = engine.generate_in_session(session, request.clone())?;
+            let mut fresh = Engine::from_dir(root.path(), config)?;
+            let fresh_session = fresh.create_session()?;
+            let expected = fresh.generate_in_session(fresh_session, request)?;
+            assert_eq!(recovered.token_ids, expected.token_ids);
+            assert_eq!(recovered.text, expected.text);
+            assert_eq!(recovered.text, "12345678");
+        }
+        Ok(())
     }
 }
