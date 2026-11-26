@@ -28,7 +28,7 @@ The principal remaining roadmap gaps are therefore custom contracts and
 production paths, not standard-op registration:
 
 - Mobius has no fused quantized-expert emitter for `com.microsoft::QMoE` or
-  `pkg.nxrt::BlockQuantizedMoE`, so existing runtime kernels are not exercised
+  `pkg.nxrt._private::BlockQuantizedMoE`, so existing runtime kernels are not exercised
   by exported GLM/DeepSeek graphs;
 - GLM IndexShare selected-token attention has no frozen private-op ABI;
 - CUDA CSA needs its device-resident Phase B;
@@ -48,7 +48,7 @@ the shared MLA + MoE path.
 These are random-weight structural bring-up results, not claims of semantic
 correctness for production weights. The emitted GLM/DeepSeek MoE remains a
 per-expert decomposition: Mobius emits `MatMulNBits`, not fused `QMoE` or
-`pkg.nxrt::BlockQuantizedMoE`. Consequently the existing CPU/CUDA QMoE kernel
+`pkg.nxrt._private::BlockQuantizedMoE`. Consequently the existing CPU/CUDA QMoE kernel
 and CPU BlockQuantizedMoE kernel have not yet been exercised E2E by these
 harnesses. The primary exporter gap is a Mobius fused-quantized-expert path
 with the required routing/layout contract. DeepSeek-V4 E2E remains blocked
@@ -136,7 +136,7 @@ weakening wrong-dtype rejection.
 
 | Boundary | Current status | Consequence |
 |---|---:|---|
-| Fused quantized experts (`com.microsoft::QMoE` / `pkg.nxrt::BlockQuantizedMoE`) | ◐ runtime kernels exist, exporter missing | CPU and CUDA QMoE kernels and the CPU BlockQuantizedMoE parity kernel are registered, but Mobius emits per-expert `MatMulNBits` for GLM/DeepSeek. A fused quantized-expert emitter and routing/layout validation are required for E2E coverage. |
+| Fused quantized experts (`com.microsoft::QMoE` / `pkg.nxrt._private::BlockQuantizedMoE`) | ◐ runtime kernels exist, exporter missing | CPU and CUDA QMoE kernels and the CPU BlockQuantizedMoE parity kernel are registered, but Mobius emits per-expert `MatMulNBits` for GLM/DeepSeek. A fused quantized-expert emitter and routing/layout validation are required for E2E coverage. |
 | GLM IndexShare selected-token attention | ❌ contract-blocked | Mobius #404's dense additive-mask fallback is a correctness oracle but scans full K/V. Op boundary, index order/sentinels, deterministic parity, and cache/mask semantics are unfrozen ([team decision](../../.squad/decisions.md#L916-L932)). |
 | CUDA `CompressedSparseAttention` | ◐ Phase A landed | Correct host-staged CUDA execution delegates to the CPU oracle. Device-resident compression, selection, sparse attention, state, capture, and rollback are Phase B; seven user decisions remain ([plan](../execution/CUDA_CSA_PHASE_B_PLAN.md#L22-L96)). |
 | CUDA `SparseKvGather` | ✅ native | Device byte-copy gather is registered; small index/valid-length tensors are host-read for deterministic range validation. This primitive does not itself define GLM IndexShare. |
@@ -181,7 +181,7 @@ Mobius must export the official recurrent state; correction-token
 ### P0 — unblock model contracts and end-to-end artifacts
 
 1. Add a Mobius fused quantized-expert emitter for GLM/DeepSeek, targeting
-   `com.microsoft::QMoE` and/or `pkg.nxrt::BlockQuantizedMoE`, and validate it
+   `com.microsoft::QMoE` and/or `pkg.nxrt._private::BlockQuantizedMoE`, and validate it
    E2E against the existing runtime kernels. Add a CUDA BlockQuantizedMoE path
    if that private ABI is selected for production.
 2. Freeze the GLM IndexShare selected-token operator ABI and parity rules, then

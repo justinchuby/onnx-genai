@@ -350,9 +350,23 @@ fn unfused_reference(graph: &Graph, banks: [ValueId; 2]) -> Graph {
 #[test]
 fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
     for t in [1, 4] {
-        let Fixture { graph, banks, .. } = fixture(t);
+        let Fixture {
+            mut graph, banks, ..
+        } = fixture(t);
         let mut reference = InferenceSession::from_graph(unfused_reference(&graph, banks)).unwrap();
-        let mut fused = InferenceSession::from_graph(graph).unwrap();
+        // Serialized ONNX uses names as SSA edges; the original in-memory
+        // fixture deliberately left its intermediate values anonymous.
+        let value_ids: Vec<_> = graph.values.iter().map(|(id, _)| id).collect();
+        for id in value_ids {
+            let value = graph.value_mut(id);
+            if value.name.is_none() {
+                value.name = Some(format!("moe_value_{}", id.0));
+            }
+        }
+        let source_bytes =
+            onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph)).unwrap();
+        let decoded = onnx_runtime_loader::load_model_bytes(&source_bytes).unwrap();
+        let mut fused = InferenceSession::from_graph(decoded).unwrap();
         assert_eq!(
             fused
                 .graph()
@@ -367,6 +381,41 @@ fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
             OP
         );
         assert!(fused.execution_provider_fallback_report().is_none());
+        assert_eq!(
+            fused.graph().opset_imports.get("pkg.nxrt._private"),
+            Some(&1)
+        );
+        let fused_bytes =
+            onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(fused.graph()))
+                .unwrap();
+        let mut reloaded = InferenceSession::from_graph(
+            onnx_runtime_loader::load_model_bytes(&fused_bytes).unwrap(),
+        )
+        .unwrap();
+        let target = fused.graph().node(
+            fused
+                .graph()
+                .value(fused.graph().outputs[0])
+                .producer
+                .unwrap(),
+        );
+        assert_eq!(target.domain, "pkg.nxrt._private");
+        assert_eq!(fused.graph().effective_opset(target), Some(1));
+        assert!(
+            fused
+                .graph()
+                .nodes
+                .values()
+                .all(|node| node.domain != "pkg.nxrt")
+        );
+        assert!(
+            reference
+                .graph()
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "GroupedMatMul")
+                .all(|n| n.is_default_domain() && reference.graph().effective_opset(n) == Some(29))
+        );
         assert_eq!(
             reference
                 .graph()
@@ -447,6 +496,21 @@ fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
             .map(|(name, tensor)| (*name, tensor))
             .collect();
         let got = fused.run(&inputs).unwrap();
+        let reloaded_output = reloaded.run(&inputs).unwrap();
+        let got_bits = got[0]
+            .to_vec_f32()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>();
+        let reloaded_bits = reloaded_output[0]
+            .to_vec_f32()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got_bits, reloaded_bits,
+            "private fused model must survive serialization and execute identically"
+        );
         let want = reference.run(&inputs).unwrap();
         assert_eq!(got[0].shape, [1, t, 16]);
         let got = got[0].to_vec_f32();

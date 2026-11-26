@@ -1,4 +1,4 @@
-//! `pkg.nxrt::KvCacheCapacityAppend`: the CUDA-graph-capture-safe replacement
+//! `pkg.nxrt._private::KvCacheCapacityAppend`: the CUDA-graph-capture-safe replacement
 //! for a decomposed-attention KV-cache-growth `Concat`.
 //!
 //! A plain `Concat(past, current) -> present` grows its declared shape and its

@@ -23,7 +23,7 @@
 //! file as written.)
 //!
 //! Coherence is checked at three levels: structural (no native-only
-//! `pkg.nxrt::*` op, has fused QMoE and MatMulNBits), a locked native
+//! `pkg.nxrt._private::*` op, has fused QMoE and MatMulNBits), a locked native
 //! CPU/CUDA anchor (regression), and stock-ORT-vs-native-CPU token agreement
 //! (proves the graph is executable and numerically consistent with no
 //! native-only op dependency at all -- mirroring
@@ -140,7 +140,7 @@ fn generate(engine: &mut Engine) -> anyhow::Result<Vec<u32>> {
     Ok(engine.generate(request)?.token_ids)
 }
 
-/// Structural gate: no native-only `pkg.nxrt::*` op may appear (this
+/// Structural gate: no native-only `pkg.nxrt._private::*` op may appear (this
 /// fixture's entire claim to stock-ORT executability depends on it), while
 /// routed experts must be fused into one `com.microsoft::QMoE` per MoE layer
 /// (mobius#550's export, not a per-expert dense loop), and attention must be
@@ -170,11 +170,11 @@ fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
         graph
             .nodes
             .values()
-            .filter(|node| node.domain == "pkg.nxrt")
+            .filter(|node| node.domain == "pkg.nxrt._private")
             .count(),
         0,
         "{} claims stock-ORT executability and must contain zero native-only \
-         pkg.nxrt::* nodes",
+         pkg.nxrt._private::* nodes",
         model.display(),
     );
     let qmoe_count = graph
@@ -280,7 +280,7 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
 /// family nodes). Every other model this native CUDA decoder previously
 /// supported (GLM-5.2 full-attention, GLM-5.2 IndexShare, DeepSeek-V2/V3-Lite)
 /// instead terminates its KV-consuming subgraph at a single kernel (a fused
-/// `Attention` op, or the native `pkg.nxrt::IndexShare` op) that has its own
+/// `Attention` op, or the native `pkg.nxrt._private::IndexShare` op) that has its own
 /// internal logic for reconciling a physically-wider capacity KV buffer
 /// against the logical valid length. DeepSeek-V4's decomposed graph has no
 /// such kernel: `present.0.key` is a plain `Concat` output consumed further
@@ -357,7 +357,7 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
 /// `Add(score, mask)` chain and a new forward V-role `Softmax` -> `MatMul`
 /// walk) and, only when the active EP's `supports_op` actually accepts the
 /// new op (a per-candidate capability gate, not a model/op-name allowlist),
-/// replaces it in place with `pkg.nxrt::KvCacheCapacityAppend`. That op's CUDA
+/// replaces it in place with `pkg.nxrt._private::KvCacheCapacityAppend`. That op's CUDA
 /// kernel (`onnx-runtime-ep-cuda/src/kernels/kv_cache_capacity_append.rs`)
 /// resolves the one legitimately step-varying quantity -- the destination
 /// row -- from `position_ids`'s *device memory contents* at execute time,
@@ -367,7 +367,7 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
 /// replay-safe as the logical length grows. `geometry.rs::kernel_input_uses_
 /// physical_capacity` was extended with a matching arm so the capture-
 /// eligibility predicate itself recognizes the rewritten op the same way it
-/// already recognized `Attention`/`GroupQueryAttention`/`pkg.nxrt::IndexShare`.
+/// already recognized `Attention`/`GroupQueryAttention`/`pkg.nxrt._private::IndexShare`.
 /// No DeepSeek-specific branch exists anywhere in this path: CPU (which has
 /// no such kernel) leaves the `Concat` untouched and remains exactly as
 /// eager as before.
@@ -426,13 +426,13 @@ fn deepseek_v4_tiny_native_cuda_matches_cpu() -> anyhow::Result<()> {
     // decomposed KV-cache growth capture-eligible: see the doc comment above.
     // A regression back to `captures == 0` would mean either the rewrite no
     // longer fires (e.g. the CUDA EP stopped advertising
-    // `pkg.nxrt::KvCacheCapacityAppend` support) or the capture-eligibility
+    // `pkg.nxrt._private::KvCacheCapacityAppend` support) or the capture-eligibility
     // predicate stopped recognizing the rewritten op.
     assert!(
         stats.graph.captures > 0,
         "expected whole-step CUDA graph capture to succeed for this fixture now that \
          S3 capacity emission rewrites its KV-cache-growth Concat into \
-         pkg.nxrt::KvCacheCapacityAppend, got captures={} decline_reason={:?}",
+         pkg.nxrt._private::KvCacheCapacityAppend, got captures={} decline_reason={:?}",
         stats.graph.captures,
         stats.graph.decline_reason
     );

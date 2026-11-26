@@ -99,7 +99,7 @@ pub(crate) fn resolve_decode_backend(
                 #[cfg(not(feature = "native-backend"))]
                 {
                     anyhow::bail!(
-                        "model contains native-only operators (pkg.nxrt::BlockQuantizedMatMul); \
+                        "model contains native-only operators (pkg.nxrt._private::BlockQuantizedMatMul); \
                          rebuild the CLI with --features native-backend (or --features \
                          native-cuda for the native CUDA EP) and select \
                          decode_backend = EngineDecodeBackend::Native \
@@ -197,7 +197,7 @@ pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result
 pub(crate) fn model_proto_requires_native_backend(
     model: &onnx_runtime_loader::proto::ModelProto,
 ) -> bool {
-    const DOMAIN: &str = "pkg.nxrt";
+    const DOMAIN: &str = "pkg.nxrt._private";
     const OP_TYPE: &str = "BlockQuantizedMatMul";
     const OPSET_VERSION: i64 = 1;
 

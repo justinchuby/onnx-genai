@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity tests for `pkg.nxrt::SparseKvGather` v1.
+//! GPU parity tests for `pkg.nxrt._private::SparseKvGather` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
 //! API, runs it through the CUDA EP, and compares the device output against the
@@ -32,7 +32,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct HostTensor {

@@ -200,7 +200,7 @@ fn capability_parity_unsupported_ops() {
     let test_cases: &[(&str, &str)] = &[
         ("FakeOp", ""),
         ("MatMul", "com.nonexistent"),
-        ("CustomThing", "pkg.nxrt"),
+        ("CustomThing", "pkg.nxrt._private"),
     ];
 
     for &(op_type, domain) in test_cases {

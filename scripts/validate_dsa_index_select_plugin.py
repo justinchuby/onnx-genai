@@ -1,4 +1,4 @@
-"""Real ORT CUDA-plugin Compute validation for pkg.nxrt::DsaIndexSelect v1.
+"""Real ORT CUDA-plugin Compute validation for pkg.nxrt._private::DsaIndexSelect v1.
 
 Owned-workspace graph replay and physical retirement are Rust GPU fixtures;
 Compute cannot manufacture a capture owner from its borrowed workspace view.
@@ -59,7 +59,7 @@ def model_bytes(
         "DsaIndexSelect",
         ["query", "key", "weights", "attention_bias"],
         ["selected_indices"],
-        domain="pkg.nxrt",
+        domain="pkg.nxrt._private",
         top_k=top_k,
         scale=scale,
         weights_scale=weights_scale,
@@ -74,7 +74,7 @@ def model_bytes(
         graph,
         opset_imports=[
             helper.make_opsetid("", 20),
-            helper.make_opsetid("pkg.nxrt", version),
+            helper.make_opsetid("pkg.nxrt._private", version),
         ],
     )
     model.ir_version = 11

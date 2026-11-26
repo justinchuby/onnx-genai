@@ -1162,12 +1162,12 @@ mod tests {
         assert!(!model_proto_requires_native_backend(&model));
 
         model.graph.as_mut().unwrap().node.push(NodeProto {
-            domain: "pkg.nxrt".to_string(),
+            domain: "pkg.nxrt._private".to_string(),
             op_type: "BlockQuantizedMatMul".to_string(),
             ..NodeProto::default()
         });
         model.opset_import.push(OperatorSetIdProto {
-            domain: "pkg.nxrt".to_string(),
+            domain: "pkg.nxrt._private".to_string(),
             version: 1,
         });
         assert!(model_proto_requires_native_backend(&model));
@@ -1175,7 +1175,7 @@ mod tests {
         model.graph.as_mut().unwrap().node[0].domain = "example.wrong.domain".to_string();
         assert!(!model_proto_requires_native_backend(&model));
 
-        model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt".to_string();
+        model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt._private".to_string();
         model.opset_import[0].version = 2;
         assert!(!model_proto_requires_native_backend(&model));
     }
