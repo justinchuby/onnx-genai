@@ -921,6 +921,8 @@ pub struct EngineConfig {
     pub kv_connector: KvConnectorConfig,
     /// Vendor-neutral hot, warm, and cold resource ceilings (DESIGN §26.11).
     pub limits: ResourceLimits,
+    /// Finite raw/resident PCM policy, intersected with live host headroom before audio decoding.
+    pub audio_decode_limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
     /// Permit programmatic resource-limit changes after engine initialization.
     pub allow_runtime_override: bool,
     /// Static device/host weight placement policy.
@@ -961,6 +963,8 @@ impl Default for EngineConfig {
             kv_cache_dtype: KvDType::F32,
             kv_connector: KvConnectorConfig::default(),
             limits: ResourceLimits::default(),
+            audio_decode_limits:
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
             allow_runtime_override: false,
             device_policy: DevicePolicy::Auto,
             // One encoder output for a handful of attachments. Big enough that
@@ -1817,6 +1821,9 @@ impl GrammarActivation {
 /// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
+    /// Generate one canonical JSON-valued Atem XML call. The grammar describes
+    /// its logical tagged-JSON projection, with standalone parameter schemas.
+    XmlToolCall { grammar: String, prefix: String },
     /// llama.cpp GBNF over the raw newly generated stream, including channel
     /// markers and model-token references. Assistant prefill is not consumed.
     Gbnf {

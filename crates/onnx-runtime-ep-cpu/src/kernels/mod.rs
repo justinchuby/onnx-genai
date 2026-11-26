@@ -679,6 +679,7 @@ mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
 pub mod hardmax;
+mod host_rows;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
@@ -1179,7 +1180,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::AffineFactory),
     );
     rec.register(
@@ -1188,7 +1189,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::PackedFactory),
     );
     rec.register(
@@ -1209,7 +1210,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     }
     rec.register(
         OpKey::new("GroupedMatMul", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::Factory),
     );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
@@ -2629,6 +2630,88 @@ pub(crate) mod testutil {
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 
+    /// Dense fixed-width fixture materialized with padded, reversed or packed
+    /// origins. Input shapes are positive and source bytes are canonical dense.
+    pub(crate) struct Repacked {
+        backing: Vec<u128>,
+        shape: Vec<usize>,
+        strides: Vec<i64>,
+        base: usize,
+        offset: usize,
+        dtype: DataType,
+    }
+    impl Repacked {
+        pub(crate) fn new(source: &Owned, mode: usize) -> Self {
+            let shape = source.shape.clone();
+            let width = source.dtype.byte_size();
+            let mut strides = compute_contiguous_strides(&shape)
+                .expect("fixture shape has representable contiguous strides");
+            if matches!(mode, 1..=3 | 5) {
+                let mut step = if mode == 2 { 2 } else { 1 };
+                for (axis, &dim) in shape.iter().enumerate().rev() {
+                    strides[axis] = step;
+                    step = step * dim as i64 + 3;
+                }
+            }
+            let extent = shape
+                .iter()
+                .zip(&strides)
+                .map(|(&d, &s)| (d - 1) * s as usize)
+                .sum::<usize>();
+            let offset = if mode == 3 {
+                extent * width
+            } else if mode == 5 {
+                (shape[0] - 1) * strides[0] as usize * width
+            } else {
+                0
+            };
+            if mode == 3 {
+                strides.iter_mut().for_each(|s| *s = -*s);
+            }
+            if mode == 5 {
+                strides[0] = -strides[0];
+            }
+            let base = usize::from(mode == 4);
+            let len = (extent + 1) * width + base;
+            let mut backing = vec![0xccccccccccccccccccccccccccccccccu128; len.div_ceil(16)];
+            let storage = unsafe {
+                std::slice::from_raw_parts_mut(
+                    backing.as_mut_ptr().cast::<u8>(),
+                    backing.len() * 16,
+                )
+            };
+            for (logical, value) in source.bytes.chunks_exact(width).enumerate() {
+                let mut n = logical;
+                let mut at = (offset + base) as i64;
+                for (axis, &dim) in shape.iter().enumerate().rev() {
+                    let coordinate = n % dim;
+                    n /= dim;
+                    at += coordinate as i64 * strides[axis] * width as i64;
+                }
+                let at = at as usize;
+                storage[at..at + width].copy_from_slice(value);
+            }
+            Self {
+                backing,
+                shape,
+                strides,
+                base,
+                offset,
+                dtype: source.dtype,
+            }
+        }
+        pub(crate) fn view(&self) -> TensorView<'_> {
+            TensorView::new(
+                DevicePtr(unsafe { self.backing.as_ptr().cast::<u8>().add(self.base).cast() }),
+                self.dtype,
+                &self.shape,
+                &self.strides,
+                DeviceId::cpu(),
+            )
+            .with_byte_offset(self.offset)
+        }
+    }
+
     pub trait PreparedTestKernel: onnx_runtime_ep_api::Kernel {
         fn execute_prepared(
             &self,
@@ -2810,7 +2893,8 @@ pub(crate) mod testutil {
 
     impl Owned {
         pub fn f32(shape: &[usize], data: &[f32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 4);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2824,7 +2908,8 @@ pub(crate) mod testutil {
         }
 
         pub fn f64(shape: &[usize], data: &[f64]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 8);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2838,7 +2923,8 @@ pub(crate) mod testutil {
         }
 
         pub fn i64(shape: &[usize], data: &[i64]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 8);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2852,7 +2938,8 @@ pub(crate) mod testutil {
         }
 
         pub fn i32(shape: &[usize], data: &[i32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 4);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2867,7 +2954,8 @@ pub(crate) mod testutil {
 
         /// An f16 buffer built by rounding `data` (given in f32) to half.
         pub fn f16(shape: &[usize], data: &[f32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 2);
             for &v in data {
                 bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
@@ -2883,7 +2971,8 @@ pub(crate) mod testutil {
         /// An f16 buffer built from raw 16-bit patterns (for adversarial
         /// NaN/inf/denormal cases that must survive without f32-reinterpret).
         pub fn f16_bits(shape: &[usize], bits: &[u16]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(bits.len() * 2);
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
@@ -2898,7 +2987,8 @@ pub(crate) mod testutil {
 
         /// A bf16 buffer built by rounding `data` (given in f32) to bfloat16.
         pub fn bf16(shape: &[usize], data: &[f32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 2);
             for &v in data {
                 bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
@@ -2913,7 +3003,8 @@ pub(crate) mod testutil {
 
         /// A bf16 buffer built from raw 16-bit patterns.
         pub fn bf16_bits(shape: &[usize], bits: &[u16]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(bits.len() * 2);
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
@@ -2928,7 +3019,8 @@ pub(crate) mod testutil {
 
         /// A u8 buffer.
         pub fn u8(shape: &[usize], data: &[u8]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             Self {
                 bytes: data.to_vec(),
                 shape: shape.to_vec(),
@@ -2938,7 +3030,8 @@ pub(crate) mod testutil {
         }
 
         pub fn bool_(shape: &[usize], data: &[bool]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let bytes = data.iter().map(|&b| b as u8).collect();
             Self {
                 bytes,
@@ -2957,7 +3050,8 @@ pub(crate) mod testutil {
         /// A zero-filled output buffer of `shape` with element type `dtype`.
         pub fn zeros(dtype: DataType, shape: &[usize]) -> Self {
             let n: usize = shape.iter().product();
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let esize = dtype.byte_size();
             Self {
                 bytes: vec![0u8; n * esize],

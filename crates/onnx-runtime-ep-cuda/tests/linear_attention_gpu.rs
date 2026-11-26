@@ -706,11 +706,17 @@ fn opset27_recurrent_and_range_release_ab() {
                 .collect();
             let in_strides: Vec<_> = shapes
                 .iter()
-                .map(|s| compute_contiguous_strides(s))
+                .map(|s| {
+                    compute_contiguous_strides(s)
+                        .expect("fixture shape has representable contiguous strides")
+                })
                 .collect();
             let out_strides: Vec<_> = outputs
                 .iter()
-                .map(|(_, s)| compute_contiguous_strides(s))
+                .map(|(_, s)| {
+                    compute_contiguous_strides(s)
+                        .expect("fixture shape has representable contiguous strides")
+                })
                 .collect();
             let input_views: Vec<_> = inputs
                 .iter()
@@ -1109,7 +1115,10 @@ fn capture_recurrent_state_with_workspace(d_k: usize) {
     let mut eager_inputs = upload_inputs();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let captured_views = inputs
         .iter()
@@ -1141,7 +1150,10 @@ fn capture_recurrent_state_with_workspace(d_k: usize) {
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let output_bytes = outputs[0].0.storage_bytes(outputs[0].1.iter().product());
     let state_bytes = inputs[3].bytes.len();

@@ -2510,7 +2510,7 @@ impl CompressedSparseAttentionKernel {
         let host_input_strides = host_input_shapes
             .iter()
             .map(|shape| compute_contiguous_strides(shape))
-            .collect::<Vec<_>>();
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         // Build dense host-resident input views. `DevicePtr` is a raw pointer,
         // so these views borrow nothing from `staged` at the type level;
         // `staged` remains alive until the oracle returns.
@@ -2541,7 +2541,7 @@ impl CompressedSparseAttentionKernel {
         let out_strides: Vec<Vec<i64>> = out_shapes
             .iter()
             .map(|shape| compute_contiguous_strides(shape))
-            .collect();
+            .collect::<std::result::Result<_, _>>()?;
         let mut out_bufs: Vec<Vec<u8>> = outputs.iter().map(|o| vec![0u8; o.byte_size()]).collect();
 
         let mut host_outputs: Vec<TensorMut> = out_bufs

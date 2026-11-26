@@ -37,8 +37,18 @@ fn window_boundary_matches_actual_multi_resample_execution_at_different_source_r
         let mut observed = 0;
         for samples in 1..80 {
             let bytes = encode_wav_pcm16(&vec![0.25; samples], rate, 1).unwrap();
-            let actual = bounded.run(&[&bytes]).unwrap();
-            let untrimmed = reference.run(&[&bytes]).unwrap();
+            let actual = bounded
+                .run(
+                    &[&bytes],
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                )
+                .unwrap();
+            let untrimmed = reference
+                .run(
+                    &[&bytes],
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                )
+                .unwrap();
             let fits = actual[0].data == untrimmed[0].data;
             if fits {
                 observed = samples;
@@ -87,7 +97,12 @@ fn windows_before_resampling_bind_source_samples_and_padding_is_not_real_audio()
     assert_eq!(p.maximum_input_samples(16000).unwrap().unwrap().get(), 12);
     assert_eq!(p.maximum_input_samples(8000).unwrap().unwrap().get(), 12);
     let bytes = encode_wav_pcm16(&[0.25; 12], 8000, 1).unwrap();
-    let actual = p.run(&[&bytes]).unwrap();
+    let actual = p
+        .run(
+            &[&bytes],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     let AudioTensorData::Fp32(samples) = &actual[0].data else {
         panic!("float waveform")
     };
@@ -159,7 +174,12 @@ fn fixed_feature_windows_follow_configured_hops_without_a_special_frame_count() 
             );
             for (count, fits) in [(maximum, true), (maximum + 1, false)] {
                 let bytes = encode_wav_pcm16(&vec![0.5; count], source_rate, 1).unwrap();
-                let actual = counter.run(&[&bytes]).unwrap();
+                let actual = counter
+                    .run(
+                        &[&bytes],
+                        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                    )
+                    .unwrap();
                 let AudioTensorData::Int64(samples) = &actual[0].data else {
                     panic!("sample count")
                 };

@@ -326,12 +326,18 @@ fn run_decode(
     let scalar_shape: [usize; 0] = [];
     let output_shape = query_shape;
 
-    let query_strides = compute_contiguous_strides(&query_shape);
-    let current_strides = compute_contiguous_strides(&current_shape);
-    let cache_strides = compute_contiguous_strides(&cache_shape);
-    let seqlens_strides = compute_contiguous_strides(&seqlens_shape);
-    let scalar_strides = compute_contiguous_strides(&scalar_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let query_strides = compute_contiguous_strides(&query_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let current_strides = compute_contiguous_strides(&current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let seqlens_strides = compute_contiguous_strides(&seqlens_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let scalar_strides = compute_contiguous_strides(&scalar_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let mut output_buffer = ep
         .allocate(QUERY_HEADS * HEAD_DIM * ELEM, 256)

@@ -1521,7 +1521,7 @@ impl EinsumKernel {
             .iter()
             .zip(mappings)
             .map(|(layout, mapping)| {
-                let dense_strides = compute_contiguous_strides(&layout.shape);
+                let dense_strides = compute_contiguous_strides(&layout.shape)?;
                 let mut strides = vec![0usize; iteration_axes.len()];
                 for (unique_axis, &iteration_axis) in mapping.iter().enumerate() {
                     let iter_extent = iteration_shape[iteration_axis];
@@ -2139,7 +2139,7 @@ fn prepare_tree_accessor<T: EinsumElement>(
             TreeReadSource::Accumulator(ReadPtr(value.data.as_ptr())),
             &value.axes,
             &value.shape,
-            compute_contiguous_strides(&value.shape)
+            compute_contiguous_strides(&value.shape)?
                 .into_iter()
                 .map(i128::from)
                 .collect(),
@@ -2346,7 +2346,7 @@ fn write_tree_output<T: EinsumElement>(
     if requested_len == 0 {
         return Ok(());
     }
-    let canonical_strides = compute_contiguous_strides(&final_value.shape);
+    let canonical_strides = compute_contiguous_strides(&final_value.shape)?;
     let mut requested_index = vec![0usize; requested_shape.len()];
     let output_origin = output.data_ptr_mut::<T>();
     for linear in 0..requested_len {

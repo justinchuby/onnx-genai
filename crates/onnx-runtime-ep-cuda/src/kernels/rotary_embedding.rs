@@ -681,9 +681,11 @@ mod tests {
 
     fn run_bf16_rope(ep: &CudaExecutionProvider, interleaved: bool) -> (Vec<bf16>, Vec<bf16>) {
         let shape = [2, 2, 3, 7];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let cache_shape = [shape[0] * shape[2], 3];
-        let cache_strides = compute_contiguous_strides(&cache_shape);
+        let cache_strides = compute_contiguous_strides(&cache_shape)
+            .expect("fixture shape has representable contiguous strides");
         let input = (0..shape.iter().product())
             .map(|index| bf16::from_f32(((index * 17 % 97) as f32 - 48.0) / 23.0))
             .collect::<Vec<_>>();

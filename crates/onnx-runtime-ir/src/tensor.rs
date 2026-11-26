@@ -145,10 +145,18 @@ impl TensorData {
     }
 }
 
-/// Number of elements in `dims`, or `None` when their product overflows.
+/// Number of elements, or `None` if a nonempty shape exceeds `usize`.
+/// Any zero extent makes the count zero, even after an overflowing prefix.
 pub fn checked_numel(dims: &[usize]) -> Option<usize> {
-    dims.iter()
-        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+    let mut product = Some(1usize);
+    for &dimension in dims {
+        if dimension == 0 {
+            return Some(0);
+        }
+        // Keep scanning after overflow: a later zero still makes this empty.
+        product = product.and_then(|n| n.checked_mul(dimension));
+    }
+    product
 }
 
 /// Dense storage size for `dtype` and `dims`, or `None` on geometry overflow.

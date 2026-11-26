@@ -3,6 +3,9 @@
 The [generated endpoint registration matrix](LLAMA_CPP_ENDPOINT_MATRIX.md) inventories
 all 55 static upstream method/path contracts, including aliases and conditional routes.
 Its route-presence results are separate from the behavioral evidence below.
+The [behavioral acceptance matrix](LLAMA_CPP_BEHAVIOR_MATRIX.md) links concrete
+test assertions and preserves unfinished requirements. Source links are distinct
+from revision-bound runtime receipts and full upstream parity.
 
 Native execution is enabled and selected by default in the engine, facade, CLI
 and server. ORT is an explicitly selected reference backend for tests and
@@ -602,8 +605,9 @@ completion, so a later request cannot change an earlier response's count.
 The count comes from the materialized cursor, not prompt-plus-output token
 arithmetic: the final sampled token may not yet have been consumed by a forward.
 OpenAI cached-prompt usage continues to report input reuse separately.
-Native multimodal prompt objects and infill extra files still require further
-engine support. Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
+Native multimodal prompt objects still require further engine support.
+`/infill` extra file context is supported for packages declaring the explicit
+`package.infill` control roles and extra-context template (schema v1.18). Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
 remain zero. Token-counting routes use the same prompt renderer and declared media expansion
 as generation. They validate attachments and tool capability without executing a
 generation. Anthropic streaming receives
@@ -665,9 +669,9 @@ including actual native image preprocessing and model-owned token usage. See
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream capabilities remain incomplete:
 
-- Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  broader pressure/overlap acceptance and
-  device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
+- Broader realtime pressure/overlap and device-backed wire acceptance;
+  declared turn-based/duplex tagged-json forcing and canonical named-parameter
+  XML forcing are implemented; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
   joint/packed decision heads and shared generation/decision entry points.
@@ -710,7 +714,11 @@ The former tool/MCP/proxy CLI options and library configuration types are remove
 The supplied model tool protocols require object arguments. Forced tool grammars
 and realtime parameter admission share that domain restriction even for `true`,
 empty, omitted/null or union parameter schemas. Existing schema conditions and
-root reference locations are retained; contradictory schemas are not relaxed.
+root reference locations are retained; contradictory schemas are not relaxed. Forced
+JSON calls compile parameter documents independently, preserving their standalone
+root URI, dialect, pointers and anchors. Per-tool registries remain separate,
+including tools reusing the same `$id`. References do not fetch external
+resources. This remains the grammar backend's supported schema language.
 
 Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
 assistant `tool_calls` (including streaming deltas), execute those calls in their
@@ -924,14 +932,26 @@ logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
 
 Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
-and Hann-window lengths through the executable log-mel program. Numerical
-acceptance includes an independent direct DFT and Native workflows using
-nonstandard geometry. Feature-tensor serving also executes the model-authored
-audio program, with explicit named output binding and runtime shape checks;
-rank-3 shapes never select a hidden default analysis recipe. Pure-waveform normalization, named transform dataflow and validity publication
-execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
-DSP operations, window/mel conventions and codecs remain open; this does not imply
-full audio parity.
+and Hann-window lengths through the executable log-mel program. Standalone
+spectrograms additionally admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Numerical acceptance includes an independent
+direct DFT and Native workflows using nonstandard geometry. Feature-tensor
+serving also executes the model-authored audio program, with explicit named
+output binding and runtime shape checks; rank-3 shapes never select a hidden
+default analysis recipe. Pure-waveform normalization, named transform dataflow
+and validity publication execute as described in
+[audio preprocessing](AUDIO_PREPROCESSING.md).
+
+Content-probed encoded audio includes bounded Ogg Opus with canonical channel
+routing and one raw-clock owner for pre-skip/final-granule trimming. CLI file/stdin
+transcription and feature-bound `generate --audio` propagate configured finite PCM
+policies. Engine-backed admission intersects them with a live host-ledger
+snapshot; this is not a PCM memory lease or an atomic concurrent-memory guarantee.
+WebM/MP4 Opus, cropped/nonzero-origin Ogg and code 3 packets with 32–48 frames
+remain explicitly unsupported; see the full
+[encoded-audio contract](AUDIO_PREPROCESSING.md#encoded-audio-formats) for all
+capability and resource limits. Additional DSP operations, window/mel conventions
+and codecs remain open; this does not imply full audio parity.
 
 File transcription now executes declared one-pass CTC/greedy acoustic workflows
 as well as the existing generative speech path. Both aliases expose typed
@@ -948,3 +968,34 @@ serving accepts waveform outputs without a mel shape. See [transcription](TRANSC
 
 Encoded audio support and decoder limitations are documented in
 [audio preprocessing](AUDIO_PREPROCESSING.md#encoded-audio-formats).
+
+## Infill file context
+
+`/infill` accepts `input_extra: [{"filename":"helpers.rs","text":"..."}]`
+when the package declares `package.infill.extra_context_template`. File order,
+filenames and text are passed to this bounded model-authored Jinja template as
+`input_extra`; its output precedes the FIM control envelope. A filename is a
+caller-owned label: the server never opens or resolves that name. No repository
+or file separator token is inferred. Without a declared template, an absent/empty
+list leaves ordinary FIM prompts unchanged. A declared template also renders the
+empty list. A nonempty list without a template fails before streaming.
+
+The package explicitly declares `prefix_token`, `middle_token`, `suffix_token`
+and `order` (`psm` or `spm`); each spelling must resolve to one registered model
+token. The declaration takes precedence over the existing tokenizer-only FIM
+detection. Request file count, filename bytes, total filename/text UTF-8 bytes,
+template output bytes and interpreter operations have configurable server
+bounds (`ServerConfig.max_infill_*`). Token count, context admission, prefill-only and actual
+FIM execution share the same prepared token IDs, including BOS/EOS handling and
+the extra context. Existing FIM sampling and ending-role behavior is retained.
+
+The file-context wire shape follows the pinned llama.cpp implementation: `text`
+is required and may be empty; `filename` is optional (default `tmp`) and may
+be empty. Additional object fields are ignored. Supplied filenames must remain
+within the configured byte limit. See the [upstream request checks](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L5394-L5411)
+and [filename default](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L1904-L1905).
+
+`extra_context_template` serializes the native `/infill` file-context list,
+including an empty list. OpenAI completion `suffix` and engine FIM convenience
+methods use the declared control roles without this wire-specific template.
+Prepared-token FIM execution can carry the already rendered context.

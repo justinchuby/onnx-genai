@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.18",
+  "package": {
+    "infill": {
+      "prefix_token": "<P>",
+      "middle_token": "<M>",
+      "suffix_token": "<S>",
+      "order": "spm",
+      "additional_stop_tokens": ["<END>"],
+      "extra_context_template": "{% for file in input_extra %}{{file.filename}}:{{file.text}}{% endfor %}"
+    }
+  }
+}

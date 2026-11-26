@@ -2570,6 +2570,7 @@ mod tests {
         padded[2] = 4;
         let shape = [E, H, 1, 17];
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides")
             .into_iter()
             .map(|stride| stride * 2)
             .collect::<Vec<_>>();

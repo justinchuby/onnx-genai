@@ -816,10 +816,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         let src_ptr = src.as_ptr() as *const u8;
         let dst_ptr = dst.as_mut_ptr() as *mut u8;
         // SAFETY: both pointers are valid host allocations of at least `size`
-        // bytes (checked above). They name distinct `DeviceBuffer`s — `dst` is
-        // borrowed `&mut`, so it cannot alias `src` — hence non-overlapping.
+        // bytes (checked above). Borrowed buffer descriptors may name the same
+        // backing or shifted ranges; their Rust borrows do not prove raw-range
+        // disjointness. memmove semantics preserve the source under overlap.
         unsafe {
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+            std::ptr::copy(src_ptr, dst_ptr, size);
         }
         Ok(())
     }
@@ -2409,5 +2410,34 @@ mod tests {
         );
         unknown.domain = "com.microsoft".to_string();
         assert!(!ep.supports_op(&unknown, 1, &[], &[], &[]).is_supported());
+    }
+    #[test]
+    fn copy_handles_identical_and_shifted_borrowed_buffer_ranges() {
+        let ep = CpuExecutionProvider::new();
+        for destination in [0usize, 4, 8] {
+            let mut backing = (0..24).map(|v| v as u8).collect::<Vec<_>>();
+            let mut expected = backing.clone();
+            expected.copy_within(4..12, destination);
+            let pointer = backing.as_mut_ptr();
+            // SAFETY: backing stays live; only the destination handle writes,
+            // and no owner access races the synchronous copy. Borrowed handles
+            // never free the allocation and raw ranges may overlap.
+            let (src, mut dst) = unsafe {
+                (
+                    DeviceBuffer::from_borrowed_parts(pointer.add(4).cast(), ep.device_id(), 8, 1),
+                    DeviceBuffer::from_borrowed_mut_parts(
+                        pointer.add(destination).cast(),
+                        ep.device_id(),
+                        8,
+                        1,
+                    )
+                    .unwrap(),
+                )
+            };
+            ep.copy(&src, &mut dst, 8).unwrap();
+            ep.deallocate(src).unwrap();
+            ep.deallocate(dst).unwrap();
+            assert_eq!(backing, expected);
+        }
     }
 }

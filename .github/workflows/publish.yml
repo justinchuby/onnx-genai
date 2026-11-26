@@ -205,6 +205,7 @@ jobs:
           publish_crate onnx-runtime-protocol-trace
           publish_crate onnx-genai-scheduler
           publish_crate onnx-genai-ort
+          publish_crate onnx-genai-llguidance
           publish_crate onnx-genai-engine
           publish_crate onnx-genai
           publish_crate onnx-genai-server
