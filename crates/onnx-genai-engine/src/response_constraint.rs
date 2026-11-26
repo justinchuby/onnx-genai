@@ -829,6 +829,7 @@ impl Constraint for ContentConstraint {
         match self.normalization {
             Normalization::Json => "json_constraint",
             Normalization::Literal => "response_grammar_constraint",
+            Normalization::CanonicalXml => "xml_tool_constraint",
         }
     }
 }
