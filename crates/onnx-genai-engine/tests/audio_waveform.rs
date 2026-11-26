@@ -95,7 +95,7 @@ fn native_ogg_opus_presentation_survives_authored_decode_resample_and_head() {
         .unwrap()
     {
         if transform["op"] == "pad" {
-            transform["op"] = serde_json::json!("fixed_window");
+            transform["mode"] = serde_json::json!("fixed_window");
         }
     }
     for output in metadata["preprocessing"]["audio"]["outputs"]
