@@ -242,9 +242,11 @@ impl RealtimeSession<'_> {
                     crate::text_projection::ProjectionKind::Plain,
                     prefix,
                     options.max_constraint_bytes,
-                    endings.clone(),
-                    &options.effective_preserved_tokens(),
-                    decoder.clone(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings.clone(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )
             };
             let json = |schema: &serde_json::Value, prefix: &str| {
@@ -254,9 +256,11 @@ impl RealtimeSession<'_> {
                     crate::text_projection::ProjectionKind::Plain,
                     prefix,
                     options.max_constraint_bytes,
-                    endings.clone(),
-                    &options.effective_preserved_tokens(),
-                    decoder.clone(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings.clone(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )
             };
             let logical = match options.constraint.as_ref() {
@@ -267,9 +271,11 @@ impl RealtimeSession<'_> {
                         crate::text_projection::ProjectionKind::Plain,
                         prefix,
                         options.max_constraint_bytes,
-                        endings.clone(),
-                        &options.effective_preserved_tokens(),
-                        decoder.clone(),
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings.clone(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
                     )?,
                 ),
                 Some(crate::GenerateConstraint::Regex { pattern, prefix }) => Some(text(

@@ -235,7 +235,7 @@ impl serde::ser::SerializeStruct for &mut PatternProbe {
         Ok(())
     }
 }
-impl<'a> serde::Serializer for &'a mut PatternProbe {
+impl serde::Serializer for &mut PatternProbe {
     type Ok = ();
     type Error = ProbeError;
     type SerializeSeq = serde::ser::Impossible<(), ProbeError>;

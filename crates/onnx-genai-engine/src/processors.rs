@@ -194,9 +194,11 @@ pub(crate) fn build_processor_chain(
                     kind(),
                     &prefix(plain),
                     max_bytes,
-                    endings(),
-                    &options.effective_preserved_tokens(),
-                    decoder.clone(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )?)
             }
             GenerateConstraint::JsonSchema {
@@ -211,9 +213,11 @@ pub(crate) fn build_processor_chain(
                     kind(),
                     &prefix(plain),
                     max_bytes,
-                    endings(),
-                    &options.effective_preserved_tokens(),
-                    decoder.clone(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )?)
             }
             GenerateConstraint::Regex {
@@ -230,9 +234,11 @@ pub(crate) fn build_processor_chain(
                         kind(),
                         &prefix(plain),
                         max_bytes,
-                        endings(),
-                        &options.effective_preserved_tokens(),
-                        decoder.clone(),
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
                     )?)
                 } else {
                     build_llguidance_constraint(
@@ -270,9 +276,11 @@ pub(crate) fn build_processor_chain(
                         kind,
                         prefix,
                         max_bytes,
-                        endings(),
-                        &options.effective_preserved_tokens(),
-                        decoder.clone(),
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
                     )?,
                 )
             }
@@ -290,9 +298,11 @@ pub(crate) fn build_processor_chain(
                         kind(),
                         &prefix(plain),
                         max_bytes,
-                        endings(),
-                        &options.effective_preserved_tokens(),
-                        decoder.clone(),
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
                     )?)
                 } else {
                     build_llguidance_constraint(

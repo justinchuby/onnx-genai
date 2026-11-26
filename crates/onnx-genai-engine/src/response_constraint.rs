@@ -146,11 +146,28 @@ struct State {
     ended: bool,
 }
 
-struct ConstraintTokens {
-    raw: Option<ByteStreamContract>,
-    decoded: Option<Arc<ByteStreamContract>>,
-    endings: Vec<TokenId>,
-    preserved: std::collections::BTreeSet<u32>,
+/// Token endings, preserved specials and the prepared decoded vocabulary are
+/// one resolved set of facts. Raw grammar cannot also carry decoded transforms.
+pub(crate) enum ConstraintTokens {
+    Raw(ByteStreamContract),
+    Decoded {
+        contract: Option<Arc<ByteStreamContract>>,
+        endings: Vec<TokenId>,
+        preserved: std::collections::BTreeSet<u32>,
+    },
+}
+impl ConstraintTokens {
+    pub(crate) fn decoded(
+        endings: Vec<TokenId>,
+        preserved: &std::collections::BTreeSet<u32>,
+        contract: Option<Arc<ByteStreamContract>>,
+    ) -> Self {
+        Self::Decoded {
+            contract,
+            endings,
+            preserved: preserved.clone(),
+        }
+    }
 }
 
 pub(crate) struct ContentConstraint {
@@ -173,9 +190,7 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
-        decoded: Option<Arc<ByteStreamContract>>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         Self::new(
             tokenizer,
@@ -184,12 +199,7 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                raw: None,
-                decoded,
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
     pub(crate) fn raw_json_schema(
@@ -205,12 +215,7 @@ impl ContentConstraint {
             ProjectionKind::Plain,
             "",
             max_bytes,
-            ConstraintTokens {
-                raw: Some(contract.into_raw()),
-                decoded: None,
-                endings: Vec::new(),
-                preserved: Default::default(),
-            },
+            ConstraintTokens::Raw(contract.into_raw()),
         )
     }
 
@@ -220,9 +225,7 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
-        decoded: Option<Arc<ByteStreamContract>>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         Self::new(
             tokenizer,
@@ -231,12 +234,7 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                raw: None,
-                decoded,
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
 
@@ -246,9 +244,7 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
-        decoded: Option<Arc<ByteStreamContract>>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         let cursor = match grammar {
             crate::config::TextGrammar::Regex(pattern) => {
@@ -263,12 +259,7 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                raw: None,
-                decoded,
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
     fn new(
@@ -280,12 +271,16 @@ impl ContentConstraint {
         max_bytes: usize,
         tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
-        let ConstraintTokens {
-            endings,
-            preserved,
-            raw,
-            decoded,
-        } = tokens;
+        let (raw, decoded, endings, preserved) = match tokens {
+            ConstraintTokens::Raw(contract) => {
+                (Some(contract), None, Vec::new(), Default::default())
+            }
+            ConstraintTokens::Decoded {
+                contract,
+                endings,
+                preserved,
+            } => (None, contract, endings, preserved),
+        };
         let vocabulary = tokenizer
             .inner()
             .get_vocab(true)
@@ -1102,9 +1097,7 @@ mod tests {
             ProjectionKind::Plain,
             "",
             128,
-            vec![],
-            &preserved,
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(vec![], &preserved, None),
         )
         .unwrap();
         constraint.seed_raw_bytes(b"\"\xc3").unwrap();
@@ -1143,9 +1136,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let eos = [TokenCandidate {
@@ -1169,9 +1164,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let context = ProcessorContext {
@@ -1361,9 +1358,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     4096,
-                    vec![3],
-                    &Default::default(),
-                    None,
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 let mut reference = ContentConstraint::json_schema(
@@ -1372,9 +1371,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     4096,
-                    vec![3],
-                    &Default::default(),
-                    None,
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 assert!(fast.plain_vocabulary.is_some());
@@ -1436,9 +1437,11 @@ mod tests {
                 ProjectionKind::Plain,
                 "",
                 1024,
-                vec![3],
-                &Default::default(),
-                None,
+                crate::response_constraint::ConstraintTokens::decoded(
+                    vec![3],
+                    &Default::default(),
+                    None,
+                ),
             )
             .unwrap();
             let candidates = (0..32)
@@ -1483,9 +1486,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     3,
-                    vec![3],
-                    &Default::default(),
-                    None,
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 let mask = bounded
@@ -1556,9 +1561,11 @@ mod tests {
                 ProjectionKind::Plain,
                 "",
                 4096,
-                vec![3],
-                &Default::default(),
-                None,
+                crate::response_constraint::ConstraintTokens::decoded(
+                    vec![3],
+                    &Default::default(),
+                    None,
+                ),
             )
             .unwrap();
             let candidates = (0..32)
@@ -1771,9 +1778,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let mut reference = ContentConstraint::json_schema(
@@ -1782,9 +1791,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         assert!(fast.plain_vocabulary.is_some());
@@ -2187,9 +2198,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let candidates = [3u32, 4, 5, 6]

@@ -4931,9 +4931,11 @@ mod tests {
             crate::text_projection::ProjectionKind::Plain,
             prefix,
             4096,
-            vec![eos],
-            &Default::default(),
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![eos],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         ConstraintProcessor::new(Box::new(constraint), texts, vec![eos])

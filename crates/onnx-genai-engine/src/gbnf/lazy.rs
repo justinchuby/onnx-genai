@@ -678,9 +678,11 @@ mod tests {
             crate::text_projection::ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
-            None,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         assert!(
