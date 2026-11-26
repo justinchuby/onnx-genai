@@ -203,8 +203,13 @@ completed argument spelling must match that grammar; completed protocol parsing
 must describe the same JSON values before completion is published. Forced tagged
 JSON envelopes admit every ordering of `name`, optional `id`, and `arguments`,
 while retaining required fields, ID limits and rejection of extra fields. This uses the backend's supported schema language,
-not a claim of general JSON Schema validation. Protocol parsing, parameter
-admission and required-call postconditions do not substitute for
+not a claim of general JSON Schema validation. Supplied parameter schemas are
+intersected with the registered protocols' object-argument domain in both forced
+grammars and parameter admission. Omitted/null parameters, `true`, an empty
+schema and unions containing objects never authorize scalar/array call arguments.
+Composition retains existing constraints and root definitions/references; it does
+not replace an incompatible schema with a permissive object schema.
+Protocol parsing, parameter admission and required-call postconditions do not substitute for
 constraint-guided sampling.
 Expand wire acceptance for tools, malformed/pressure cases, overlapping turns,
 rate epochs, multimodel isolation and native device execution. The current

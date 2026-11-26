@@ -707,6 +707,11 @@ pending compatibility work. `/props` reports `server_tools: false` in
 `nxrt_capabilities` and `cors_proxy_enabled: false` in both router and model modes.
 The former tool/MCP/proxy CLI options and library configuration types are removed.
 
+The supplied model tool protocols require object arguments. Forced tool grammars
+and realtime parameter admission share that domain restriction even for `true`,
+empty, omitted/null or union parameter schemas. Existing schema conditions and
+root reference locations are retained; contradictory schemas are not relaxed.
+
 Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
 assistant `tool_calls` (including streaming deltas), execute those calls in their
 harness, and return `role: "tool"` messages with the matching `tool_call_id`.
