@@ -2574,24 +2574,58 @@ fn tile_rejects_signature_change_during_capture() {
     ignore = "requires CUDA device; enable gpu-tests"
 )]
 fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
+    assert_broadcast_metadata_replacement(
+        &Node::new(NodeId(0), "Add", vec![], vec![]),
+        13,
+        DataType::Float32,
+        [&raw(&[1_f32, 2., 3.]), &raw(&[10_f32, 20., 30.])],
+        [
+            &raw(&[11_f32, 21., 31., 12., 22., 32.]),
+            &raw(&[11_f32, 12., 21., 22., 31., 32.]),
+        ],
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn bitshift_metadata_and_signature_publish_together_and_preserve_old_graph() {
+    let mut node = Node::new(NodeId(0), "BitShift", vec![], vec![]);
+    node.attributes
+        .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
+    assert_broadcast_metadata_replacement(
+        &node,
+        28,
+        DataType::Int32,
+        [&raw(&[-8_i32, 16, 0]), &raw(&[0_i32, 1, 3])],
+        [
+            &raw(&[-8_i32, -4, -1, 16, 8, 2]),
+            &raw(&[-8_i32, 16, -4, 8, -1, 2]),
+        ],
+    );
+}
+
+fn assert_broadcast_metadata_replacement(
+    node: &Node,
+    opset: u64,
+    dtype: DataType,
+    inputs: [&[u8]; 2],
+    expected: [&[u8]; 2],
+) {
     let ep = require_cuda();
     let runtime = ep.runtime();
     runtime.set_defer_eager_sync(true);
-    let a = ep.allocate(12, 256).unwrap();
-    let b = ep.allocate(12, 256).unwrap();
-    let output = ep.allocate(24, 256).unwrap();
+    let a = ep.allocate(inputs[0].len(), 256).unwrap();
+    let b = ep.allocate(inputs[1].len(), 256).unwrap();
+    let output = ep.allocate(expected[0].len(), 256).unwrap();
     // SAFETY: each allocation covers exactly its three input values.
     unsafe {
-        runtime
-            .htod(&raw(&[1_f32, 2., 3.]), cuptr(a.as_ptr()))
-            .unwrap();
-        runtime
-            .htod(&raw(&[10_f32, 20., 30.]), cuptr(b.as_ptr()))
-            .unwrap();
+        runtime.htod(inputs[0], cuptr(a.as_ptr())).unwrap();
+        runtime.htod(inputs[1], cuptr(b.as_ptr())).unwrap();
     }
-    let mut kernel = ep
-        .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 13)
-        .unwrap();
+    let mut kernel = ep.get_kernel(node, &[], opset).unwrap();
     kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
         capture_eligible: true,
         ..Default::default()
@@ -2607,14 +2641,14 @@ fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
             &[
                 TensorView::new(
                     DevicePtr(a.as_ptr()),
-                    DataType::Float32,
+                    dtype,
                     a_shape,
                     &a_strides,
                     ep.device_id(),
                 ),
                 TensorView::new(
                     DevicePtr(b.as_ptr()),
-                    DataType::Float32,
+                    dtype,
                     b_shape,
                     &b_strides,
                     ep.device_id(),
@@ -2622,7 +2656,7 @@ fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
             ],
             &mut [TensorMut::new(
                 DevicePtrMut(output.as_ptr().cast_mut()),
-                DataType::Float32,
+                dtype,
                 out_shape,
                 &out_strides,
                 ep.device_id(),
@@ -2743,13 +2777,13 @@ fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
         "cold shape facts must not allocate, transfer or synchronize"
     );
     drop(kernel);
-    let mut actual = [0u8; 24];
+    let mut actual = vec![0u8; expected[0].len()];
     runtime.replay_graph().unwrap();
-    // SAFETY: the live output allocation covers exactly six Float32 values.
+    // SAFETY: the live output allocation covers the expected result.
     unsafe {
         runtime.dtoh(&mut actual, cuptr(output.as_ptr())).unwrap();
     }
-    assert_eq!(actual.as_slice(), raw(&[11_f32, 21., 31., 12., 22., 32.]));
+    assert_eq!(actual.as_slice(), expected[0]);
     runtime
         .replay_graph_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
         .unwrap();
@@ -2757,7 +2791,7 @@ fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
     unsafe {
         runtime.dtoh(&mut actual, cuptr(output.as_ptr())).unwrap();
     }
-    assert_eq!(actual.as_slice(), raw(&[11_f32, 12., 21., 22., 31., 32.]));
+    assert_eq!(actual.as_slice(), expected[1]);
     runtime.reset_graph().unwrap();
     runtime
         .reset_graph_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)

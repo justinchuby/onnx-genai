@@ -2745,6 +2745,23 @@ impl CudaExecutionProvider {
         )
     }
 
+    fn validate_execution_surface(&self, node: &Node) -> Result<()> {
+        // The construction contract also identifies the shipped plugin surface.
+        if matches!(
+            self.conv_transpose_contract,
+            ConvTransposeContract::OrtPlugin
+        ) && node.op_type == "DFT"
+            && onnx_runtime_ir::is_default_domain(&node.domain)
+            && onnx_runtime_ir::dft::DftMode::parse(node).map_err(EpError::KernelFailed)?
+                == onnx_runtime_ir::dft::DftMode::RealInverse
+        {
+            return Err(EpError::KernelFailed(
+                "CUDA ORT plugin does not support DFT IRFFT; select a CPU EP or run DFT-20 in standalone nxrt".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Return whether a fully initialized CUDA EP can be constructed for this
     /// device right now. This checks the driver, wheel/system libraries, device,
     /// and thread binding rather than reporting a compile-time feature.
@@ -2768,6 +2785,7 @@ impl CudaExecutionProvider {
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> Result<Box<dyn Kernel>> {
+        self.validate_execution_surface(op)?;
         let factory = self
             .registry
             .lookup(&op.op_type, &op.domain, opset)
@@ -4359,6 +4377,11 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
+            onnx_runtime_ep_api::det::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) =
             onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
@@ -4411,6 +4434,9 @@ impl ExecutionProvider for CudaExecutionProvider {
             }
         {
             return KernelMatch::unsupported(reason);
+        }
+        if let Err(error) = self.validate_execution_surface(op) {
+            return KernelMatch::unsupported(error.to_string());
         }
         if op.op_type == "DFT"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
@@ -4590,13 +4616,6 @@ impl ExecutionProvider for CudaExecutionProvider {
                 input_dtypes,
                 self.conv_transpose_contract,
             )
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if matches!(op.op_type.as_str(), "QuantizeLinear" | "DequantizeLinear")
-            && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) =
-                crate::kernels::quantization::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

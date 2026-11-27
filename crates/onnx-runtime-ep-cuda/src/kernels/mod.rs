@@ -51,6 +51,7 @@ pub mod data_transform;
 pub(crate) mod deform_conv;
 mod dequantize_packed;
 mod dequantize_packed_gather;
+mod det;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
@@ -186,8 +187,8 @@ use pointwise::{
 /// * **Modulo** — `Mod` (f32 with `fmod=1`, plus i32/i64 truncated and
 ///   floor modulo).
 /// * **Bitwise** — `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
-///   (all integer dtypes, broadcasting) and unsigned `BitShift`
-///   (LEFT/RIGHT), matched to the CPU EP `bitwise.rs`/`bitshift.rs`.
+///   (all integer dtypes, broadcasting) and native integer `BitShift` from
+///   opset 11, matched to the CPU EP.
 /// * **LogSoftmax / Hardmax** — numerically-stable axis-reduction ops
 ///   (f32/f16/bf16), matched to the CPU EP; `LogSoftmax` uses the stable
 ///   shifted-logsumexp formulation.
@@ -234,6 +235,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "FusedGemm",
     "Conv",
     "DFT",
+    "Det",
     "STFT",
     "MaxPool",
     "MaxUnpool",
@@ -566,6 +568,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("BitCast", "") => BIT_CAST_TYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
+        ("Det", "") => onnx_runtime_ep_api::det::DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
@@ -741,11 +744,21 @@ pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescr
             !(key.domain.is_empty() && matches!(key.op_type.as_str(), "RoiAlign" | "MaxRoiPool"))
         })
         .map(|key| {
-            let supported_dtypes = if key.op_type == "Conv"
+            let supported_dtypes = if key.op_type == "BitShift" && key.domain.is_empty() {
+                onnx_runtime_ep_api::bitshift::ORT_DTYPES
+            } else if key.op_type == "Conv"
                 && key.domain.is_empty()
                 && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
             {
                 onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
+            } else if key.op_type == "Mod" && key.domain.is_empty() {
+                if key.since_version >= onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE {
+                    onnx_runtime_ir::modulo::DTYPES
+                } else if registry.explicit_end_version(key) < u64::MAX {
+                    mod_op::LEGACY_DTYPES
+                } else {
+                    cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
+                }
             } else {
                 cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
             };
@@ -879,6 +892,11 @@ pub(crate) fn build_cuda_registry_for_contract(
     }
 
     let fft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
+    reg.register(
+        OpKey::new("Det", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(det::Factory(runtime.clone())),
+    );
     reg.register(
         OpKey::new("DFT", "", 17),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -1133,24 +1151,14 @@ pub(crate) fn build_cuda_registry_for_contract(
             v27: true,
         }),
     );
-    for version in [10, 13, 19, 21, 23, 25] {
-        reg.register(
-            OpKey::new("QuantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::LinearQuantFactory {
-                op: quantization::LinearQuantOp::Quantize,
-                runtime: runtime.clone(),
-            }),
-        );
-        reg.register(
-            OpKey::new("DequantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::LinearQuantFactory {
-                op: quantization::LinearQuantOp::Dequantize,
-                runtime: runtime.clone(),
-            }),
-        );
-    }
+    quantization::register_linear_quantization(
+        &mut reg,
+        &runtime,
+        matches!(
+            conv_transpose_contract,
+            conv_transpose::Contract::Standalone
+        ),
+    );
     reg.register(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1172,13 +1180,26 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
-        OpKey::new("QLinearMatMul", "", 10),
-        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(qlinear_matmul::QLinearMatMulFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    let scale_support = qlinear_matmul::scale_support(conv_transpose_contract);
+    let versions: &[u64] =
+        if scale_support == onnx_runtime_ir::qlinear_matmul::ScaleSupport::FloatAndHalf {
+            &[
+                10,
+                onnx_runtime_ir::qlinear_matmul::HALF_SCALE_SINCE_VERSION,
+            ]
+        } else {
+            &[10]
+        };
+    for &since_version in versions {
+        reg.register(
+            OpKey::new("QLinearMatMul", "", since_version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(qlinear_matmul::QLinearMatMulFactory {
+                runtime: runtime.clone(),
+                scale_support,
+            }),
+        );
+    }
     reg.register(
         OpKey::new("Resize", "", 10),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -2016,14 +2037,30 @@ pub(crate) fn build_cuda_registry_for_contract(
         }),
     );
 
-    // Mod (mod_op.rs) — f32 (fmod=1) plus i32/i64 truncated and floor modulo.
-    reg.register(
+    let mod_28 = onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE;
+    let standalone = matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
+    );
+    reg.register_through(
         OpKey::new("Mod", "", 10),
+        if standalone { mod_28 - 1 } else { u64::MAX },
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(mod_op::ModFactory {
             runtime: runtime.clone(),
+            since_version: 10,
         }),
     );
+    if standalone {
+        reg.register(
+            OpKey::new("Mod", "", mod_28),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(mod_op::ModFactory {
+                runtime: runtime.clone(),
+                since_version: mod_28,
+            }),
+        );
+    }
 
     // ── CUDA Wave 3 — pointwise math / logical / comparison (pointwise.rs) ──
 
@@ -2165,10 +2202,8 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
-    // Unsigned BitShift (LEFT/RIGHT via the `direction` attribute); matches the
-    // CPU EP `bitshift.rs` checked-shift contract.
     reg.register(
-        OpKey::new("BitShift", "", 11),
+        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SINCE_VERSION),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitShiftFactory {
             runtime: runtime.clone(),
@@ -2422,6 +2457,25 @@ mod tests {
                 .expect("CUDA registry census requires a usable CUDA device 0"),
         );
         let registry = build_cuda_registry(runtime);
+        let descriptors = build_cuda_registry_descriptors(&registry);
+        let shifts: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.domain.is_empty() && d.op_type == "BitShift")
+            .collect();
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(
+            (shifts[0].since_version, shifts[0].end_version),
+            (11, u64::MAX)
+        );
+        assert_eq!(
+            shifts[0].supported_dtypes,
+            &[
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
+        );
         let pairs: BTreeSet<(String, String)> = registry
             .keys()
             .map(|key| (key.domain.clone(), key.op_type.clone()))

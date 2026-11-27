@@ -8,6 +8,7 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
     WorkspacePreparation, WorkspaceView,
 };
+use onnx_runtime_ir::qlinear_matmul::{ScaleSupport, ScaleType};
 use onnx_runtime_ir::{DataType, Node, broadcast_shapes};
 
 use crate::error::{driver_err, not_implemented};
@@ -20,6 +21,23 @@ const OFFSET_WORDS: usize = 2;
 
 const BLOCK: u32 = 256;
 const SOURCE: &str = r#"
+#ifndef SCALE_TYPE
+#define SCALE_TYPE float
+#define LOAD_SCALE(value) (value)
+using ScaleCompute = float;
+__device__ __forceinline__ float combined_scale(float a, float b, float y) {
+  return a * b / y;
+}
+__device__ __forceinline__ float round_output(float value) { return nearbyintf(value); }
+#else
+using ScaleCompute = double;
+__device__ __forceinline__ double combined_scale(double a, double b, double y) {
+  // Match ONNX reference: round the multiply and divide to TS.
+  return LOAD_SCALE(STORE_SCALE((double)LOAD_SCALE(STORE_SCALE(a * b)) / y));
+}
+__device__ __forceinline__ double round_output(double value) { return nearbyint(value); }
+#endif
+
 __device__ __forceinline__ int load_quantized(
     const void* values, int dtype, unsigned long long index) {
   return dtype == 0 ? (int)((const signed char*)values)[index]
@@ -38,15 +56,15 @@ __device__ __forceinline__ void store_quantized(
 }
 
 extern "C" __global__ void qlinear_matmul(
-    const void* a, const float* a_scale, const void* a_zero_point,
-    const void* b, const float* b_scale, const void* b_zero_point,
-    const float* y_scale, const void* y_zero_point, void* y,
+    const void* a, const SCALE_TYPE* a_scale, const void* a_zero_point,
+    const void* b, const SCALE_TYPE* b_scale, const void* b_zero_point,
+    const SCALE_TYPE* y_scale, const void* y_zero_point, void* y,
     const unsigned long long* batch_offsets, unsigned long long elements,
     unsigned long long m, unsigned long long k, unsigned long long n,
     unsigned long long a_axis_length, unsigned long long b_axis_length,
     int a_dtype, int b_dtype, int y_dtype, int a_per_axis, int b_per_axis) {
   const int output_zero_point = load_quantized(y_zero_point, y_dtype, 0);
-  const float output_scale = *y_scale;
+  const float output_scale = LOAD_SCALE(*y_scale);
   for (unsigned long long output_index =
            blockIdx.x * blockDim.x + threadIdx.x;
        output_index < elements;
@@ -72,8 +90,16 @@ extern "C" __global__ void qlinear_matmul(
       accumulated_bits += (unsigned int)(av * bv);
     }
     const int accumulated = (int)accumulated_bits;
-    const float scale = a_scale[a_parameter] * b_scale[b_parameter] / output_scale;
-    const float rounded = nearbyintf((float)accumulated * scale);
+    const ScaleCompute scale =
+        combined_scale(LOAD_SCALE(a_scale[a_parameter]), LOAD_SCALE(b_scale[b_parameter]), output_scale);
+    const ScaleCompute rounded = round_output((ScaleCompute)accumulated * scale);
+#ifdef STORE_SCALE
+    // The reference casts the final NaN (0 * inf) to integer zero.
+    if (isnan(rounded)) {
+      store_quantized(y, y_dtype, output_index, 0);
+      continue;
+    }
+#endif
     const long long rounded_integer =
         isnan(rounded) ? 0 : (rounded > 512.0f ? 512 : (rounded < -512.0f ? -512 : (long long)rounded));
     const long long requantized = rounded_integer + (long long)output_zero_point;
@@ -82,20 +108,30 @@ extern "C" __global__ void qlinear_matmul(
 }
 "#;
 
+pub(super) fn scale_support(contract: super::conv_transpose::Contract) -> ScaleSupport {
+    match contract {
+        super::conv_transpose::Contract::Standalone => ScaleSupport::FloatAndHalf,
+        super::conv_transpose::Contract::OrtPlugin => ScaleSupport::FloatOnly,
+    }
+}
+
 pub struct QLinearMatMulFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub scale_support: ScaleSupport,
 }
 
 impl KernelFactory for QLinearMatMulFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(QLinearMatMulKernel {
             runtime: self.runtime.clone(),
+            scale_support: self.scale_support,
         }))
     }
 }
 
 struct QLinearMatMulKernel {
     runtime: Arc<CudaRuntime>,
+    scale_support: ScaleSupport,
 }
 
 #[derive(Clone, Copy)]
@@ -118,9 +154,10 @@ impl QuantParameters {
         axis: QuantAxis,
         quantized_dtype: DataType,
     ) -> Result<Self> {
-        if scale.dtype != DataType::Float32 || zero_point.dtype != quantized_dtype {
+        if zero_point.dtype != quantized_dtype {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep QLinearMatMul: {name}_scale must be Float32 and {name}_zero_point must match the operand dtype"
+                "cuda_ep QLinearMatMul: {name}_zero_point dtype {:?} must match the operand dtype {quantized_dtype:?}",
+                zero_point.dtype
             )));
         }
         if scale.shape != zero_point.shape {
@@ -329,22 +366,45 @@ fn next_index(shape: &[usize], index: &mut [usize]) {
     }
 }
 
-fn validate_scale_values(runtime: &CudaRuntime, scale: &TensorView) -> Result<()> {
+fn validate_scale_values(
+    runtime: &CudaRuntime,
+    scale: &TensorView,
+    name: &str,
+    scale_type: ScaleType,
+) -> Result<()> {
     let mut bytes =
-        vec![0_u8; checked_tensor_bytes("QLinearMatMul", "scale", DataType::Float32, scale.shape)?];
+        vec![0_u8; checked_tensor_bytes("QLinearMatMul", name, scale.dtype, scale.shape)?];
     if !bytes.is_empty() {
-        // SAFETY: the validated scale tensor is contiguous Float32 storage and `bytes`
+        // SAFETY: the validated scale tensor is contiguous and `bytes`
         // has exactly the corresponding allocation length.
-        unsafe { runtime.dtoh(&mut bytes, cuptr(scale.data_ptr::<f32>() as *const c_void))? };
+        unsafe { runtime.dtoh(&mut bytes, cuptr(scale.data_ptr::<u8>() as *const c_void))? };
     }
-    if bytes
-        .chunks_exact(size_of::<f32>())
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
-        .any(|value| value <= 0.0 || !value.is_finite())
-    {
-        return Err(EpError::KernelFailed(
-            "cuda_ep QLinearMatMul: scales must be finite and positive".into(),
-        ));
+    let invalid = |value: f32| value <= 0.0 || !value.is_finite();
+    let invalid_value = match scale_type {
+        ScaleType::Float32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(f32::from_ne_bytes)
+            .any(invalid),
+        ScaleType::Float16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| half::f16::from_bits(u16::from_ne_bytes(*bytes)).to_f32())
+            .any(invalid),
+        ScaleType::BFloat16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| half::bf16::from_bits(u16::from_ne_bytes(*bytes)).to_f32())
+            .any(invalid),
+    };
+    if invalid_value {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep QLinearMatMul: {name} values must be finite and positive"
+        )));
     }
     Ok(())
 }
@@ -367,6 +427,13 @@ impl QLinearMatMulKernel {
         let a_dtype = quant_dtype(inputs[0].dtype, "A")?;
         let b_dtype = quant_dtype(inputs[3].dtype, "B")?;
         let y_dtype = quant_dtype(outputs[0].dtype, "Y")?;
+        let scale_type = ScaleType::resolve(
+            self.scale_support,
+            inputs[1].dtype,
+            inputs[4].dtype,
+            inputs[6].dtype,
+        )
+        .map_err(|reason| EpError::KernelFailed(format!("cuda_ep QLinearMatMul: {reason}")))?;
         if inputs[7].dtype != outputs[0].dtype {
             return Err(EpError::KernelFailed(
                 "cuda_ep QLinearMatMul: y_zero_point dtype must match Y".into(),
@@ -395,8 +462,7 @@ impl QLinearMatMulKernel {
             QuantAxis::Column,
             inputs[3].dtype,
         )?;
-        if inputs[6].dtype != DataType::Float32
-            || inputs[6].shape != inputs[7].shape
+        if inputs[6].shape != inputs[7].shape
             || !(inputs[6].shape.is_empty() || inputs[6].shape == [1])
         {
             return Err(EpError::KernelFailed(
@@ -412,8 +478,8 @@ impl QLinearMatMulKernel {
         let upload = geometry
             .workspace(&OutputMetadata::from_view(&outputs[0]))?
             .bind(workspace)?;
-        for scale in [&inputs[1], &inputs[4], &inputs[6]] {
-            validate_scale_values(&self.runtime, scale)?;
+        for (index, name) in [(1, "a_scale"), (4, "b_scale"), (6, "y_scale")] {
+            validate_scale_values(&self.runtime, &inputs[index], name, scale_type)?;
         }
         let elements = outputs[0].numel() as u64;
         if elements == 0 {
@@ -421,9 +487,23 @@ impl QLinearMatMulKernel {
         }
         let offsets = geometry.batch_offsets()?;
         let offsets_pointer = upload.upload(&self.runtime, &offsets)?;
-        let function =
-            self.runtime
-                .nvrtc_function("qlinear_matmul_v1", SOURCE, "qlinear_matmul")?;
+        if scale_type != ScaleType::Float32 {
+            self.runtime.require_nvrtc_half_headers("QLinearMatMul")?;
+        }
+        let (module, source) = match scale_type {
+            ScaleType::Float32 => ("qlinear_matmul_v1", std::borrow::Cow::Borrowed(SOURCE)),
+            ScaleType::Float16 => (
+                "qlinear_matmul_f16_v2",
+                format!("#include <cuda_fp16.h>\n#define SCALE_TYPE __half\n#define LOAD_SCALE __half2float\n#define STORE_SCALE __double2half\n{SOURCE}").into(),
+            ),
+            ScaleType::BFloat16 => (
+                "qlinear_matmul_bf16_v2",
+                format!("#include <cuda_bf16.h>\n#define SCALE_TYPE __nv_bfloat16\n#define LOAD_SCALE __bfloat162float\n#define STORE_SCALE __double2bfloat16\n{SOURCE}").into(),
+            ),
+        };
+        let function = self
+            .runtime
+            .nvrtc_function(module, &source, "qlinear_matmul")?;
         let pointers = inputs
             .iter()
             .map(|input| cuptr(input.data_ptr::<u8>() as *const c_void))

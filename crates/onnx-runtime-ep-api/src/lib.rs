@@ -37,6 +37,8 @@ pub mod abi;
 pub mod affine_gather;
 pub mod attention_window;
 pub mod bit_cast;
+pub mod bitshift;
+pub mod det;
 pub mod epcontext;
 pub mod float8_cast;
 pub mod gemm;

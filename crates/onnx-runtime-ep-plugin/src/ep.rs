@@ -208,23 +208,6 @@ pub(crate) fn excludes_schema_revision(
     })
 }
 
-pub(crate) fn query_plugin_capabilities(
-    view: &onnx_runtime_ir::GraphView<'_>,
-    ep: &dyn ExecutionProvider,
-    exclusions: OperatorExclusions,
-    mut node_admissible: impl FnMut(NodeIndex, bool) -> bool,
-) -> onnx_runtime_ep_api::Result<Vec<onnx_runtime_ep_api::SubgraphClaim>> {
-    onnx_runtime_ep_api::abi::OrtGraphView::new(view).query_capabilities_filtered(
-        ep,
-        |index, graph_kernel| {
-            let node = view.node(index);
-            // Exclude before partitioning so an unsupported node cannot take
-            // supported neighbors out with it in the later registry filter.
-            !excludes_schema_revision(exclusions, node) && node_admissible(index, graph_kernel)
-        },
-    )
-}
-
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
 ///
 /// The first field is `OrtEp` so the pointer can be cast directly.
@@ -498,52 +481,58 @@ fn ep_get_capability_inner(
     let mut graph_kernel_nodes = std::collections::HashSet::new();
     let exclusions = exported.operator_exclusions;
     let claims = exported.ep.with(|ep| {
-        query_plugin_capabilities(&view, ep, exclusions, |node, graph_kernel| {
-            let ir_node = view.node(node);
-            if exceeded_ort_schema_max(ir_node, ir_graph.effective_opset(ir_node).unwrap_or(0))
-                .is_some()
-            {
-                return false;
-            }
-            if graph_kernel {
-                if ep.executor_kernel_scope(ir_node)
-                    == onnx_runtime_ep_api::ExecutorKernelScope::Required
+        query_plugin_capabilities(
+            &view,
+            ep,
+            &exported.registry_entries,
+            exclusions,
+            |node, graph_kernel| {
+                let ir_node = view.node(node);
+                if exceeded_ort_schema_max(ir_node, ir_graph.effective_opset(ir_node).unwrap_or(0))
+                    .is_some()
                 {
                     return false;
                 }
-                graph_kernel_nodes.insert(ir_node.id);
-                return true;
-            }
-            if is_gpu_ep && !node_inputs_all_routable(&view, node) {
-                return false;
-            }
-            if is_gpu_ep {
-                let input_shapes: Vec<Vec<Option<usize>>> = view
-                    .node_inputs(node)
-                    .iter()
-                    .map(|input| {
-                        input
-                            .map(|value| {
-                                view.value(value)
-                                    .shape
-                                    .iter()
-                                    .map(|dimension| dimension.as_static())
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
-                let strategy = crate::compute::ShapeInference::for_node(
-                    ir_node,
-                    &input_shapes,
-                    ir_node.outputs.len(),
-                );
-                if shape_inference_reads_runtime_values(&strategy, ir_node) {
+                if graph_kernel {
+                    if ep.executor_kernel_scope(ir_node)
+                        == onnx_runtime_ep_api::ExecutorKernelScope::Required
+                    {
+                        return false;
+                    }
+                    graph_kernel_nodes.insert(ir_node.id);
+                    return true;
+                }
+                if is_gpu_ep && !node_inputs_all_routable(&view, node) {
                     return false;
                 }
-            }
-            true
-        })
+                if is_gpu_ep {
+                    let input_shapes: Vec<Vec<Option<usize>>> = view
+                        .node_inputs(node)
+                        .iter()
+                        .map(|input| {
+                            input
+                                .map(|value| {
+                                    view.value(value)
+                                        .shape
+                                        .iter()
+                                        .map(|dimension| dimension.as_static())
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    let strategy = crate::compute::ShapeInference::for_node(
+                        ir_node,
+                        &input_shapes,
+                        ir_node.outputs.len(),
+                    );
+                    if shape_inference_reads_runtime_values(&strategy, ir_node) {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
     });
 
     let claims = match claims {
@@ -765,6 +754,40 @@ fn ort_descriptor_end_version(entry: &KernelRegistryEntry) -> i32 {
     })
 }
 
+fn is_standard_bitshift(node: &onnx_runtime_ir::Node) -> bool {
+    node.op_type == "BitShift" && onnx_runtime_ir::normalize_domain(&node.domain).is_empty()
+}
+
+fn query_plugin_capabilities(
+    view: &onnx_runtime_ir::GraphView<'_>,
+    ep: &dyn ExecutionProvider,
+    entries: &[KernelRegistryEntry],
+    exclusions: OperatorExclusions,
+    mut node_admissible: impl FnMut(NodeIndex, bool) -> bool,
+) -> onnx_runtime_ep_api::Result<Vec<onnx_runtime_ep_api::SubgraphClaim>> {
+    onnx_runtime_ep_api::abi::OrtGraphView::new(view).query_capabilities_filtered(
+        ep,
+        |index, graph_kernel| {
+            let node = view.node(index);
+            // Exclude before partitioning so an unsupported node cannot take
+            // supported neighbors out with it in the later registry filter.
+            !excludes_schema_revision(exclusions, node)
+                && plugin_bitshift_is_admissible(node, view.graph(), entries)
+                && node_admissible(index, graph_kernel)
+        },
+    )
+}
+
+// Use the advertised dtype contract before grouping and again before native
+// factory lookup. A schema cutoff would also exclude unsigned BitShift-28.
+fn plugin_bitshift_is_admissible(
+    node: &onnx_runtime_ir::Node,
+    graph: &onnx_runtime_ir::Graph,
+    entries: &[KernelRegistryEntry],
+) -> bool {
+    !is_standard_bitshift(node) || node_passes_dtype_filter(node, graph, entries)
+}
+
 /// Check whether a node's input/output element types are all supported by the
 /// corresponding registry entry. Returns `true` if the node should be claimed.
 ///
@@ -778,7 +801,7 @@ pub(crate) fn node_passes_dtype_filter(
     if entries.is_empty() {
         return true;
     }
-    let domain = if node.domain.is_empty() {
+    let domain = if is_standard_bitshift(node) {
         ""
     } else {
         node.domain.as_str()
@@ -1030,6 +1053,13 @@ fn ep_compile_inner(
         let mut entries: Vec<crate::compute::CompiledKernelEntry> = Vec::new();
         for node_idx in view.nodes() {
             let node = view.node(node_idx);
+            if !plugin_bitshift_is_admissible(node, ir_graph, &exported.registry_entries) {
+                return fail_status(&format!(
+                    "Compile: node '{}' (BitShift) does not match the ORT plugin's unsigned integer \
+                     dtype contract; use unsigned inputs and output, or run signed BitShift in standalone nxrt",
+                    node.name
+                ));
+            }
             let graph_kernel = graph_claims.contains(node.id);
             let kernel_inputs = if graph_kernel {
                 node.inputs_with_captures(captures.get(&node.id).into_iter().flatten().copied())
@@ -2410,11 +2440,12 @@ mod tests {
             let view = GraphView::new(&graph, &cache);
 
             let standalone =
-                super::query_plugin_capabilities(&view, &provider, &[], |_, _| true).unwrap();
+                super::query_plugin_capabilities(&view, &provider, &[], &[], |_, _| true).unwrap();
             assert_eq!(standalone[0].node_ids, [id], "{domain:?} {revision:?}");
             let claims = super::query_plugin_capabilities(
                 &view,
                 &provider,
+                &[],
                 super::STANDALONE_CAUSAL_CONV,
                 |_, _| {
                     assert!(allowed, "{domain:?} {revision:?} reached plugin admission");
@@ -2465,6 +2496,100 @@ mod tests {
                 assert!(matches!(strategy, ShapeInference::Declined { .. }));
             }
         }
+    }
+
+    #[test]
+    fn bitshift_plugin_admission_preserves_unsigned_partition() {
+        for opset in [11, 28] {
+            check_bitshift_plugin_admission(opset);
+        }
+    }
+
+    fn check_bitshift_plugin_admission(opset: i64) {
+        use onnx_runtime_ep_api::abi::OrtGraphView;
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Attribute, Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
+
+        let (_, descriptors) = onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors();
+        let entries = ["BitShift", "Cast"].map(|op_type| {
+            let descriptor = descriptors
+                .iter()
+                .find(|d| d.op_type == op_type && d.domain.is_empty())
+                .unwrap();
+            KernelRegistryEntry {
+                op_type,
+                domain: "",
+                since_version: i32::try_from(descriptor.since_version).unwrap(),
+                end_version: i32::try_from(descriptor.end_version).unwrap_or(i32::MAX),
+                supported_dtypes: descriptor.supported_dtypes,
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            }
+        });
+        let mut graph = Graph::new();
+        let x = graph.create_named_value("x", DataType::Int32, Shape::default());
+        let count = graph.create_named_value("count", DataType::Int32, Shape::default());
+        let unsigned_count =
+            graph.create_named_value("unsigned_count", DataType::Uint8, Shape::default());
+        for input in [x, count, unsigned_count] {
+            graph.add_input(input);
+        }
+        let signed = graph.create_named_value("signed", DataType::Int32, Shape::default());
+        let converted = graph.create_named_value("converted", DataType::Uint8, Shape::default());
+        let y = graph.create_named_value("y", DataType::Uint8, Shape::default());
+        graph.add_output(y);
+
+        let bitshift = |inputs, output| {
+            let mut node = Node::new(NodeId(0), "BitShift", inputs, vec![output]);
+            node.version = Some(opset);
+            node.attributes
+                .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
+            node
+        };
+        let signed_id = graph.insert_node(bitshift(vec![Some(x), Some(count)], signed));
+        let mut cast = Node::new(NodeId(0), "Cast", vec![Some(signed)], vec![converted]);
+        cast.version = Some(if opset == 11 { 9 } else { 19 });
+        cast.attributes.insert("to".into(), Attribute::Int(2)); // UINT8
+        let cast_id = graph.insert_node(cast);
+        let unsigned_id =
+            graph.insert_node(bitshift(vec![Some(converted), Some(unsigned_count)], y));
+        let cache = GraphViewCache::build(&graph).unwrap();
+        let view = GraphView::new(&graph, &cache);
+        let ep = CpuExecutionProvider::new();
+        let ort = OrtGraphView::new(&view);
+
+        let native_claims = ort.query_capabilities_filtered(&ep, |_, _| true).unwrap();
+        assert_eq!(native_claims.len(), 1);
+        assert_eq!(
+            native_claims[0].node_ids.as_slice(),
+            &[signed_id, cast_id, unsigned_id]
+        );
+        let plugin_claims =
+            query_plugin_capabilities(&view, &ep, &entries, &[], |_, _| true).unwrap();
+        assert_eq!(plugin_claims.len(), 1);
+        assert_eq!(
+            plugin_claims[0].node_ids.as_slice(),
+            &[cast_id, unsigned_id]
+        );
+        let passes_final_filter = |claim: &onnx_runtime_ep_api::SubgraphClaim| {
+            claim
+                .node_ids
+                .iter()
+                .all(|&id| node_passes_dtype_filter(graph.node(id), &graph, &entries))
+        };
+        assert!(!passes_final_filter(&native_claims[0]));
+        assert!(passes_final_filter(&plugin_claims[0]));
+        // Compile uses this same check before looking up the native factory.
+        assert!(!plugin_bitshift_is_admissible(
+            graph.node(signed_id),
+            &graph,
+            &entries
+        ));
+        assert!(plugin_bitshift_is_admissible(
+            graph.node(unsigned_id),
+            &graph,
+            &entries
+        ));
     }
 
     #[test]
@@ -2538,6 +2663,47 @@ mod tests {
         );
         let node = g.nodes.get(nid).unwrap();
         assert!(super::node_passes_dtype_filter(node, &g, &entries,));
+    }
+
+    #[test]
+    fn dtype_filter_keeps_standalone_pad_types_out_of_cpu_ort_claims() {
+        let (_, descriptors) = onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors();
+        let pad = descriptors
+            .iter()
+            .find(|entry| entry.op_type == "Pad" && entry.domain.is_empty())
+            .unwrap();
+        let entries = [KernelRegistryEntry {
+            op_type: "Pad",
+            domain: "",
+            since_version: 1,
+            end_version: i32::MAX,
+            supported_dtypes: pad.supported_dtypes,
+            input_dtype_constraints: onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(
+                &pad.op_type,
+                &pad.domain,
+            ),
+            output_dtype_constraints: onnx_runtime_ep_cpu::kernels::output_dtype_constraints_for_op(
+                &pad.op_type,
+                &pad.domain,
+            ),
+        }];
+        for (dtype, accepted) in [
+            (DataType::Float32, true),
+            (DataType::Float64, true),
+            (DataType::Int4, false),
+            (DataType::Uint4, false),
+            (DataType::Float4E2M1, false),
+            (DataType::Float8E8M0, false),
+            (DataType::Int2, false),
+            (DataType::Uint2, false),
+        ] {
+            let (g, id) = graph_with_node("Pad", "", &[dtype, DataType::Int64], &[dtype]);
+            assert_eq!(
+                super::node_passes_dtype_filter(g.node(id), &g, &entries),
+                accepted,
+                "{dtype:?}"
+            );
+        }
     }
 
     /// Node with unsupported dtype (Int64 for Add that only supports f32/f16)

@@ -2,20 +2,22 @@
 //!
 //! Supports real and complex input, forward and inverse, full and onesided output.
 //! On macOS/iOS the fast path uses Accelerate's vDSP DFT for power-of-two lengths;
-//! all other cases fall back to a Cooley–Tukey radix-2 FFT (power-of-two) or naive
-//! O(N²) DFT (arbitrary length).
+//! Float64 and other portable paths use a Cooley–Tukey radix-2 FFT for
+//! power-of-two lengths or a direct O(N²) DFT for other lengths.
 
 use std::cell::Cell;
-use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use num_traits::{Float, FloatConst};
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
     WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceView,
 };
-use onnx_runtime_ir::{Node, dft::DftMode};
+use onnx_runtime_ir::{
+    DataType, Node,
+    dft::{self, DftMode},
+};
 
-use super::check_arity;
 use super::typed_workspace::TypedWorkspace;
 use crate::dtype::{
     scalar_i64, to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow,
@@ -114,25 +116,18 @@ impl KernelFactory for DftFactory {
             mode.validate_components(components)
                 .map_err(EpError::KernelFailed)?;
         }
-        // Opset < 20: axis is an attribute (default 1).
-        // Opset >= 20: axis is an input, handled at execute time.
-        let axis_attr = node.attr("axis").and_then(|a| a.as_int());
-        let default_axis = if node.local_opset().unwrap_or(17) >= 20 {
-            -2
-        } else {
-            1
-        };
+        let opset = node.local_opset().unwrap_or(17);
         Ok(Box::new(DftKernel {
             mode,
-            axis_attr,
-            default_axis,
+            opset,
+            default_axis: dft::default_axis(node, opset),
         }))
     }
 }
 
 struct DftKernel {
     mode: DftMode,
-    axis_attr: Option<i64>,
+    opset: u64,
     default_axis: i64,
 }
 
@@ -144,12 +139,13 @@ struct DftGeometry {
     output_components: usize,
     batches: usize,
     output_elements: usize,
+    dtype: DataType,
 }
 
 impl DftGeometry {
-    fn workspace(&self) -> Result<TypedWorkspace<f32, 4>> {
+    fn workspace<T: Float + Default>(&self) -> Result<TypedWorkspace<T, 4>> {
         let len = if self.batches == 0 { 0 } else { self.n };
-        TypedWorkspace::<f32, _>::new(
+        TypedWorkspace::new(
             "DFT",
             [
                 ("real input", len),
@@ -159,17 +155,31 @@ impl DftGeometry {
             ],
         )
     }
+
+    fn requirement(&self) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        Ok(if self.dtype == DataType::Float64 {
+            self.workspace::<f64>()?.requirement()
+        } else {
+            self.workspace::<f32>()?.requirement()
+        })
+    }
 }
 
 impl DftKernel {
+    fn max_inputs(&self) -> usize {
+        if self.opset >= 20 { 3 } else { 2 }
+    }
+
     fn geometry(
         &self,
         inputs: &[TensorMetadata<'_>],
         views: Option<&[TensorView<'_>]>,
     ) -> Result<Option<DftGeometry>> {
-        if !(1..=3).contains(&inputs.len()) || !inputs[0].present {
+        let max_inputs = self.max_inputs();
+        if !(1..=max_inputs).contains(&inputs.len()) || !inputs[0].present {
             return Err(EpError::KernelFailed(format!(
-                "DFT needs 1 to 3 input slots with present signal, got {}; provide signal and optional scalar dft_length/axis",
+                "DFT opset {} needs 1 to {max_inputs} input slots with present signal, got {}; use a scalar dft_length and supply an axis input only from opset 20",
+                self.opset,
                 inputs.len()
             )));
         }
@@ -201,11 +211,11 @@ impl DftKernel {
                         control.shape
                     )));
                 }
-                if !matches!(
-                    control.dtype,
-                    onnx_runtime_ir::DataType::Int32 | onnx_runtime_ir::DataType::Int64
-                ) || (i == 2 && control.dtype != onnx_runtime_ir::DataType::Int64)
-                {
+                if !(if i == 1 {
+                    dft::is_length_dtype(control.dtype)
+                } else {
+                    control.dtype == DataType::Int64
+                }) {
                     return Err(EpError::KernelFailed(format!(
                         "DFT: `{name}` dtype {:?} is invalid; use int32/int64 for dft_length and int64 for axis",
                         control.dtype
@@ -220,23 +230,18 @@ impl DftKernel {
             let view = views.and_then(|views| views.get(i)).ok_or_else(|| EpError::KernelFailed(format!("DFT: `{name}` metadata is present but its Host view is missing; bind the scalar before execution")))?;
             scalar_i64("DFT", name, view)
         };
-        let axis = normalize_axis(
+        let axis = dft::normalize_axis(
             if present(2) {
                 read_control(2, "axis")?
             } else {
-                self.axis_attr.unwrap_or(self.default_axis)
+                self.default_axis
             },
             rank,
-        )?;
+        )
+        .map_err(EpError::KernelFailed)?;
         let signal_len = input.shape[axis];
         let n = if present(1) {
-            let value = read_control(1, "dft_length")?;
-            usize::try_from(value)
-                .ok()
-                .filter(|&n| n > 0)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(format!("DFT: dft_length must be positive, got {value}"))
-                })?
+            dft::explicit_length(read_control(1, "dft_length")?).map_err(EpError::KernelFailed)?
         } else {
             self.mode
                 .default_length(signal_len)
@@ -276,7 +281,12 @@ impl DftKernel {
             ("input materialization", input_elements),
             ("output staging", output_elements),
         ] {
-            std::alloc::Layout::array::<f32>(count).map_err(|_| EpError::KernelFailed(format!("DFT: {name} of {count} f32 elements exceeds addressable capacity; reduce shape or dft_length")))?;
+            let layout = if input.dtype == DataType::Float64 {
+                std::alloc::Layout::array::<f64>(count)
+            } else {
+                std::alloc::Layout::array::<f32>(count)
+            };
+            layout.map_err(|_| EpError::KernelFailed(format!("DFT: {name} of {count} elements for {:?} exceeds addressable capacity; reduce shape or dft_length", input.dtype)))?;
         }
         Ok(Some(DftGeometry {
             axis,
@@ -286,22 +296,25 @@ impl DftKernel {
             output_components,
             batches,
             output_elements,
+            dtype: input.dtype,
         }))
     }
 
     fn live_geometry(&self, inputs: &[TensorView<'_>]) -> Result<DftGeometry> {
-        if !(1..=3).contains(&inputs.len()) {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: expected 1 to 3 input slots, got {}",
-                inputs.len()
-            )));
-        }
         let metadata = std::array::from_fn::<_, 3, _>(|i| {
             inputs.get(i).map_or(
                 TensorMetadata::new(onnx_runtime_ir::DataType::Undefined, &[], false),
                 |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
             )
         });
+        if inputs.len() > metadata.len() {
+            return Err(EpError::KernelFailed(format!(
+                "DFT opset {} accepts at most {} input slots, got {}",
+                self.opset,
+                self.max_inputs(),
+                inputs.len()
+            )));
+        }
         self.geometry(&metadata[..inputs.len()], Some(inputs))?.ok_or_else(|| EpError::KernelFailed("DFT: runtime controls are unreadable; bind Host dft_length/axis scalars before execution".into()))
     }
 }
@@ -313,9 +326,7 @@ impl Kernel for DftKernel {
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<WorkspacePreparation> {
         match self.geometry(inputs, None)? {
-            Some(geometry) => Ok(WorkspacePreparation::Ready(
-                geometry.workspace()?.requirement(),
-            )),
+            Some(geometry) => Ok(WorkspacePreparation::Ready(geometry.requirement()?)),
             None => Ok(WorkspacePreparation::Deferred),
         }
     }
@@ -355,7 +366,7 @@ impl Kernel for DftKernel {
             )
         })?;
         Ok(WorkspaceExecutionPreparation::Ready(
-            geometry.workspace()?.requirement(),
+            geometry.requirement()?,
         ))
     }
 
@@ -380,7 +391,7 @@ impl DftKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        check_arity("DFT", inputs, outputs, 1, 3, 1)?;
+        super::check_arity("DFT", inputs, outputs, 1, self.max_inputs(), 1)?;
         let geometry = self.live_geometry(inputs)?;
         let input = &inputs[0];
         let output = &mut outputs[0];
@@ -410,9 +421,75 @@ impl DftKernel {
             )));
         }
         validate_f32_widen_input("DFT", input)?;
-        if geometry.batches == 0 {
-            return write_dense_f32_narrow("DFT", output, &[]);
+        if !output.device.is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "DFT: output device {:?} is not Host accessible; bind a CPU output",
+                output.device
+            )));
         }
+        if output.dtype != input.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "DFT: output dtype must match input {:?}, got {:?}; bind an output with the signal dtype",
+                input.dtype, output.dtype
+            )));
+        }
+        if geometry.batches == 0 {
+            return super::write_dense_bytes(output, &[]);
+        }
+        if input.dtype == DataType::Float64 {
+            let inverse = self.mode.inverse();
+            let result = self.transform_batches(
+                &geometry,
+                input,
+                output,
+                workspace,
+                || {
+                    let bytes = super::to_dense_bytes(input)?;
+                    Ok(bytes
+                        .chunks_exact(8)
+                        .map(|b| f64::from_ne_bytes(b.try_into().expect("8-byte chunk")))
+                        .collect::<Vec<_>>())
+                },
+                |real, imag, real_out, imag_out| {
+                    if real.len().is_power_of_two() && real.len() > 1 {
+                        real_out.copy_from_slice(real);
+                        imag_out.copy_from_slice(imag);
+                        fft_radix2_in_place(real_out, imag_out, inverse);
+                    } else {
+                        naive_dft_into(real, imag, real_out, imag_out, inverse);
+                    }
+                },
+            )?;
+            let bytes: Vec<_> = result.into_iter().flat_map(f64::to_ne_bytes).collect();
+            super::write_dense_bytes(output, &bytes)
+        } else {
+            let mut dft = None;
+            let result = self.transform_batches(
+                &geometry,
+                input,
+                output,
+                workspace,
+                || to_dense_f32_widen("DFT", input),
+                |r, i, ro, io| {
+                    dft.get_or_insert_with(|| DftPlan::new(geometry.n, self.mode.inverse()))
+                        .transform(r, i, ro, io)
+                },
+            )?;
+            write_dense_f32_narrow("DFT", output, &result)
+        }
+    }
+
+    fn transform_batches<T: Float + Default, D: AsRef<[T]>>(
+        &self,
+        geometry: &DftGeometry,
+        input: &TensorView<'_>,
+        output: &TensorMut<'_>,
+        workspace: Option<WorkspaceView>,
+        read: impl FnOnce() -> Result<D>,
+        mut transform: impl FnMut(&[T], &[T], &mut [T], &mut [T]),
+    ) -> Result<Vec<T>> {
+        let axis = geometry.axis;
+        let last = input.shape.len() - 1;
         let input_strides = row_major_strides(input.shape)?;
         let output_strides = row_major_strides(output.shape)?;
         let batch_shape = input
@@ -422,23 +499,17 @@ impl DftKernel {
             .filter(|(i, _)| *i != axis && *i != last)
             .map(|(_, &d)| d)
             .collect::<Vec<_>>();
-        let plan = geometry.workspace()?;
+        let plan = geometry.workspace::<T>()?;
         // SAFETY: CPU execution owns exclusive live Host backing until this
         // synchronous closure returns. The shared helper checks/initializes
-        // four disjoint regions before any f32 references are formed.
+        // four disjoint typed regions before any references are formed.
         unsafe {
             plan.with_buffers(workspace, |[real_in, imag_in, real_out, imag_out]| {
-                let input_data = to_dense_f32_widen("DFT", input)?;
-                let mut output_data = vec![0.0f32; geometry.output_elements];
+                let data = read()?;
+                let input_data = data.as_ref();
+                let mut output_data = vec![T::zero(); geometry.output_elements];
                 let mut batch_indices = vec![0usize; batch_shape.len()];
-                let dft = DftPlan::new(geometry.n, self.mode.inverse());
-                let copied = geometry
-                    .signal_len
-                    .min(if self.mode == DftMode::RealInverse {
-                        geometry.n / 2 + 1
-                    } else {
-                        geometry.n
-                    });
+                let copied = geometry.signal_len.min(self.mode.input_length(geometry.n));
                 for _ in 0..geometry.batches {
                     let (in_base, out_base) = compute_bases(
                         &batch_indices,
@@ -459,16 +530,16 @@ impl DftKernel {
                     // The plan never mutates its input. Positive-frequency padding
                     // stays zero between batches; mirrors touch only negative bins.
                     if self.mode == DftMode::RealInverse {
-                        imag_in[0] = 0.0;
+                        imag_in[0] = T::zero();
                         if geometry.n.is_multiple_of(2) {
-                            imag_in[geometry.n / 2] = 0.0;
+                            imag_in[geometry.n / 2] = T::zero();
                         }
                         for i in 1..geometry.n.div_ceil(2) {
                             real_in[geometry.n - i] = real_in[i];
                             imag_in[geometry.n - i] = -imag_in[i];
                         }
                     }
-                    dft.transform(real_in, imag_in, real_out, imag_out);
+                    transform(real_in, imag_in, real_out, imag_out);
                     for i in 0..geometry.output_len {
                         let idx = out_base + i * output_strides[axis];
                         output_data[idx] = real_out[i];
@@ -478,21 +549,10 @@ impl DftKernel {
                     }
                     advance_indices(&mut batch_indices, &batch_shape);
                 }
-                write_dense_f32_narrow("DFT", output, &output_data)
+                Ok(output_data)
             })
         }
     }
-}
-
-fn normalize_axis(axis: i64, rank: usize) -> Result<usize> {
-    let r = rank as i64;
-    let normalized = if axis >= 0 { axis } else { axis + r };
-    if normalized < 0 || normalized >= r - 1 {
-        return Err(EpError::KernelFailed(format!(
-            "DFT: axis {axis} invalid for rank {rank} (last dim is complex component)"
-        )));
-    }
-    Ok(normalized as usize)
 }
 
 fn row_major_strides(shape: &[usize]) -> Result<Vec<usize>> {
@@ -703,7 +763,7 @@ fn fft_radix2(
     (real, imag)
 }
 
-fn fft_radix2_in_place(real: &mut [f32], imag: &mut [f32], inverse: bool) {
+fn fft_radix2_in_place<T: Float + FloatConst>(real: &mut [T], imag: &mut [T], inverse: bool) {
     let n = real.len();
     debug_assert!(n.is_power_of_two() && n > 1);
     debug_assert_eq!(imag.len(), n);
@@ -719,35 +779,36 @@ fn fft_radix2_in_place(real: &mut [f32], imag: &mut [f32], inverse: bool) {
     }
 
     // Butterfly passes.
-    let sign: f32 = if inverse { 1.0 } else { -1.0 };
+    let turn = if inverse { T::TAU() } else { -T::TAU() };
     let mut len = 2;
     while len <= n {
         let half = len / 2;
-        let angle = sign * 2.0 * PI / len as f32;
+        let angle = turn / T::from(len).unwrap();
         for start in (0..n).step_by(len) {
             for k in 0..half {
-                let w_re = (angle * k as f32).cos();
-                let w_im = (angle * k as f32).sin();
+                let phase = angle * T::from(k).unwrap();
+                let w_re = phase.cos();
+                let w_im = phase.sin();
                 let i1 = start + k;
                 let i2 = start + k + half;
                 let tr = real[i2] * w_re - imag[i2] * w_im;
                 let ti = real[i2] * w_im + imag[i2] * w_re;
                 real[i2] = real[i1] - tr;
                 imag[i2] = imag[i1] - ti;
-                real[i1] += tr;
-                imag[i1] += ti;
+                real[i1] = real[i1] + tr;
+                imag[i1] = imag[i1] + ti;
             }
         }
         len <<= 1;
     }
 
     if inverse {
-        let scale = 1.0 / n as f32;
+        let scale = T::one() / T::from(n).unwrap();
         for x in real.iter_mut() {
-            *x *= scale;
+            *x = *x * scale;
         }
         for x in imag.iter_mut() {
-            *x *= scale;
+            *x = *x * scale;
         }
     }
 }
@@ -768,32 +829,33 @@ fn naive_dft(
     (real_out, imag_out)
 }
 
-fn naive_dft_into(
-    real_in: &[f32],
-    imag_in: &[f32],
-    real_out: &mut [f32],
-    imag_out: &mut [f32],
+fn naive_dft_into<T: Float + FloatConst>(
+    real_in: &[T],
+    imag_in: &[T],
+    real_out: &mut [T],
+    imag_out: &mut [T],
     inverse: bool,
 ) {
     let n = real_in.len();
     debug_assert_eq!(imag_in.len(), n);
     debug_assert_eq!(real_out.len(), imag_out.len());
     debug_assert!(real_out.len() <= n);
-    let sign: f32 = if inverse { 1.0 } else { -1.0 };
+    let turn = if inverse { T::TAU() } else { -T::TAU() };
+    let length = T::from(n).unwrap();
     for k in 0..real_out.len() {
-        let mut sum_re = 0.0f32;
-        let mut sum_im = 0.0f32;
+        let mut sum_re = T::zero();
+        let mut sum_im = T::zero();
         for t in 0..n {
-            let angle = sign * 2.0 * PI * (k as f32) * (t as f32) / (n as f32);
+            let angle = turn * T::from(k).unwrap() * T::from(t).unwrap() / length;
             let w_re = angle.cos();
             let w_im = angle.sin();
-            sum_re += real_in[t] * w_re - imag_in[t] * w_im;
-            sum_im += real_in[t] * w_im + imag_in[t] * w_re;
+            sum_re = sum_re + (real_in[t] * w_re - imag_in[t] * w_im);
+            sum_im = sum_im + (real_in[t] * w_im + imag_in[t] * w_re);
         }
         if inverse {
-            let scale = 1.0 / n as f32;
-            sum_re *= scale;
-            sum_im *= scale;
+            let scale = T::one() / length;
+            sum_re = sum_re * scale;
+            sum_im = sum_im * scale;
         }
         real_out[k] = sum_re;
         imag_out[k] = sum_im;
@@ -963,6 +1025,95 @@ mod tests {
                 "{error}"
             );
             assert!(output.to_f32().iter().all(|&v| v == 123.));
+        }
+    }
+
+    #[test]
+    fn dft_real_inverse_preserves_float64_precision_in_both_opsets() {
+        let delta = 2f64.powi(-40);
+        let spectrum = Owned::f64(
+            &[2, 2, 2],
+            &[1.0 + delta, 9.0, 1.0, 11.0, 1.0, 7.0, 1.0 + delta, 13.0],
+        );
+        let inputs = [spectrum.view()];
+        let expected = Owned::f64(
+            &[2, 2, 1],
+            &[
+                1.0 + delta / 2.0,
+                delta / 2.0,
+                1.0 + delta / 2.0,
+                -delta / 2.0,
+            ],
+        );
+        for opset in [17, 20] {
+            let kernel = DftFactory.create(&irfft_node(opset), &[]).unwrap();
+            let requirement = kernel
+                .workspace_requirement(&metadata(&inputs), &[])
+                .unwrap();
+            let WorkspacePreparation::Ready(requirement) = requirement else {
+                panic!("implicit controls should give a static requirement for opset {opset}");
+            };
+            assert_eq!(
+                requirement.bytes, 64,
+                "four f64 buffers for one two-point transform, not two batches"
+            );
+            let mut output = Owned::f64(&[2, 2, 1], &[0.; 4]);
+            assert!(kernel.execute(&inputs, &mut [output.view_mut()]).is_err());
+            kernel
+                .execute_prepared(&inputs, &mut [output.view_mut()])
+                .unwrap();
+            // NumPy irfft ignores the imaginary components of DC and even Nyquist.
+            assert_eq!(output.bytes, expected.bytes, "opset {opset}");
+        }
+    }
+
+    #[test]
+    fn dft_v20_real_inverse_accepts_rank_zero_int32_length_on_nondefault_axis() {
+        let spectrum = Owned::f32(&[2, 2, 2], &[1., 9., 2., -8., 3., 4., -2., 1.]);
+        let length = Owned::i32(&[], &[5]);
+        let axis = Owned::i64(&[], &[-3]);
+        let kernel = DftFactory.create(&irfft_node(20), &[]).unwrap();
+        let mut output = Owned::zeros_f32(&[5, 2, 1]);
+        kernel
+            .execute_prepared(
+                &[spectrum.view(), length.view(), axis.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        // NumPy irfft([[1+9j, 2-8j], [3+4j, -2+1j]], n=5, axis=0).
+        let expected = [
+            1.4,
+            -0.4,
+            -0.95087004,
+            -0.2276362,
+            -1.7112768,
+            0.8120995,
+            0.16963601,
+            1.2823277,
+            2.0925107,
+            0.533209,
+        ];
+        for (i, (actual, expected)) in output.to_f32().into_iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 2e-6,
+                "index {i}: expected {expected}, got {actual}"
+            );
+        }
+
+        let spectrum = Owned::f64(&[2, 2, 2], &[1., 9., 2., -8., 3., 4., -2., 1.]);
+        let mut output = Owned::f64(&[5, 2, 1], &[0.; 10]);
+        kernel
+            .execute_prepared(
+                &[spectrum.view(), length.view(), axis.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        for (i, (bytes, expected)) in output.bytes.chunks_exact(8).zip(expected).enumerate() {
+            let actual = f64::from_ne_bytes(bytes.try_into().unwrap());
+            assert!(
+                (actual - f64::from(expected)).abs() < 2e-6,
+                "index {i}: expected {expected}, got {actual}"
+            );
         }
     }
 
