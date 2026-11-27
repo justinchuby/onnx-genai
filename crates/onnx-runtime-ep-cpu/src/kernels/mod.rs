@@ -1280,7 +1280,10 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("Einsum", "", 12),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(einsum::EinsumFactory::new(resources.clone())),
+        Box::new(einsum::EinsumFactory::new_with_native_dtype_extensions(
+            resources.clone(),
+            standalone,
+        )),
     );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),

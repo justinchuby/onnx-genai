@@ -430,7 +430,7 @@ pub(super) fn plugin_fused_output_shapes(
         }
     }
 
-    let registry = InferenceRegistry::default_registry();
+    let registry = InferenceRegistry::native_runtime_registry();
     let order = shape_graph.topological_order().ok()?;
     for node_id in order {
         let inner = shape_graph.node(node_id);

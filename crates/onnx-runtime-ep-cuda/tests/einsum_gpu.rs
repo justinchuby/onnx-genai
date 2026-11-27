@@ -588,12 +588,43 @@ fn dtypes_bmm_stride_zero_and_flattened_groups_match_f64_reference() {
         &[],
     );
     assert!(
-        claim
-            .reason()
-            .is_some_and(|reason| reason.contains("not admitted by Einsum-12")),
-        "bf16 decline must name the schema blocker: {:?}",
+        claim.is_supported(),
+        "native CUDA placement must admit executable BFloat16 at Einsum-12: {:?}",
         claim.reason()
     );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn ort_plugin_claim_keeps_official_einsum_dtype_boundary() {
+    let ep = CudaExecutionProvider::new_for_ort_plugin().expect("construct ORT-plugin CUDA EP");
+    let inputs = [
+        float_input(DataType::BFloat16, &[2, 3], &[0.0; 6]),
+        float_input(DataType::BFloat16, &[3, 4], &[0.0; 12]),
+    ];
+    let (graph, node) = common::build_graph(
+        "Einsum",
+        "",
+        27,
+        &inputs,
+        &[(DataType::BFloat16, vec![2, 4])],
+        &[("equation", Attribute::String(b"ik,kj->ij".to_vec()))],
+    );
+    let model = Model::new(&graph);
+    let claim = ep.supports_op(
+        model.graph.node(node),
+        27,
+        &[static_shape([2, 3]), static_shape([3, 4])],
+        &[DataType::BFloat16, DataType::BFloat16],
+        &[],
+    );
+    let reason = claim
+        .reason()
+        .expect("ORT plugin must retain the official Einsum-12 dtype boundary");
+    assert!(reason.contains("not admitted by Einsum-12"), "{reason}");
 }
 
 #[cfg_attr(

@@ -2078,7 +2078,7 @@ mod tests {
                 onnx_runtime_ir::static_shape([3, 4]),
             ];
             assert!(
-                !ep.supports_op(&node, 12, &shapes, &[DataType::BFloat16; 2], &[])
+                ep.supports_op(&node, 12, &shapes, &[DataType::BFloat16; 2], &[])
                     .is_supported()
             );
             assert!(
@@ -2086,6 +2086,26 @@ mod tests {
                     .is_supported()
             );
         }
+    }
+
+    #[test]
+    fn ort_plugin_keeps_official_einsum_dtype_boundary() {
+        let ep = CpuExecutionProvider::for_ort_plugin();
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes.insert(
+            "equation".into(),
+            onnx_runtime_ir::Attribute::String("ij,jk->ik".into()),
+        );
+        let shapes = [
+            onnx_runtime_ir::static_shape([2, 3]),
+            onnx_runtime_ir::static_shape([3, 4]),
+        ];
+
+        let support = ep.supports_op(&node, 27, &shapes, &[DataType::BFloat16; 2], &[]);
+        let reason = support
+            .reason()
+            .expect("ORT plugin must retain the official Einsum-12 dtype boundary");
+        assert!(reason.contains("not admitted by Einsum-12"), "{reason}");
     }
 
     #[cfg(feature = "ops-cnn")]
