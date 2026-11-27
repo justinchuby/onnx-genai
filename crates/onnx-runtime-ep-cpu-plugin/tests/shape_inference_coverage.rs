@@ -20,7 +20,6 @@
 //! op without a shape rule fails, and adding a shape rule without removing the
 //! op from the allowlist also fails. Neither direction can pass silently.
 
-use onnx_runtime_ep_cpu::kernels::build_cpu_registry;
 use onnx_runtime_ep_plugin::compute::ShapeInference;
 use onnx_runtime_ir::{Attribute, Node, NodeId, ValueId};
 
@@ -274,7 +273,8 @@ fn declines(op_type: &str, domain: &str) -> bool {
 /// an inventory built on descriptors. `keys()` is the same set `supports_op`
 /// consults, which is what makes it the right source of truth here.
 fn registered_ops() -> Vec<(String, String)> {
-    let registry = build_cpu_registry();
+    let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::for_ort_plugin();
+    let registry = ep.registry();
     let mut ops: Vec<(String, String)> = registry
         .keys()
         .filter(|k| !TEST_ONLY.contains(&k.op_type.as_str()))
@@ -461,13 +461,14 @@ fn every_registered_op_has_a_kernel_registry_entry() {
     use onnx_runtime_ir::is_default_domain;
 
     let (registry, descriptors) = build_cpu_registry_with_descriptors();
-    let is_standalone_roi_align =
-        |domain: &str, op: &str| is_default_domain(domain) && op == "RoiAlign";
+    let is_standalone_roi = |domain: &str, op: &str| {
+        is_default_domain(domain) && matches!(op, "RoiAlign" | "MaxRoiPool")
+    };
     assert!(
         descriptors
             .iter()
-            .all(|d| !is_standalone_roi_align(&d.domain, &d.op_type)),
-        "standalone-only ONNX RoiAlign must not be advertised by the ORT CPU plugin"
+            .all(|d| !is_standalone_roi(&d.domain, &d.op_type)),
+        "standalone-only ONNX ROI kernels must not be advertised by the ORT CPU plugin"
     );
     let described: std::collections::BTreeSet<(String, String)> = descriptors
         .iter()
@@ -476,7 +477,7 @@ fn every_registered_op_has_a_kernel_registry_entry() {
 
     let missing: Vec<String> = registry
         .keys()
-        .filter(|k| !is_standalone_roi_align(&k.domain, &k.op_type))
+        .filter(|k| !is_standalone_roi(&k.domain, &k.op_type))
         .filter(|k| !described.contains(&(k.domain.clone(), k.op_type.clone())))
         .map(|k| format!("{}::{}", k.domain, k.op_type))
         .collect();

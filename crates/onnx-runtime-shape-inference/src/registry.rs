@@ -40,6 +40,13 @@ impl InferenceRegistry {
         reg
     }
 
+    /// Built-in rules using standalone native executable-dtype extensions.
+    pub fn native_runtime_registry() -> Self {
+        let mut reg = Self::default_registry();
+        crate::handlers::register_native_einsum(&mut reg);
+        reg
+    }
+
     /// Register `rule` for `(domain, op)` applying from opset `min_opset`
     /// upward. A later registration at a higher `min_opset` supersedes this one
     /// for those versions.

@@ -1,7 +1,7 @@
 //! ONNX `EyeLike`: an identity-like tensor using an input only for shape and dtype.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::{DataType, Node, eye_like::Attributes};
 
 use super::{check_arity, write_dense_bytes};
 use crate::dtype::{NumericElem, write_dense};
@@ -14,31 +14,8 @@ pub struct EyeLikeFactory;
 
 impl KernelFactory for EyeLikeFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let k = match node.attr("k") {
-            None => 0,
-            Some(Attribute::Int(k)) => *k,
-            Some(_) => {
-                return Err(EpError::KernelFailed(
-                    "EyeLike: `k` must be an integer".into(),
-                ));
-            }
-        };
-        let dtype = match node.attr("dtype") {
-            None => None,
-            Some(Attribute::Int(dtype)) => {
-                let dtype = i32::try_from(*dtype).map_err(|_| {
-                    EpError::KernelFailed(format!("EyeLike: invalid dtype {dtype}"))
-                })?;
-                Some(DataType::from_onnx(dtype).ok_or_else(|| {
-                    EpError::KernelFailed(format!("EyeLike: invalid dtype {dtype}"))
-                })?)
-            }
-            Some(_) => {
-                return Err(EpError::KernelFailed(
-                    "EyeLike: `dtype` must be an integer".into(),
-                ));
-            }
-        };
+        let Attributes { k, dtype } = Attributes::parse(node)
+            .map_err(|reason| EpError::KernelFailed(format!("EyeLike: {reason}")))?;
         Ok(Box::new(EyeLikeKernel { k, dtype }))
     }
 }
@@ -102,7 +79,7 @@ fn diagonal_col(row: usize, cols: usize, k: i64) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::NodeId;
+    use onnx_runtime_ir::{Attribute, NodeId};
 
     #[test]
     fn populates_offset_diagonal() {

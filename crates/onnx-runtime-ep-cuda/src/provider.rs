@@ -1735,6 +1735,7 @@ pub struct CudaExecutionProvider {
     workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
     conv_transpose_contract: ConvTransposeContract,
+    native_einsum_dtype_extensions: bool,
     csa_metrics: Arc<CsaMetrics>,
     /// Device weight-offload policy resolved from the environment. When enabled,
     /// the EP advertises the `nxrt` weight-paging capability and pages lazy
@@ -1937,6 +1938,7 @@ impl CudaExecutionProvider {
             ordinal,
             offload_policy,
             ConvTransposeContract::Standalone,
+            true,
         )
     }
 
@@ -1944,6 +1946,7 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
         conv_transpose_contract: ConvTransposeContract,
+        native_einsum_dtype_extensions: bool,
     ) -> Result<Self> {
         Self::from_config_with_contract(
             ordinal,
@@ -1955,6 +1958,7 @@ impl CudaExecutionProvider {
                 memory: None,
             },
             conv_transpose_contract,
+            native_einsum_dtype_extensions,
         )
     }
 
@@ -2030,13 +2034,14 @@ impl CudaExecutionProvider {
     /// Construct with allocator selection complete before any runtime is exposed.
     /// An injected allocator is authoritative: the built-in VMM is never created.
     pub fn from_config(ordinal: u32, config: CudaProviderConfig) -> Result<Self> {
-        Self::from_config_with_contract(ordinal, config, ConvTransposeContract::Standalone)
+        Self::from_config_with_contract(ordinal, config, ConvTransposeContract::Standalone, true)
     }
 
     fn from_config_with_contract(
         ordinal: u32,
         config: CudaProviderConfig,
         conv_transpose_contract: ConvTransposeContract,
+        native_einsum_dtype_extensions: bool,
     ) -> Result<Self> {
         let CudaProviderConfig {
             offload_policy,
@@ -2228,6 +2233,7 @@ impl CudaExecutionProvider {
             workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
             conv_transpose_contract,
+            native_einsum_dtype_extensions,
             csa_metrics,
             offload_policy,
             residency,
@@ -2735,6 +2741,7 @@ impl CudaExecutionProvider {
             0,
             DeviceOffloadPolicy::from_env(),
             ConvTransposeContract::OrtPlugin,
+            false,
         )
     }
 
@@ -4385,13 +4392,23 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
         if op.op_type == "Einsum"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) = crate::kernels::einsum::unsupported_reason_for_opset(
-                op,
-                opset,
-                shapes,
-                input_dtypes,
-                layouts,
-            )
+            && let Some(reason) = if self.native_einsum_dtype_extensions {
+                crate::kernels::einsum::unsupported_reason_for_native_opset(
+                    op,
+                    opset,
+                    shapes,
+                    input_dtypes,
+                    layouts,
+                )
+            } else {
+                crate::kernels::einsum::unsupported_reason_for_opset(
+                    op,
+                    opset,
+                    shapes,
+                    input_dtypes,
+                    layouts,
+                )
+            }
         {
             return KernelMatch::unsupported(reason);
         }
@@ -4557,6 +4574,13 @@ impl ExecutionProvider for CudaExecutionProvider {
                 crate::kernels::deform_conv::unsupported_reason(op, opset, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "MaxRoiPool"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Err(reason) =
+                onnx_runtime_ir::max_roi_pool::validate_claim(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(format!("MaxRoiPool: {reason}"));
         }
         if (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) = crate::kernels::standard_claims::unsupported_reason_at_opset(

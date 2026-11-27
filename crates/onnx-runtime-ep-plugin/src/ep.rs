@@ -499,20 +499,25 @@ fn ep_get_capability_inner(
     let exclusions = exported.operator_exclusions;
     let claims = exported.ep.with(|ep| {
         query_plugin_capabilities(&view, ep, exclusions, |node, graph_kernel| {
+            let ir_node = view.node(node);
+            if exceeded_ort_schema_max(ir_node, ir_graph.effective_opset(ir_node).unwrap_or(0))
+                .is_some()
+            {
+                return false;
+            }
             if graph_kernel {
-                if ep.executor_kernel_scope(view.node(node))
+                if ep.executor_kernel_scope(ir_node)
                     == onnx_runtime_ep_api::ExecutorKernelScope::Required
                 {
                     return false;
                 }
-                graph_kernel_nodes.insert(view.node(node).id);
+                graph_kernel_nodes.insert(ir_node.id);
                 return true;
             }
             if is_gpu_ep && !node_inputs_all_routable(&view, node) {
                 return false;
             }
             if is_gpu_ep {
-                let ir_node = view.node(node);
                 let input_shapes: Vec<Vec<Option<usize>>> = view
                     .node_inputs(node)
                     .iter()
@@ -739,6 +744,27 @@ fn ep_get_capability_inner(
     ok_status()
 }
 
+// The shared kernel registry can execute OneHot-28, but that schema is
+// standalone-only. Apply the same ceiling to ORT descriptors and callbacks.
+fn ort_schema_max_version(op_type: &str, domain: &str) -> Option<u64> {
+    (op_type == "OneHot" && onnx_runtime_ir::is_default_domain(domain))
+        .then_some(onnx_runtime_ep_api::one_hot::BF16_SINCE_VERSION - 1)
+}
+
+fn exceeded_ort_schema_max(node: &onnx_runtime_ir::Node, opset: u64) -> Option<u64> {
+    ort_schema_max_version(&node.op_type, &node.domain).filter(|&max| opset > max)
+}
+
+fn ort_descriptor_end_version(entry: &KernelRegistryEntry) -> i32 {
+    ort_schema_max_version(entry.op_type, entry.domain).map_or(entry.end_version, |max| {
+        // CPU's v9 descriptor is otherwise open-ended. Once made finite, it
+        // must not overlap v11 or ORT rejects the duplicate type constraints.
+        let max = if entry.since_version == 9 { 10 } else { max };
+        let max = i32::try_from(max).expect("ORT schema ceiling must fit the i32 version ABI");
+        entry.end_version.min(max)
+    })
+}
+
 /// Check whether a node's input/output element types are all supported by the
 /// corresponding registry entry. Returns `true` if the node should be claimed.
 ///
@@ -757,9 +783,18 @@ pub(crate) fn node_passes_dtype_filter(
     } else {
         node.domain.as_str()
     };
-    let entry = entries
+    let matching = entries
         .iter()
-        .find(|e| e.op_type == node.op_type && e.domain == domain);
+        .filter(|entry| entry.op_type == node.op_type && entry.domain == domain)
+        .collect::<Vec<_>>();
+    let entry = match node.version.and_then(|version| i32::try_from(version).ok()) {
+        Some(version) if version > 0 => matching
+            .into_iter()
+            .filter(|entry| entry.since_version <= version && version <= entry.end_version)
+            .max_by_key(|entry| entry.since_version),
+        _ if matching.len() == 1 => matching.into_iter().next(),
+        _ => None,
+    };
     let Some(entry) = entry else {
         return false;
     };
@@ -1039,6 +1074,14 @@ fn ep_compile_inner(
                 .collect();
 
             let opset = ir_graph.effective_opset(node).unwrap_or(0);
+
+            if let Some(max) = exceeded_ort_schema_max(node, opset) {
+                cleanup_partial_infos(out_infos, i);
+                return fail_status(&format!(
+                    "Compile: subgraph {i}, node #{}: {}-{opset} is available only in standalone nxrt; use standalone nxrt or a model using a schema through opset {max}",
+                    node.id.0, node.op_type
+                ));
+            }
 
             let compiled = exported.ep.with(|ep| {
                 if graph_kernel {
@@ -1767,10 +1810,11 @@ pub fn build_ort_kernel_registry(
 
     for entry in entries {
         // Validate version range.
-        if entry.end_version < entry.since_version || entry.since_version <= 0 {
+        let end_version = ort_descriptor_end_version(entry);
+        if end_version < entry.since_version || entry.since_version <= 0 {
             failures.push(format!(
                 "{}/{}: invalid version range since={} end={}",
-                entry.domain, entry.op_type, entry.since_version, entry.end_version
+                entry.domain, entry.op_type, entry.since_version, end_version
             ));
             continue;
         }
@@ -1818,12 +1862,12 @@ pub fn build_ort_kernel_registry(
             ));
             continue;
         }
-        let s = unsafe { set_since_version(builder, entry.since_version, entry.end_version) };
+        let s = unsafe { set_since_version(builder, entry.since_version, end_version) };
         if !s.is_null() {
             unsafe { release_builder(builder) };
             failures.push(format!(
                 "{}/{}: SetSinceVersion({}, {}) failed",
-                entry.domain, entry.op_type, entry.since_version, entry.end_version
+                entry.domain, entry.op_type, entry.since_version, end_version
             ));
             continue;
         }
@@ -2230,6 +2274,48 @@ mod tests {
         assert!(entry.supported_dtypes.contains(&DataType::BFloat16));
     }
 
+    #[test]
+    fn ort_one_hot_stops_before_standalone_schema() {
+        let mut graph = onnx_runtime_ir::Graph::new();
+        graph.opset_imports.insert(String::new(), 28);
+        let mut node =
+            onnx_runtime_ir::Node::new(onnx_runtime_ir::NodeId(0), "OneHot", vec![], vec![]);
+        let entry = |domain, since_version, end_version| KernelRegistryEntry {
+            op_type: "OneHot",
+            domain,
+            since_version,
+            end_version,
+            supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
+        };
+        for v9_end in [i32::MAX, 10] {
+            // CPU passes an unbounded v9 range here; CUDA already ends it at 10.
+            let entries = [entry("", 9, v9_end), entry("", 11, i32::MAX)];
+            let ranges = entries.map(|e| (e.since_version, ort_descriptor_end_version(&e)));
+            assert_eq!(ranges, [(9, 10), (11, 27)]);
+        }
+        assert_eq!(
+            ort_descriptor_end_version(&entry("ai.onnx", 11, i32::MAX)),
+            27
+        );
+        assert_eq!(
+            ort_descriptor_end_version(&entry("com.example", 11, i32::MAX)),
+            i32::MAX
+        );
+        for version in [9, 11, 28, 29] {
+            node.version = Some(version);
+            let opset = graph.effective_opset(&node).unwrap();
+            assert_eq!(
+                exceeded_ort_schema_max(&node, opset),
+                if version < 28 { None } else { Some(27) },
+                "ORT must gate on the resolved node schema, not the model opset"
+            );
+        }
+        node.domain = "com.example".into();
+        assert!(exceeded_ort_schema_max(&node, 28).is_none());
+    }
+
     /// build_ort_kernel_registry returns None when host API is not set.
     #[test]
     fn build_registry_without_host_api_returns_none() {
@@ -2475,6 +2561,78 @@ mod tests {
         );
         let node = g.nodes.get(nid).unwrap();
         assert!(!super::node_passes_dtype_filter(node, &g, &entries,));
+    }
+
+    #[test]
+    fn dtype_filter_selects_versioned_conv_dtype_contract() {
+        let entries = vec![
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 1,
+                end_version: 21,
+                supported_dtypes: &[DataType::Float32, DataType::Float16],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 22,
+                end_version: i32::MAX,
+                supported_dtypes: &[DataType::Float32, DataType::Float16, DataType::BFloat16],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+        ];
+        for (version, accepted) in [(21, false), (22, true)] {
+            let (mut graph, id) = graph_with_node(
+                "Conv",
+                "",
+                &[DataType::BFloat16, DataType::BFloat16],
+                &[DataType::BFloat16],
+            );
+            graph.node_mut(id).version = Some(version);
+            assert_eq!(
+                super::node_passes_dtype_filter(graph.node(id), &graph, &entries),
+                accepted,
+                "BF16 Conv schema version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn dtype_filter_rejects_ambiguous_versioned_contract_without_node_version() {
+        let entries = vec![
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 1,
+                end_version: 21,
+                supported_dtypes: &[DataType::Float32],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 22,
+                end_version: i32::MAX,
+                supported_dtypes: &[DataType::Float32, DataType::BFloat16],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+        ];
+        let (graph, id) = graph_with_node(
+            "Conv",
+            "",
+            &[DataType::Float32, DataType::Float32],
+            &[DataType::Float32],
+        );
+        assert!(
+            !super::node_passes_dtype_filter(graph.node(id), &graph, &entries),
+            "multiple versioned contracts require the schema version read from ORT"
+        );
     }
 
     /// The union of an op's edge dtypes is not its kernel's rule.

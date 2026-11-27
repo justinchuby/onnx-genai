@@ -1,0 +1,15 @@
+# ONNX 622adf94d4e720142950aa8178f7357d52e63db0, onnx/defs/nn/defs.cc
+domain: ""
+name: InstanceNormalization
+since_version: 22
+doc: Normalize each channel of each sample independently.
+attributes:
+  - { name: epsilon, type: float, default: 0.00001 }
+inputs:
+  - { name: input, type_str: T }
+  - { name: scale, type_str: T }
+  - { name: B, type_str: T }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

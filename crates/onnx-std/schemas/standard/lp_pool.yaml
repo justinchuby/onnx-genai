@@ -1,0 +1,18 @@
+domain: ""
+name: LpPool
+since_version: 22
+doc: Compute the Lp norm over each sliding spatial window.
+attributes:
+  - { name: kernel_shape, type: ints, required: true }
+  - { name: strides, type: ints }
+  - { name: dilations, type: ints }
+  - { name: auto_pad, type: string, default: NOTSET }
+  - { name: pads, type: ints }
+  - { name: p, type: int, default: 2 }
+  - { name: ceil_mode, type: int, default: 0 }
+inputs:
+  - { name: X, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

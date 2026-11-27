@@ -483,6 +483,7 @@ pub struct EinsumKernel {
 pub struct EinsumFactory {
     resources: CpuMemoryResources,
     mode: Option<EinsumExecutionMode>,
+    native_dtype_extensions: bool,
 }
 
 impl EinsumFactory {
@@ -490,6 +491,18 @@ impl EinsumFactory {
         Self {
             resources,
             mode: None,
+            native_dtype_extensions: true,
+        }
+    }
+
+    pub(crate) fn new_with_native_dtype_extensions(
+        resources: CpuMemoryResources,
+        native_dtype_extensions: bool,
+    ) -> Self {
+        Self {
+            resources,
+            mode: None,
+            native_dtype_extensions,
         }
     }
 
@@ -502,6 +515,7 @@ impl EinsumFactory {
         Self {
             resources,
             mode: Some(mode),
+            native_dtype_extensions: true,
         }
     }
 }
@@ -520,7 +534,11 @@ impl KernelFactory for EinsumFactory {
         shapes: &[onnx_runtime_ir::Shape],
         input_dtypes: &[DataType],
     ) -> Option<String> {
-        unsupported_reason_for_opset(node, opset, shapes, input_dtypes)
+        if self.native_dtype_extensions {
+            unsupported_reason_for_native_opset(node, opset, shapes, input_dtypes)
+        } else {
+            unsupported_reason_for_opset(node, opset, shapes, input_dtypes)
+        }
     }
 
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -602,6 +620,25 @@ pub fn unsupported_reason_for_opset(
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<String> {
+    unsupported_reason_with_policy(node, opset, shapes, input_dtypes, false)
+}
+
+fn unsupported_reason_for_native_opset(
+    node: &Node,
+    opset: u64,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Option<String> {
+    unsupported_reason_with_policy(node, opset, shapes, input_dtypes, true)
+}
+
+fn unsupported_reason_with_policy(
+    node: &Node,
+    opset: u64,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+    native_runtime: bool,
+) -> Option<String> {
     let equation = match equation(node) {
         Ok(equation) => equation,
         Err(error) => return Some(error.to_string()),
@@ -619,7 +656,12 @@ pub fn unsupported_reason_for_opset(
         .zip(input_dtypes)
         .map(|(shape, &dtype)| EinsumInput::new(dtype, shape))
         .collect();
-    match EinsumPlan::build_for_opset(equation, &inputs, opset) {
+    let planned = if native_runtime {
+        EinsumPlan::build_for_native_opset(equation, &inputs, opset)
+    } else {
+        EinsumPlan::build_for_opset(equation, &inputs, opset)
+    };
+    match planned {
         Ok(_) => None,
         Err(error) => Some(format!(
             "Einsum canonical planning rejected `{equation}`: {error}"
@@ -753,7 +795,7 @@ impl Kernel for EinsumKernel {
             return None;
         }
         let dtype = inputs.first()?.dtype;
-        if !self.plan.schema().supports_dtype(dtype)
+        if !self.plan.schema().supports_native_dtype(dtype)
             || inputs.iter().any(|input| input.dtype != dtype)
         {
             return None;
@@ -831,7 +873,9 @@ impl EinsumKernel {
 
     fn validate_workspace_metadata(&self, inputs: &[TensorMetadata<'_>]) -> Result<DataType> {
         let dtype = inputs.first().map(|input| input.dtype).ok_or_else(|| EpError::KernelFailed("Einsum workspace needs at least one present numeric input; provide the compiled operand metadata".into()))?;
-        if inputs.len() != self.plan.operands().len() || !self.plan.schema().supports_dtype(dtype) {
+        if inputs.len() != self.plan.operands().len()
+            || !self.plan.schema().supports_native_dtype(dtype)
+        {
             return Err(EpError::KernelFailed(format!(
                 "Einsum `{}` workspace received {} operands with dtype {dtype:?}; supply {} homogeneous operands supported by {}",
                 self.plan.equation(),
@@ -957,18 +1001,14 @@ impl EinsumKernel {
                     input.device
                 )));
             }
-            if !self.plan.schema().supports_dtype(input.dtype) {
+            if !self.plan.schema().supports_native_dtype(input.dtype) {
                 return Err(EpError::KernelFailed(format!(
-                    "Einsum `{}` input #{index} has dtype {:?}, which is not admitted by {}. HOW: \
-                     use a homogeneous numeric dtype supported by that schema{}.",
+                    "Einsum `{}` input #{index} has dtype {:?}, which the native runtime cannot \
+                     execute under {}. HOW: use a homogeneous numeric dtype supported by the \
+                     native Einsum kernel.",
                     self.plan.equation(),
                     input.dtype,
-                    self.plan.schema(),
-                    if input.dtype == DataType::BFloat16 {
-                        " or import ai.onnx opset 28+ for BFloat16"
-                    } else {
-                        ""
-                    }
+                    self.plan.schema()
                 )));
             }
             if input.dtype != inputs[0].dtype {
@@ -4061,7 +4101,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_placement_declines_bfloat16_and_reaches_float16_float32() {
+    fn provider_placement_reaches_native_einsum_dtypes() {
         let provider = crate::CpuExecutionProvider::new();
 
         for dtype in [DataType::Float32, DataType::Float16] {
@@ -4111,20 +4151,17 @@ mod tests {
         let view = frozen.view();
         let node_index = view.nodes().next().expect("one Einsum node");
         let support = provider.supports_node(&view, node_index, 24);
-        assert!(!support.is_supported());
-        let reason = support.reason().expect("BFloat16 decline must explain why");
         assert!(
-            reason.contains("dtype BFloat16, which is not admitted by Einsum-12"),
-            "{reason}"
+            support.is_supported(),
+            "BFloat16 must use the native executable-dtype policy: {support:?}"
         );
-        assert!(reason.contains("import ai.onnx opset 28+"), "{reason}");
-        assert!(reason.contains("HOW:"), "{reason}");
-        assert!(
+        assert_eq!(
             OrtGraphView::new(&view)
                 .query_capabilities(&provider)
                 .unwrap()
-                .is_empty(),
-            "BFloat16 Einsum must not reach compilation through provider placement"
+                .len(),
+            1,
+            "BFloat16 Einsum must reach native provider placement"
         );
     }
 
@@ -4360,21 +4397,13 @@ mod tests {
             unsupported_reason_for_opset(&node, 12, &[int_shape], &[DataType::Int32]).is_none()
         );
 
-        let direct = kernel("i->i", &[vec![2]], ExecutionMode::Optimized);
+        let direct = kernel("i->i", &[vec![2]], ExecutionMode::GenericNative);
         let input = Owned::bf16(&[2], &[1.0, 2.0]);
-        assert!(
-            direct
-                .view_outputs(&[input.view()], &[vec![2]], 1)
-                .is_none(),
-            "BFloat16 must not bypass kernel dtype validation through a view output"
-        );
         let mut output = Owned::zeros(DataType::BFloat16, &[2]);
-        let error = direct
-            .execute(&[input.view()], &mut [output.view_mut()])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not admitted by Einsum-12"), "{error}");
-        assert!(error.contains("HOW:"), "{error}");
+        direct
+            .execute_prepared(&[input.view()], &mut [output.view_mut()])
+            .expect("native Einsum-12 BFloat16 executes");
+        assert_eq!(output.to_u16_bits(), input.to_u16_bits());
 
         let bf16 = kernel_for_opset("i->i", &[vec![2]], 28, EinsumExecutionMode::GenericNative);
         let mut output = Owned::zeros(DataType::BFloat16, &[2]);

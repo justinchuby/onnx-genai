@@ -1659,6 +1659,37 @@ mod tests {
     }
 
     #[test]
+    fn window_pool_bfloat16_starts_at_opset_22() {
+        for op_type in ["AveragePool", "MaxPool"] {
+            let mut model = one_node_model(op_type, 1, 1);
+            let node = model.graph.nodes.keys().next().unwrap();
+            model
+                .graph
+                .node_mut(node)
+                .attributes
+                .insert("kernel_shape".into(), Attribute::Ints(vec![1]));
+            model.graph.opset_imports.insert(String::new(), 21);
+            assert!(
+                model.validate().is_valid(),
+                "{op_type}-21 must preserve its legacy float32 schema"
+            );
+            for value in [model.graph.inputs[0], model.graph.outputs[0]] {
+                model.graph.value_mut(value).dtype = DataType::BFloat16;
+            }
+
+            assert!(
+                !model.validate().is_valid(),
+                "{op_type}-21 must reject bfloat16"
+            );
+            model.graph.opset_imports.insert(String::new(), 22);
+            assert!(
+                model.validate().is_valid(),
+                "{op_type}-22 must accept bfloat16"
+            );
+        }
+    }
+
+    #[test]
     fn common_builtin_arity_boundaries_pass() {
         for (op_type, inputs, outputs) in [
             ("MatMul", 2, 1),

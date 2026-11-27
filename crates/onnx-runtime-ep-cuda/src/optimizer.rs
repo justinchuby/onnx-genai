@@ -1079,7 +1079,13 @@ impl CudaDropNormalizationCasts {
         match (node.op_type.as_str(), node.domain.as_str()) {
             ("SkipSimplifiedLayerNormalization", MICROSOFT_DOMAIN) => Some(&[0, 1]),
             ("SimplifiedLayerNormalization", "" | "ai.onnx") => Some(&[0]),
-            ("RMSNormalization", "" | "ai.onnx") => Some(&[0]),
+            ("RMSNormalization", "" | "ai.onnx")
+                if node
+                    .attr("stash_type")
+                    .map_or(true, |attribute| attribute.as_int() == Some(1)) =>
+            {
+                Some(&[0])
+            }
             _ => None,
         }
     }
@@ -4517,6 +4523,10 @@ mod tests {
             lp.is_default_domain(),
             "LpNormalization stays default domain"
         );
+        assert_eq!(
+            lp.version, None,
+            "optimizer-created LpNormalization inherits the graph opset"
+        );
         assert_eq!(lp.inputs, vec![Some(x)], "reads the pre-norm activation x");
         assert_eq!(lp.outputs, vec![Some(output)], "keeps the Div output value");
         assert_eq!(
@@ -6995,6 +7005,40 @@ mod tests {
             graph.value(rms_out).dtype,
             DataType::BFloat16,
             "re-inference must keep the narrow (bf16) output, not the f32 scale dtype"
+        );
+    }
+
+    #[test]
+    fn preserves_casts_around_alternate_stash_rms_norm() {
+        let hidden = 128;
+        let (mut graph, _, _) = cast_wrapped_rms_norm_graph_bf16(hidden);
+        let rms = graph
+            .nodes
+            .values_mut()
+            .find(|node| node.op_type == "RMSNormalization")
+            .expect("RMSNormalization node exists");
+        rms.attributes
+            .insert("stash_type".into(), Attribute::Int(16));
+
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Cast")
+                .count(),
+            2,
+            "removing casts would change BFLOAT16 stage-one arithmetic"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "RMSNormalization"),
+            "alternate-stash RMSNormalization must not be rewritten to the default-stash synonym"
         );
     }
 

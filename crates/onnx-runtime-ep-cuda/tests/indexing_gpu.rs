@@ -29,6 +29,47 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn one_hot_opset28_cuda_bf16_exact_reference() {
+    let ep = common::require_cuda();
+    const OFF: u16 = 0x8000;
+    const ON: u16 = 0x7fc5;
+    let inputs = [
+        common::input(DataType::Int64, &[2, 3], &[-3_i64, -1, 3, -4, 1, 0]),
+        common::input(DataType::Int64, &[], &[3_i64]),
+        common::input(DataType::BFloat16, &[2], &[OFF, ON]),
+    ];
+    let outputs = [(DataType::BFloat16, vec![2, 3, 3])];
+    let attrs = [("axis", Attribute::Int(-2))];
+
+    for opset in [9, 11, 27] {
+        let (graph, node) = common::build_graph("OneHot", "", opset, &inputs, &outputs, &attrs);
+        let claim = ep.supports_op(
+            graph.node(node),
+            opset,
+            &[static_shape([2, 3]), static_shape([]), static_shape([2])],
+            &[DataType::Int64, DataType::Int64, DataType::BFloat16],
+            &[],
+        );
+        assert!(!claim.is_supported(), "opset {opset} must decline BF16");
+        let reason = claim.reason().expect("OneHot claim must explain rejection");
+        assert!(reason.contains("'values'"), "{reason}");
+        assert!(reason.contains("BFloat16"), "{reason}");
+        assert!(reason.contains("OneHot-28"), "{reason}");
+    }
+
+    let got = common::run_cuda(&ep, "OneHot", "", 28, &inputs, &outputs, &attrs);
+    let expected = [
+        ON, OFF, OFF, OFF, OFF, OFF, OFF, ON, OFF, // first indices row
+        OFF, OFF, ON, OFF, ON, OFF, OFF, OFF, OFF, // second indices row
+    ];
+    assert_eq!(got, [common::raw(&expected)]);
+}
+
 struct Tensor {
     dtype: DataType,
     shape: Vec<usize>,
