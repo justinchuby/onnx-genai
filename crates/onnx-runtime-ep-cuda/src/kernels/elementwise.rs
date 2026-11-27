@@ -89,6 +89,18 @@ __device__ float op_gelu_tanh(float x) {
     return x * 0.5f * (1.0f + tanhf(inner));
 }
 
+#define DEFINE_GELU_F64(NAME, EXPR) \
+extern "C" __global__ void NAME##_f64(const double* x, double* y, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) { \
+        const double v = x[i]; \
+        y[i] = isinf(v) && v < 0.0 ? 0.0 : (EXPR); \
+    } \
+}
+
+DEFINE_GELU_F64(gelu, (0.5 * v) * (1.0 + erf(v * 0.7071067811865475244)))
+DEFINE_GELU_F64(gelu_tanh, (0.5 * v) * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v))))
+
 __device__ float op_add(float a, float b) { return a + b; }
 __device__ float op_sub(float a, float b) { return a - b; }
 __device__ float op_mul(float a, float b) { return a * b; }
@@ -304,13 +316,14 @@ extern "C" __global__ void decomposed_silu_bf16(
 /// NVRTC module names (one module holds all unary / all binary entries so a
 /// runtime compiles each source string at most once — see
 /// [`CudaRuntime::nvrtc_function`]).
-const POINTWISE_MODULE: &str = "elementwise_float_v5";
+const POINTWISE_MODULE: &str = "elementwise_float_v6";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloatDtype {
     F32,
     F16,
     Bf16,
+    F64,
 }
 
 impl FloatDtype {
@@ -330,6 +343,7 @@ impl FloatDtype {
             Self::F32 => "f32",
             Self::F16 => "f16",
             Self::Bf16 => "bf16",
+            Self::F64 => "f64",
         }
     }
 }
@@ -344,7 +358,8 @@ pub enum UnaryOp {
     Sigmoid,
     Silu,
     Gelu,
-    GeluTanh,
+    StandardGeluExact,
+    StandardGeluTanh,
 }
 
 impl UnaryOp {
@@ -356,13 +371,27 @@ impl UnaryOp {
             UnaryOp::Tanh => "tanh",
             UnaryOp::Sigmoid => "sigmoid",
             UnaryOp::Silu => "silu",
-            UnaryOp::Gelu => "gelu",
-            UnaryOp::GeluTanh => "gelu_tanh",
+            UnaryOp::Gelu | UnaryOp::StandardGeluExact => "gelu",
+            UnaryOp::StandardGeluTanh => "gelu_tanh",
         }
     }
 
     fn entry(self, dtype: FloatDtype) -> String {
         format!("{}_{}", self.stem(), dtype.suffix())
+    }
+
+    fn dtype(self, dtype: DataType) -> Result<FloatDtype> {
+        if matches!(self, Self::StandardGeluExact | Self::StandardGeluTanh) {
+            return match dtype {
+                DataType::Float64 => Ok(FloatDtype::F64),
+                _ => FloatDtype::from_onnx("Gelu", "X", dtype).map_err(|_| {
+                    not_implemented(format!(
+                        "Gelu with X dtype {dtype:?} (supported: Float16, Float32, Float64, BFloat16)"
+                    ))
+                }),
+            };
+        }
+        FloatDtype::from_onnx(self.op_name(), "input", dtype)
     }
 
     /// ONNX op type this maps to (for error messages).
@@ -374,8 +403,7 @@ impl UnaryOp {
             UnaryOp::Tanh => "Tanh",
             UnaryOp::Sigmoid => "Sigmoid",
             UnaryOp::Silu => "Silu",
-            UnaryOp::Gelu => "Gelu",
-            UnaryOp::GeluTanh => "Gelu",
+            UnaryOp::Gelu | UnaryOp::StandardGeluExact | UnaryOp::StandardGeluTanh => "Gelu",
         }
     }
 }
@@ -502,22 +530,29 @@ pub struct StandardGeluFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
+impl StandardGeluFactory {
+    fn op(node: &Node) -> Result<UnaryOp> {
+        match node.attr("approximate") {
+            None => Ok(UnaryOp::StandardGeluExact),
+            Some(attribute) => match attribute.as_str() {
+                Some("none") => Ok(UnaryOp::StandardGeluExact),
+                Some("tanh") => Ok(UnaryOp::StandardGeluTanh),
+                _ => Err(EpError::KernelFailed(
+                    "cuda_ep Gelu: approximate must be 'none' or 'tanh'".into(),
+                )),
+            },
+        }
+    }
+
+    pub(super) fn validate(node: &Node, dtype: DataType) -> Result<()> {
+        Self::op(node)?.dtype(dtype).map(|_| ())
+    }
+}
+
 impl KernelFactory for StandardGeluFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let op = match node.attr("approximate") {
-            None => UnaryOp::Gelu,
-            Some(attribute) => match attribute.as_str() {
-                Some("none") => UnaryOp::Gelu,
-                Some("tanh") => UnaryOp::GeluTanh,
-                _ => {
-                    return Err(EpError::KernelFailed(
-                        "cuda_ep Gelu: approximate must be 'none' or 'tanh'".into(),
-                    ));
-                }
-            },
-        };
         Ok(Box::new(UnaryKernel {
-            op,
+            op: Self::op(node)?,
             runtime: self.runtime.clone(),
             decomposed_silu: false,
             last_capture_safe_signature: Mutex::new(None),
@@ -559,8 +594,8 @@ impl UnaryKernel {
             )));
         }
         let x = &inputs[0];
-        let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
-        if dtype != FloatDtype::F32 {
+        let dtype = self.op.dtype(x.dtype)?;
+        if matches!(dtype, FloatDtype::F16 | FloatDtype::Bf16) {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
         if outputs[0].dtype != x.dtype {
@@ -629,8 +664,8 @@ impl UnaryKernel {
                 UnaryOp::Relu => 1,
                 UnaryOp::Sqrt | UnaryOp::Erf | UnaryOp::Tanh => 1,
                 UnaryOp::Sigmoid | UnaryOp::Silu => 4,
-                UnaryOp::Gelu => 6,
-                UnaryOp::GeluTanh => 9,
+                UnaryOp::Gelu | UnaryOp::StandardGeluExact => 6,
+                UnaryOp::StandardGeluTanh => 9,
             };
             (n as u64).saturating_mul(per_element)
         });
@@ -1183,7 +1218,7 @@ mod tests {
             UnaryOp::Sigmoid,
             UnaryOp::Silu,
             UnaryOp::Gelu,
-            UnaryOp::GeluTanh,
+            UnaryOp::StandardGeluTanh,
         ];
         for op in ops {
             // Every advertised entry must be present verbatim in the NVRTC source.
@@ -1192,6 +1227,27 @@ mod tests {
                 "missing NVRTC generator for {}",
                 op.op_name()
             );
+        }
+    }
+
+    #[test]
+    fn only_standard_gelu_unary_modes_resolve_float64() {
+        for (op, expected) in [
+            (UnaryOp::StandardGeluExact, "gelu_f64"),
+            (UnaryOp::StandardGeluTanh, "gelu_tanh_f64"),
+        ] {
+            assert_eq!(op.entry(op.dtype(DataType::Float64).unwrap()), expected);
+        }
+        for op in [
+            UnaryOp::Gelu,
+            UnaryOp::Relu,
+            UnaryOp::Sqrt,
+            UnaryOp::Erf,
+            UnaryOp::Tanh,
+            UnaryOp::Sigmoid,
+            UnaryOp::Silu,
+        ] {
+            assert!(op.dtype(DataType::Float64).is_err(), "{op:?}");
         }
     }
 

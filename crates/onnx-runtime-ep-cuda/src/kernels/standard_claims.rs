@@ -836,17 +836,8 @@ fn constant_of_shape(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
 
 fn gelu(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 1, 1, 1)?;
-    require_one_of(
-        input_dtypes,
-        0,
-        &[DataType::Float16, DataType::Float32, DataType::BFloat16],
-        "X",
-    )?;
-    match node.attr("approximate") {
-        None => Ok(()),
-        Some(attribute) if matches!(attribute.as_str(), Some("none" | "tanh")) => Ok(()),
-        Some(_) => Err("attribute 'approximate' must be 'none' or 'tanh'".into()),
-    }
+    super::elementwise::StandardGeluFactory::validate(node, input_dtypes[0])
+        .map_err(|error| error.to_string())
 }
 
 fn one_hot(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
