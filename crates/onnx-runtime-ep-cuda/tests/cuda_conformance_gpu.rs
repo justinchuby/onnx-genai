@@ -1424,7 +1424,7 @@ fn lp_pool_cases() -> Vec<Case> {
             label: "LpPool[p=2,dilation,bf16]".into(),
             op: "LpPool",
             domain: "",
-            opset: 18,
+            opset: 22,
             inputs: vec![float_input(
                 DataType::BFloat16,
                 &[1, 1, 4, 4],

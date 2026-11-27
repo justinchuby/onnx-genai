@@ -31,6 +31,7 @@ pub(crate) fn unsupported_reason_at_opset(
         "Dropout" => {
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
         }
+        "LpPool" => lp_pool(node, opset, input_dtypes),
         "AveragePool" => {
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
                 .err()
@@ -103,7 +104,6 @@ pub(crate) fn unsupported_reason(
         "GlobalLpPool" => global_lp_pool(node, input_dtypes),
         "LpNormalization" => lp_normalization(node, input_dtypes),
         "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
-        "LpPool" => lp_pool(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
@@ -188,9 +188,9 @@ fn normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     Ok(())
 }
 
-fn lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn lp_pool(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 1, 1, 1)?;
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")
+    onnx_runtime_ir::lp_pool::validate_dtype(opset, input_dtypes[0])
 }
 
 fn center_crop_pad(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
