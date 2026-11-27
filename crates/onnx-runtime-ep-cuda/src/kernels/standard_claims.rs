@@ -4,6 +4,7 @@
 //! matrices. Keep their placement checks in sync with those runtime limits so a
 //! node is never claimed only to fail while constructing or executing a kernel.
 
+use onnx_runtime_ir::qlinear_matmul::{ScaleSupport, ScaleType};
 use onnx_runtime_ir::scatter::{ScatterReduction, validate_nd_index_type};
 use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 
@@ -44,6 +45,11 @@ pub(crate) fn unsupported_reason_at_opset(
                 grid_sample(node, input_shapes, input_dtypes)
             }
         },
+        "QLinearMatMul" => qlinear_matmul(
+            node,
+            super::qlinear_matmul::scale_support(conv_transpose_contract),
+            input_dtypes,
+        ),
         "Dropout" => {
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
         }
@@ -128,7 +134,6 @@ pub(crate) fn unsupported_reason(
         "GroupNormalization" => normalization(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
         "Col2Im" => col2im(node, input_dtypes),
-        "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
         _ => return None,
     };
@@ -242,7 +247,11 @@ fn col2im(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     require_dtype(input_dtypes, 2, DataType::Int64, "block_shape")
 }
 
-fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn qlinear_matmul(
+    node: &Node,
+    scale_support: ScaleSupport,
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
     required_arity(node, input_dtypes, 8, 1, 1)?;
     for (index, name) in [(0, "A"), (3, "B"), (7, "y_zero_point")] {
         require_one_of(
@@ -253,9 +262,12 @@ fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
         )?;
     }
 
-    for (index, name) in [(1, "a_scale"), (4, "b_scale"), (6, "y_scale")] {
-        require_dtype(input_dtypes, index, DataType::Float32, name)?;
-    }
+    ScaleType::resolve(
+        scale_support,
+        input_dtypes[1],
+        input_dtypes[4],
+        input_dtypes[6],
+    )?;
     if input_dtypes[2] != input_dtypes[0] {
         return Err("a_zero_point dtype must match A".into());
     }

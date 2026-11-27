@@ -1829,11 +1829,26 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("QLinearMatMul", "", 10),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(qlinear_matmul::QLinearMatMulFactory::new(
-            retain_caches,
-            derived_weights.clone(),
-        )),
+        Box::new(
+            qlinear_matmul::QLinearMatMulFactory::new(retain_caches, derived_weights.clone())
+                .with_scale_support(
+                    onnx_runtime_ir::qlinear_matmul::ScaleSupport::for_standalone(standalone),
+                ),
+        ),
     );
+    if standalone {
+        let version = onnx_runtime_ir::qlinear_matmul::HALF_SCALE_SINCE_VERSION;
+        rec.register(
+            OpKey::new("QLinearMatMul", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(
+                qlinear_matmul::QLinearMatMulFactory::new(retain_caches, derived_weights.clone())
+                    .with_scale_support(
+                        onnx_runtime_ir::qlinear_matmul::ScaleSupport::FloatAndHalf,
+                    ),
+            ),
+        );
+    }
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
     rec.register(
@@ -3742,10 +3757,11 @@ mod tests {
         // Opset-28 Cast adds one registration.
         // MeanVarianceNormalization-29 adds one registration.
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
+        // Standalone QLinearMatMul-21 adds one registration.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 134
+                + 135
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );

@@ -1162,13 +1162,26 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
-        OpKey::new("QLinearMatMul", "", 10),
-        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(qlinear_matmul::QLinearMatMulFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    let scale_support = qlinear_matmul::scale_support(conv_transpose_contract);
+    let versions: &[u64] =
+        if scale_support == onnx_runtime_ir::qlinear_matmul::ScaleSupport::FloatAndHalf {
+            &[
+                10,
+                onnx_runtime_ir::qlinear_matmul::HALF_SCALE_SINCE_VERSION,
+            ]
+        } else {
+            &[10]
+        };
+    for &since_version in versions {
+        reg.register(
+            OpKey::new("QLinearMatMul", "", since_version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(qlinear_matmul::QLinearMatMulFactory {
+                runtime: runtime.clone(),
+                scale_support,
+            }),
+        );
+    }
     reg.register(
         OpKey::new("Resize", "", 10),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
