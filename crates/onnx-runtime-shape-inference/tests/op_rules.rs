@@ -670,7 +670,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        244,
+        245,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        299,
+        301,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -5381,6 +5381,60 @@ fn ints(values: &[i64]) -> Attribute {
 }
 
 #[test]
+fn max_roi_pool_preserves_symbolic_region_and_channel_dims() {
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[2, 3]));
+    assert_eq!(
+        out_shape(&run(
+            &n,
+            vec![
+                tin(DataType::BFloat16, vec![c(2), sym(0), c(8), c(9)]),
+                tin(DataType::BFloat16, vec![sym(1), c(5)]),
+            ],
+            22,
+        )),
+        vec![sym(1), sym(0), c(2), c(3)],
+    );
+}
+
+#[test]
+fn max_roi_pool_shape_and_versioned_type_contract() {
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[2, 3]));
+    let inputs = |x, rois, columns| {
+        vec![
+            tin(x, vec![c(2), c(5), c(8), c(9)]),
+            tin(rois, vec![c(7), c(columns)]),
+        ]
+    };
+    use DataType::{BFloat16, Float32, Float64};
+    assert_eq!(
+        out_shape(&run(&n, inputs(Float64, Float64, 5), 19)),
+        vec![c(7), c(5), c(2), c(3)]
+    );
+    assert_eq!(
+        out_shape(&run(&n, inputs(BFloat16, BFloat16, 5), 22)),
+        vec![c(7), c(5), c(2), c(3)]
+    );
+    for (x, rois, columns, opset, reason) in [
+        (BFloat16, BFloat16, 5, 21, "requires opset 22"),
+        (Float32, Float64, 5, 22, "must match"),
+        (Float32, Float32, 4, 22, "5 columns"),
+    ] {
+        let error = try_run(&n, inputs(x, rois, columns), opset).unwrap_err();
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    let wide = i64::from(i32::MAX) + 1;
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[1, wide]));
+    assert_eq!(
+        out_shape(&run(
+            &n,
+            vec![f32in(vec![c(1), c(5), c(8), c(9)]), f32in(vec![c(0), c(5)])],
+            22,
+        )),
+        vec![c(0), c(5), c(1), c(wide)],
+    );
+}
+
+#[test]
 fn deform_conv_shapes_follow_geometry_and_versioned_types() {
     let n = with_attr(node("DeformConv", 3, 1), "strides", ints(&[2]));
     let inputs = |dtype, offset_channels| {
@@ -7581,6 +7635,8 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "MatMul", 1),
     ("", "Max", 1),
     ("", "MaxPool", 1),
+    ("", "MaxRoiPool", 1),
+    ("", "MaxRoiPool", 22),
     ("", "MaxUnpool", 9),
     ("", "MaxUnpool", 11),
     ("", "MaxUnpool", 22),

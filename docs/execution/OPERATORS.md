@@ -67,6 +67,7 @@ plugin EPs (via C ABI bridge) handle them.
 |----|-------------|-------|
 | Conv | 1 | Vision encoders, 1D conv in some LLMs. |
 | MaxPool | 1 | Vision. |
+| MaxRoiPool | 1, 22 | Standalone CPU and CUDA. Quantized, inclusive NCHW ROI pooling; opset 22 adds bfloat16. |
 | AveragePool | 1 | Vision. |
 | GlobalAveragePool | 1 | |
 | BatchNormalization | 7 | Vision backbones. |

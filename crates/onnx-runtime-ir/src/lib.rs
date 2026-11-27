@@ -64,6 +64,7 @@ mod graph_view;
 mod layout;
 pub mod linear_attention;
 pub mod lp_pool;
+pub mod max_roi_pool;
 pub mod max_unpool;
 mod node;
 pub mod onnx;
