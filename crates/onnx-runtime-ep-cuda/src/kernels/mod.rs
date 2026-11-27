@@ -70,6 +70,7 @@ mod gqa_decode;
 mod gqa_decode_bf16;
 mod gqa_decode_fp16;
 pub mod grid_sample;
+mod grid_sample_ort;
 pub mod group_normalization;
 pub mod group_query_attention;
 mod grouped_matmul;
@@ -1175,14 +1176,25 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
-    for since_version in [16_u32, 20] {
-        reg.register(
-            OpKey::new("GridSample", "", u64::from(since_version)),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(grid_sample::GridSampleFactory {
+    let grid_sample_versions: &[u32] = match conv_transpose_contract {
+        conv_transpose::Contract::Standalone => &[16, 20, 22],
+        conv_transpose::Contract::OrtPlugin => &[16, 20],
+    };
+    for &since_version in grid_sample_versions {
+        let factory: Box<dyn onnx_runtime_ep_api::KernelFactory> = match conv_transpose_contract {
+            conv_transpose::Contract::Standalone => Box::new(grid_sample::GridSampleFactory {
                 runtime: runtime.clone(),
                 since_version,
             }),
+            conv_transpose::Contract::OrtPlugin => Box::new(grid_sample_ort::GridSampleFactory {
+                runtime: runtime.clone(),
+                since_version,
+            }),
+        };
+        reg.register(
+            OpKey::new("GridSample", "", u64::from(since_version)),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            factory,
         );
     }
     for version in onnx_runtime_ir::roi_align::VERSIONS {
