@@ -4415,3 +4415,171 @@ fn eye_like_22_native_cuda_matches_onnx_reference() {
         );
     }
 }
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn pad_low_bit_native_cuda_conformance() {
+    let ep = require_cuda();
+    // Raw lanes, least-significant lane first. Expected bytes are hand-packed
+    // from the ONNX index/fill result, not produced by the CPU kernel.
+    for (dtype, opset, mode, raw, in_shape, pads, out_shape, fill, axes, expected) in [
+        (
+            DataType::Int4,
+            21,
+            "constant",
+            &[0xf8u8, 0xe7][..],
+            &[3usize][..],
+            [1i64, 1],
+            &[5usize][..],
+            None,
+            None,
+            &[0x80u8, 0x7f, 0][..],
+        ),
+        (
+            DataType::Uint4,
+            21,
+            "constant",
+            &[0x21, 0x43, 0x65],
+            &[2, 3],
+            [2, 0],
+            &[2, 5],
+            Some(0xfdu8),
+            Some(-1i32),
+            &[0xdd, 0x21, 0xd3, 0x4d, 0x65],
+        ),
+        (
+            DataType::Float4E2M1,
+            23,
+            "reflect",
+            &[0x28, 0x6d],
+            &[4],
+            [-1, 2],
+            &[5],
+            None,
+            None,
+            &[0xd2, 0xd6, 0x02],
+        ),
+        (
+            DataType::Int2,
+            25,
+            "wrap",
+            &[0xe4, 0xfd],
+            &[5],
+            [3, -1],
+            &[7],
+            None,
+            None,
+            &[0x39, 0x39],
+        ),
+        (
+            DataType::Uint2,
+            25,
+            "edge",
+            &[0xf2],
+            &[3],
+            [-1, 3],
+            &[5],
+            None,
+            None,
+            &[0xfc, 0x03],
+        ),
+        (
+            DataType::Uint2,
+            25,
+            "constant",
+            &[0xf2],
+            &[3],
+            [-4, 6],
+            &[5],
+            None,
+            None,
+            &[0, 0],
+        ),
+        (
+            DataType::Float8E8M0,
+            24,
+            "constant",
+            &[0x7f, 0x80],
+            &[2],
+            [1, 0],
+            &[3],
+            None,
+            Some(-1),
+            &[0xff, 0x7f, 0x80],
+        ),
+    ] {
+        let mut inputs = vec![
+            input(dtype, in_shape, raw),
+            input(DataType::Int64, &[2], &pads),
+        ];
+        if let Some(fill) = fill {
+            inputs.push(input(dtype, &[], &[fill]));
+        } else if axes.is_some() {
+            inputs.push(common::absent_input(dtype));
+        }
+
+        if let Some(axis) = axes {
+            inputs.push(input(DataType::Int32, &[1], &[axis]));
+        }
+        let outputs = [(dtype, out_shape.to_vec())];
+        let attrs = [("mode", Attribute::String(mode.into()))];
+        let (graph, node) = common::build_graph("Pad", "", opset, &inputs, &outputs, &attrs);
+        let claim = onnx_runtime_ep_api::ExecutionProvider::supports_op(
+            &ep,
+            graph.node(node),
+            opset - 1,
+            &[],
+            &[dtype],
+            &[],
+        );
+        assert!(
+            claim
+                .reason()
+                .is_some_and(|reason| reason.contains(&format!("requires opset {opset}"))),
+            "{dtype:?}: {:?}",
+            claim.reason()
+        );
+        let got = run_cuda(&ep, "Pad", "", opset, &inputs, &outputs, &attrs);
+        assert_eq!(got[0], expected, "{dtype:?}, {mode}");
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn pad_preserves_cuda_ort_descriptor_and_byte_axes_contract() {
+    let ep = require_cuda();
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
+    let pad = descriptors
+        .iter()
+        .find(|entry| entry.op_type == "Pad" && entry.domain.is_empty())
+        .unwrap();
+    for (dtype, accepted) in [
+        (DataType::Float32, true),
+        (DataType::Float64, false),
+        (DataType::Int4, false),
+        (DataType::Uint4, false),
+        (DataType::Float4E2M1, false),
+        (DataType::Float8E8M0, false),
+        (DataType::Int2, false),
+        (DataType::Uint2, false),
+    ] {
+        assert_eq!(pad.supported_dtypes.contains(&dtype), accepted, "{dtype:?}");
+    }
+
+    let mut inputs = [
+        input(DataType::Uint8, &[2], &[1u8, 2]),
+        input(DataType::Int64, &[2], &[1i64, 0]),
+        common::absent_input(DataType::Uint8),
+        input(DataType::Int32, &[1], &[-1i32]),
+    ];
+    let outputs = [(DataType::Uint8, vec![3])];
+    let error = common::try_run_cuda(&ep, "Pad", "", 25, &inputs, &outputs, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("axes must have Int64 dtype"), "{error}");
+    inputs[3] = input(DataType::Int64, &[1], &[-1i64]);
+    assert_eq!(
+        run_cuda(&ep, "Pad", "", 25, &inputs, &outputs, &[])[0],
+        [0, 1, 2]
+    );
+}

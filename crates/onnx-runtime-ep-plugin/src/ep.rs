@@ -2493,6 +2493,47 @@ mod tests {
         assert!(super::node_passes_dtype_filter(node, &g, &entries,));
     }
 
+    #[test]
+    fn dtype_filter_keeps_standalone_pad_types_out_of_cpu_ort_claims() {
+        let (_, descriptors) = onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors();
+        let pad = descriptors
+            .iter()
+            .find(|entry| entry.op_type == "Pad" && entry.domain.is_empty())
+            .unwrap();
+        let entries = [KernelRegistryEntry {
+            op_type: "Pad",
+            domain: "",
+            since_version: 1,
+            end_version: i32::MAX,
+            supported_dtypes: pad.supported_dtypes,
+            input_dtype_constraints: onnx_runtime_ep_cpu::kernels::input_dtype_constraints_for_op(
+                &pad.op_type,
+                &pad.domain,
+            ),
+            output_dtype_constraints: onnx_runtime_ep_cpu::kernels::output_dtype_constraints_for_op(
+                &pad.op_type,
+                &pad.domain,
+            ),
+        }];
+        for (dtype, accepted) in [
+            (DataType::Float32, true),
+            (DataType::Float64, true),
+            (DataType::Int4, false),
+            (DataType::Uint4, false),
+            (DataType::Float4E2M1, false),
+            (DataType::Float8E8M0, false),
+            (DataType::Int2, false),
+            (DataType::Uint2, false),
+        ] {
+            let (g, id) = graph_with_node("Pad", "", &[dtype, DataType::Int64], &[dtype]);
+            assert_eq!(
+                super::node_passes_dtype_filter(g.node(id), &g, &entries),
+                accepted,
+                "{dtype:?}"
+            );
+        }
+    }
+
     /// Node with unsupported dtype (Int64 for Add that only supports f32/f16)
     /// is NOT claimed.
     #[test]

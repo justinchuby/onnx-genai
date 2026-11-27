@@ -77,6 +77,7 @@ pub mod packed_arithmetic;
 pub mod packed_integer;
 pub mod packed_matmul;
 pub mod packed_routed;
+pub mod pad;
 pub mod pattern;
 pub mod pooling;
 pub mod qlinear_matmul;
