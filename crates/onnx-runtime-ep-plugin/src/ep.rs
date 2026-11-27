@@ -182,6 +182,17 @@ pub const STANDALONE_CAUSAL_CONV: OperatorExclusions = &[OperatorExclusion {
     since_version: 29,
 }];
 
+/// Native RNN support is standalone-only; ORT retains its existing RNN placement.
+pub const STANDALONE_RNN_EXCLUSION: OperatorExclusions = &[OperatorExclusion {
+    domain: "",
+    op_type: "RNN",
+    since_version: 0,
+}];
+
+/// Apply both standalone-only rules with a single factory update.
+pub const STANDALONE_CAUSAL_CONV_AND_RNN: OperatorExclusions =
+    &[STANDALONE_CAUSAL_CONV[0], STANDALONE_RNN_EXCLUSION[0]];
+
 pub(crate) fn first_excluded_revision(
     exclusions: OperatorExclusions,
     domain: &str,

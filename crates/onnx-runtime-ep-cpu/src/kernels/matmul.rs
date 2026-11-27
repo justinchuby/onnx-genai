@@ -12413,6 +12413,9 @@ mod weight_cache_accounting {
             "MaxRoiPool" => {
                 NoWeightCache("pools execution-local feature maps without retaining inputs")
             }
+            "RNN" => {
+                NoWeightCache("W/R weights and any transformed staging remain execution-local")
+            }
             "RoiAlign" => NoWeightCache(
                 "retains only parsed attributes; tensor copies and pooled output staging are per execution",
             ),

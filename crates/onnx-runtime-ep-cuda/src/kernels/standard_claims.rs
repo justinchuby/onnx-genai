@@ -26,6 +26,7 @@ pub(crate) fn unsupported_reason_at_opset(
                 .filter(|&&dtype| dtype != DataType::Undefined)
                 .and_then(|&dtype| onnx_runtime_ir::pad::validate_dtype(dtype, opset).err());
         }
+        "RNN" => return onnx_runtime_ep_api::rnn::unsupported_reason(node, input_dtypes),
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
         "Mod"

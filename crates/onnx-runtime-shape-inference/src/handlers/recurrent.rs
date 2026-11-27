@@ -11,6 +11,7 @@ fn recurrent(
     ctx: &mut InferenceContext,
     state_outputs: usize,
     honor_layout: bool,
+    infer_hidden_from_r: bool,
 ) -> Result<(), ShapeInferError> {
     let Some(x) = ctx.input_type(0).cloned() else {
         return Ok(());
@@ -18,13 +19,15 @@ fn recurrent(
     if x.shape.len() != 3 {
         return Ok(());
     }
-    let Some(hidden_size) = ctx
-        .node
-        .attr("hidden_size")
-        .and_then(Attribute::as_int)
-        .filter(|&size| size > 0)
-    else {
-        return Ok(());
+    let hidden = match ctx.node.attr("hidden_size") {
+        Some(Attribute::Int(size)) if *size > 0 => DimExpr::constant(*size),
+        None if infer_hidden_from_r => {
+            let Some(r) = ctx.input_type(2).filter(|r| r.shape.len() == 3) else {
+                return Ok(());
+            };
+            r.shape[2].clone()
+        }
+        _ => return Ok(()),
     };
     let num_directions = match ctx
         .node
@@ -49,7 +52,6 @@ fn recurrent(
         (x.shape[0].clone(), x.shape[1].clone())
     };
     let directions = DimExpr::constant(num_directions);
-    let hidden = DimExpr::constant(hidden_size);
     let y_shape = if batch_major {
         vec![batch.clone(), sequence, directions.clone(), hidden.clone()]
     } else {
@@ -71,27 +73,27 @@ fn recurrent(
 }
 
 fn rnn_pre_14(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    recurrent(ctx, 1, false)
+    recurrent(ctx, 1, false, false)
 }
 
 fn rnn_14(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    recurrent(ctx, 1, true)
+    recurrent(ctx, 1, true, true)
 }
 
 fn gru_pre_14(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    recurrent(ctx, 1, false)
+    recurrent(ctx, 1, false, false)
 }
 
 fn gru_14(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    recurrent(ctx, 1, true)
+    recurrent(ctx, 1, true, false)
 }
 
 fn lstm_pre_14(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    recurrent(ctx, 2, false)
+    recurrent(ctx, 2, false, false)
 }
 
 fn lstm_14(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    recurrent(ctx, 2, true)
+    recurrent(ctx, 2, true, false)
 }
 
 /// Register recurrent neural-network rules at their layout schema boundary.
