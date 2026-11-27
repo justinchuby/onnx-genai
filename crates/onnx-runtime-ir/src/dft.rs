@@ -1,7 +1,40 @@
 //! Shared ONNX DFT mode and real/complex geometry.
 //! See <https://onnx.ai/onnx/operators/onnx__DFT.html> (schemas 17 and 20).
 
-use crate::Node;
+use crate::{DataType, Node};
+
+pub fn default_axis(node: &Node, opset: u64) -> i64 {
+    if opset >= 20 {
+        -2
+    } else {
+        node.attr("axis")
+            .and_then(|attr| attr.as_int())
+            .unwrap_or(1)
+    }
+}
+
+pub fn normalize_axis(axis: i64, rank: usize) -> Result<usize, String> {
+    let r = i64::try_from(rank).map_err(|_| format!("DFT: rank {rank} exceeds i64"))?;
+    let normalized = if axis < 0 { axis + r } else { axis };
+    if normalized < 0 || normalized >= r - 1 {
+        return Err(format!(
+            "DFT: axis {axis} is invalid for rank {rank}; the final complex-component dimension is not a signal axis"
+        ));
+    }
+    Ok(normalized as usize)
+}
+
+pub fn explicit_length(length: i64) -> Result<usize, String> {
+    let length = usize::try_from(length).map_err(|_| {
+        format!("DFT: dft_length must be positive and fit the native index size, got {length}")
+    })?;
+    DftMode::validate_length(length)?;
+    Ok(length)
+}
+
+pub fn is_length_dtype(dtype: DataType) -> bool {
+    matches!(dtype, DataType::Int32 | DataType::Int64)
+}
 
 /// The transform's semantic mode, independent of backend or FFT algorithm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +122,14 @@ impl DftMode {
 
     pub fn output_length(self, length: usize) -> usize {
         if self == Self::RealForward {
+            length / 2 + 1
+        } else {
+            length
+        }
+    }
+
+    pub fn input_length(self, length: usize) -> usize {
+        if self == Self::RealInverse {
             length / 2 + 1
         } else {
             length

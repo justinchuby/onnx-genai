@@ -33,10 +33,24 @@ unsafe fn assignments(
     api: *const ort::OrtApi,
     session: *mut ort::OrtSession,
 ) -> Vec<(String, String)> {
+    unsafe {
+        assignments_by(api, session, |node, label| {
+            (*api).EpAssignedNode_GetOperatorType.unwrap()(node, label)
+        })
+    }
+}
+
+unsafe fn assignments_by(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    get_node_label: impl Fn(
+        *const ort::OrtEpAssignedNode,
+        *mut *const std::ffi::c_char,
+    ) -> *mut ort::OrtStatus,
+) -> Vec<(String, String)> {
     let get_info = unsafe { (*api).Session_GetEpGraphAssignmentInfo.unwrap() };
     let get_ep_name = unsafe { (*api).EpAssignedSubgraph_GetEpName.unwrap() };
     let get_nodes = unsafe { (*api).EpAssignedSubgraph_GetNodes.unwrap() };
-    let get_op_type = unsafe { (*api).EpAssignedNode_GetOperatorType.unwrap() };
     let mut subgraphs: *const *const ort::OrtEpAssignedSubgraph = ptr::null();
     let mut subgraph_count = 0usize;
     unsafe {
@@ -70,17 +84,17 @@ unsafe fn assignments(
             )
         };
         for node_index in 0..node_count {
-            let mut op_type = ptr::null();
+            let mut label = ptr::null();
             unsafe {
                 check(
                     api,
-                    get_op_type(*nodes.add(node_index), &mut op_type),
-                    "EpAssignedNode_GetOperatorType",
+                    get_node_label(*nodes.add(node_index), &mut label),
+                    "read assigned node label",
                 )
             };
             result.push((
                 ep_name.clone(),
-                unsafe { CStr::from_ptr(op_type) }
+                unsafe { CStr::from_ptr(label) }
                     .to_string_lossy()
                     .into_owned(),
             ));
@@ -230,7 +244,7 @@ unsafe fn session_with_fallback(
         verify_squeeze_fixture(&parsed);
     } else if model == "reduce_sum_device_axes" {
         verify_reduce_sum_fixture(&parsed);
-    } else {
+    } else if model != "dft_modes" {
         verify_fixture(model, &parsed);
     }
     let bytes = ort_fixture_bytes(&text);
@@ -256,6 +270,37 @@ unsafe fn session_with_fallback(
         session,
         registration,
     })
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device and ORT; enable the gpu-tests feature on a CUDA runner"
+)]
+fn cuda_plugin_dft_declines_implicit_irfft_but_claims_rfft() {
+    let _lock = lock_ort();
+    let session = unsafe { session_with_fallback("dft_modes", "cuda_dft_modes", false) }
+        .expect("DFT plugin assignment requires ORT and the CUDA-enabled plugin");
+    let assigned = unsafe {
+        assignments_by(session.api, session.session, |node, label| {
+            (*session.api).EpAssignedNode_GetName.unwrap()(node, label)
+        })
+    };
+    assert!(
+        assigned
+            .iter()
+            .any(|(ep, name)| ep == "cuda_ep" && name == "rfft"),
+        "forward one-sided DFT must remain on the plugin: {assigned:?}"
+    );
+    assert!(
+        assigned
+            .iter()
+            .any(|(ep, name)| ep == "CPUExecutionProvider" && name == "irfft")
+            && !assigned
+                .iter()
+                .any(|(ep, name)| ep == "cuda_ep" && name == "irfft"),
+        "implicit-control inverse one-sided DFT must fall back to CPU: {assigned:?}"
+    );
 }
 
 fn verify_signal_fixture(name: &str, model: &onnx_std::Model) {

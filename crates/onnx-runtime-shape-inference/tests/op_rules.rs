@@ -6538,6 +6538,31 @@ fn dft_v20_axis_input_default_and_unknown() {
 }
 
 #[test]
+fn dft_v20_irfft_int32_length_on_nondefault_axis_and_dynamic_length() {
+    let inverse = |inputs| {
+        with_attr(
+            with_attr(node("DFT", inputs, 1), "onesided", Attribute::Int(1)),
+            "inverse",
+            Attribute::Int(1),
+        )
+    };
+    let data = || f32in(vec![c(2), c(3), c(4), c(2)]);
+
+    let odd = run(
+        &inverse(3),
+        vec![data(), sd_int_scalar(DataType::Int32, c(5)), i64_scalar(-3)],
+        20,
+    );
+    assert_eq!(out_shape(&odd), vec![c(2), c(5), c(4), c(1)]);
+
+    let dynamic = run(&inverse(2), vec![data(), NodeIo::default()], 20);
+    let shape = out_shape(&dynamic);
+    assert_eq!(&shape[..2], &[c(2), c(3)]);
+    assert_symbolic(&shape[2]);
+    assert_eq!(shape[3], c(1));
+}
+
+#[test]
 fn stft_frame_length_window_and_onesided_default() {
     // frame_length = 16, frame_step = 4, signal_length = 64, onesided default 1
     // -> frames = (64-16)/4 + 1 = 13, bins = 16/2 + 1 = 9.
