@@ -34,19 +34,33 @@ const PROFILES: &[(&str, usize, usize)] = &[
 ];
 
 fn graph(profile: &str, width: usize, dtype: DataType, expose_decoded: bool) -> Graph {
+    gather_graph(profile, width, dtype, expose_decoded, width * 3, 3)
+}
+
+fn gather_graph(
+    profile: &str,
+    width: usize,
+    dtype: DataType,
+    expose_decoded: bool,
+    row_elements: usize,
+    index_count: usize,
+) -> Graph {
     let rows = 4usize;
-    let row_elements = width * 3;
     let bytes = PROFILES
         .iter()
         .find_map(|&(name, _, bytes)| (name == profile).then_some(bytes))
         .unwrap();
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 29);
-    let packed =
-        graph.create_named_value("packed", DataType::Uint8, static_shape([rows * 3 * bytes]));
-    let indices = graph.create_named_value("indices", DataType::Int64, static_shape([3]));
+    let packed = graph.create_named_value(
+        "packed",
+        DataType::Uint8,
+        static_shape([rows * (row_elements / width) * bytes]),
+    );
+    let indices = graph.create_named_value("indices", DataType::Int64, static_shape([index_count]));
     let decoded = graph.create_named_value("decoded", dtype, static_shape([rows, row_elements]));
-    let output = graph.create_named_value("output", dtype, static_shape([3, row_elements]));
+    let output =
+        graph.create_named_value("output", dtype, static_shape([index_count, row_elements]));
     graph.add_input(packed);
     graph.add_input(indices);
     let mut dq = Node::new(
@@ -356,4 +370,96 @@ fn packed_gather_cuda_preserves_index_validation() {
         .unwrap()
     };
     verify_bad_index(build(false), build(true));
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn packed_gather_cuda_empty_output_preserves_index_validation() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+    use onnx_runtime_session::DeviceGraphCaptureResult;
+    use std::{path::Path, sync::Arc};
+
+    let provider = Arc::new(CudaExecutionProvider::initialized(0).expect("initialize CUDA"));
+    let runtime = provider.runtime();
+    let build = |row_elements, count| {
+        let session = InferenceSession::from_graph_with_provider(
+            gather_graph("q4_0", 32, DataType::Float32, false, row_elements, count),
+            Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+            provider.clone(),
+            None,
+        )
+        .unwrap();
+        assert!(session.execution_provider_fallback_report().is_none());
+        assert_eq!(ops(&session, dequantize_packed_gather::OP), 1);
+        session
+    };
+
+    let mut session = build(0, 3);
+    let packed = Tensor::from_raw(DataType::Uint8, vec![0], &[]).unwrap();
+    let valid = Tensor::from_i64(&[3], &[0, -4, 3]).unwrap();
+    let invalid = Tensor::from_i64(&[3], &[0, 1, 4]).unwrap();
+    runtime.set_defer_eager_sync(false);
+    let got = session
+        .run(&[("packed", &packed), ("indices", &valid)])
+        .unwrap();
+    assert_eq!(got[0].shape, [3, 0]);
+    assert!(got[0].as_bytes().is_empty());
+    let error = session
+        .run(&[("packed", &packed), ("indices", &invalid)])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("index 4 is out of range for decoded axis 0 dimension 4"),
+        "{error}"
+    );
+
+    runtime.set_defer_eager_sync(true);
+    let got = session
+        .run(&[("packed", &packed), ("indices", &valid)])
+        .unwrap();
+    assert_eq!(got[0].shape, [3, 0]);
+    assert!(got[0].as_bytes().is_empty());
+    let error = session
+        .run(&[("packed", &packed), ("indices", &invalid)])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("flags=0x40"), "{error}");
+
+    let mut bindings = [
+        session
+            .allocate_device_binding("packed", None::<String>, DataType::Uint8, vec![0], vec![0])
+            .unwrap(),
+        session
+            .allocate_device_binding("indices", None::<String>, DataType::Int64, vec![3], vec![3])
+            .unwrap(),
+        session
+            .allocate_device_output_binding("output", DataType::Float32, vec![3, 0], vec![3, 0])
+            .unwrap(),
+    ];
+    bindings[1].write_bytes(0, valid.as_bytes()).unwrap();
+    assert!(matches!(
+        session
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap(),
+        DeviceGraphCaptureResult::Captured(_)
+    ));
+    assert_eq!(session.captured_graph_segment_count(), 1);
+    bindings[2].read_bytes_into(&mut []).unwrap();
+    let below_range = Tensor::from_i64(&[3], &[0, 1, -5]).unwrap();
+    bindings[1].write_bytes(0, below_range.as_bytes()).unwrap();
+    let error = session
+        .replay_device_graph(&mut bindings)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("flags=0x40"), "{error}");
+
+    let mut empty = build(32, 0);
+    let packed = Tensor::from_raw(DataType::Uint8, vec![4 * 18], &[0; 4 * 18]).unwrap();
+    let indices = Tensor::from_i64(&[0], &[]).unwrap();
+    let got = empty
+        .run(&[("packed", &packed), ("indices", &indices)])
+        .unwrap();
+    assert_eq!(got[0].shape, [0, 32]);
+    assert!(got[0].as_bytes().is_empty());
 }
