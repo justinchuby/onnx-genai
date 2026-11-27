@@ -89,6 +89,110 @@ fn cpu_dft_at(
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn dft_v20_irfft_odd_int32_truncates_half_spectrum_on_a_non_last_axis() {
+    let _suite_lock = lock_dft_gpu();
+    let ep = require_cuda();
+    let spectrum = float_input(
+        DataType::Float32,
+        &[4, 2, 2],
+        &[
+            1., 9., 2., -8., 3., 4., -2., 1., 5., -6., 4., 2., 100., 100., 200., -100.,
+        ],
+    );
+    let attrs = [
+        ("inverse", Attribute::Int(1)),
+        ("onesided", Attribute::Int(1)),
+    ];
+    let optional = [
+        input(DataType::Int32, &[], &[5_i32]),
+        input(DataType::Int64, &[], &[-3_i64]),
+    ];
+    let actual = dft(&ep, spectrum, &[5, 2, 1], &attrs, &optional);
+    // np.fft.irfft([[1+9j, 2-8j], [3+4j, -2+1j], [5-6j, 4+2j],
+    //               [100+100j, 200-100j]], n=5, axis=0)
+    assert_close(
+        &actual,
+        &[
+            3.4,
+            1.2,
+            -1.1582195,
+            -1.9922916,
+            -3.3757784,
+            2.0673718,
+            3.0702057,
+            1.0159097,
+            -0.9362078,
+            -0.29098997,
+        ],
+        2e-6,
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn dft_v20_irfft_default_length_preserves_float64_precision() {
+    let _suite_lock = lock_dft_gpu();
+    let ep = require_cuda();
+    let delta = 2f64.powi(-40);
+    let spectrum = input(DataType::Float64, &[2, 2], &[1.0 + delta, 9.0, 1.0, 11.0]);
+    let attrs = [
+        ("inverse", Attribute::Int(1)),
+        ("onesided", Attribute::Int(1)),
+    ];
+    let raw = run_cuda(
+        &ep,
+        "DFT",
+        "",
+        20,
+        &[spectrum],
+        &[(DataType::Float64, vec![2, 1])],
+        &attrs,
+    );
+    let actual: Vec<_> = raw[0]
+        .chunks_exact(8)
+        .map(|b| f64::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    // np.fft.irfft([1+2**-40+9j, 1+11j]); do not decode through the f32 helper.
+    assert_eq!(actual, [1.0 + delta / 2.0, delta / 2.0]);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn dft_v20_irfft_lower_precision_and_int64_length() {
+    let _suite_lock = lock_dft_gpu();
+    let ep = require_cuda();
+    let attrs = [
+        ("inverse", Attribute::Int(1)),
+        ("onesided", Attribute::Int(1)),
+    ];
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        let spectrum = float_input(dtype, &[3, 2], &[1., 9., 3., 4., 5., -6.]);
+        let length = input(DataType::Int64, &[], &[4_i64]);
+        let raw = run_cuda(
+            &ep,
+            "DFT",
+            "",
+            20,
+            &[spectrum, length],
+            &[(dtype, vec![4, 1])],
+            &attrs,
+        );
+        // np.fft.irfft([1+9j, 3+4j, 5-6j])
+        assert_close(&decode_floats(&raw[0], dtype), &[3., -3., 0., 1.], 0.0001);
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn opset_defaults_and_explicit_axes_match_cpu_on_rank4_input() {
     let _suite_lock = lock_dft_gpu();
     let ep = require_cuda();
@@ -257,18 +361,18 @@ fn claim_gates_decline_unsupported_dtype_layout_and_complex_onesided() {
             bytes: vec![0; dtype.storage_bytes(4)],
             absent: false,
         };
-        let (graph, id) = build_graph("DFT", "", 20, &[tensor], &[(dtype, vec![1, 4, 2])], &[]);
+        let (graph, id) = build_graph("DFT", "", 17, &[tensor], &[(dtype, vec![1, 4, 2])], &[]);
         let model = Model::new(&graph);
         let claim = ep.supports_op(
             model.graph.node(id),
-            20,
+            17,
             &[static_shape([1, 4, 1])],
             &[dtype],
             &[TensorLayout::contiguous()],
         );
         assert!(
             matches!(claim, KernelMatch::Unsupported { .. }),
-            "{dtype:?} must decline at claim time"
+            "DFT-17 must still decline {dtype:?} at claim time"
         );
     }
 

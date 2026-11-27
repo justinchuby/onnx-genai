@@ -327,6 +327,23 @@ mod tests {
         }
     }
     #[test]
+    fn f64_layout_rejects_f32_sized_backing_before_borrow() {
+        let plan =
+            TypedWorkspace::<f64, _>::new("DFT", [("real", 2), ("empty", 0), ("imaginary", 1)])
+                .unwrap();
+        let mut backing = [17.0f64; 4];
+        let ptr = DevicePtrMut(backing.as_mut_ptr().cast());
+        // SAFETY: this test presents only a short prefix of an exclusive Host array.
+        let result = unsafe {
+            plan.with_buffers(Some(WorkspaceView::new(ptr, 12)), |_| -> Result<()> {
+                panic!("short backing must not reach the consumer")
+            })
+        };
+        assert!(result.is_err());
+        assert_eq!(backing, [17.0; 4]);
+    }
+
+    #[test]
     fn f64_regions_preserve_eight_byte_layout_and_fresh_initialization() {
         let plan =
             TypedWorkspace::<f64, 2>::new("LpNormalization", [("Y", 3), ("empty", 0)]).unwrap();
