@@ -1133,24 +1133,14 @@ pub(crate) fn build_cuda_registry_for_contract(
             v27: true,
         }),
     );
-    for version in [10, 13, 19, 21, 23, 25] {
-        reg.register(
-            OpKey::new("QuantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::LinearQuantFactory {
-                op: quantization::LinearQuantOp::Quantize,
-                runtime: runtime.clone(),
-            }),
-        );
-        reg.register(
-            OpKey::new("DequantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::LinearQuantFactory {
-                op: quantization::LinearQuantOp::Dequantize,
-                runtime: runtime.clone(),
-            }),
-        );
-    }
+    quantization::register_linear_quantization(
+        &mut reg,
+        &runtime,
+        matches!(
+            conv_transpose_contract,
+            conv_transpose::Contract::Standalone
+        ),
+    );
     reg.register(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
