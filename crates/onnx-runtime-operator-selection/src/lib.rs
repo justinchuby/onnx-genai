@@ -69,6 +69,7 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "DepthToSpace", 1, OPS_CNN),
     entry("", "GlobalAveragePool", 1, OPS_CNN),
     entry("", "GlobalMaxPool", 1, OPS_CNN),
+    entry("", "MaxRoiPool", 1, OPS_CNN),
     entry("", "GlobalLpPool", 2, OPS_CNN),
     entry("", "GroupNormalization", 18, OPS_CNN),
     entry("", "GridSample", 16, OPS_CNN),

@@ -3234,6 +3234,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "deform_conv_gpu.rs",
         "Upstream ONNX and independently calculated N-D fixtures on both native EPs",
     ));
+    p.push(dedicated(
+        "MaxRoiPool",
+        "max_roi_pool_gpu.rs",
+        "Quantized inclusive ROI pooling, versioned dtypes, and clipping on both native EPs",
+    ));
     p.push(sweep("Dropout", dropout_cases()));
     p.push(sweep("NonZero", nonzero_cases()));
     p.push(sweep(

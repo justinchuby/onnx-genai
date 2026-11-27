@@ -598,6 +598,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
         ("Conv", "") => FLOAT_COMPUTE_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("MaxRoiPool", "") => onnx_runtime_ir::max_roi_pool::DTYPES,
         ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
 
         // The rest of the CNN family dispatches through `dispatch_float!` and
@@ -758,6 +759,7 @@ operator_group_modules!(
     conv_transpose,
     deform_conv,
     grid_sample,
+    max_roi_pool,
     max_unpool,
     mean_variance_normalization,
     norm_ops,
@@ -1015,6 +1017,13 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
             Box::new(deform_conv::Factory(version)),
         );
     }
+    for version in [1, 22] {
+        registry.register(
+            OpKey::new("MaxRoiPool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(max_roi_pool::Factory(version)),
+        );
+    }
     registry.register(
         OpKey::new("Conv", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1137,8 +1146,10 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
         .plugin_keys()
-        // RoiAlign is currently supported only in standalone nxrt.
-        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
+        // These ROI kernels are supported only in standalone nxrt.
+        .filter(|key| {
+            !(key.domain.is_empty() && matches!(key.op_type.as_str(), "RoiAlign" | "MaxRoiPool"))
+        })
         .map(|key| {
             let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
                 .iter()
@@ -3716,7 +3727,7 @@ mod tests {
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
-        // DeformConv adds separate opset-19 and opset-22 entries.
+        // DeformConv and MaxRoiPool each add two schema-version entries.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
@@ -3726,7 +3737,7 @@ mod tests {
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 129
+                + 131
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
@@ -4043,6 +4054,7 @@ mod tests {
             .into_iter()
             .map(|version| ("RoiAlign", "", version))
             .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
+            .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)])
             .collect();
         #[cfg(not(feature = "ops-cnn"))]
         let expected = std::collections::BTreeSet::new();

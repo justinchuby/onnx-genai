@@ -619,6 +619,8 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "ConvTranspose", 1, conv_transpose);
     reg.register("", "DeformConv", 19, deform_conv);
     reg.register("", "DeformConv", 22, deform_conv);
+    reg.register("", "MaxRoiPool", 1, max_roi_pool);
+    reg.register("", "MaxRoiPool", 22, max_roi_pool);
     reg.register("", "MaxPool", 1, pool);
     reg.register("", "AveragePool", 1, pool);
     // `LpPool` shares `MaxPool`/`AveragePool`'s windowed spatial formula (it
@@ -636,6 +638,40 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Pad", 1, pad);
     reg.register("", "GridSample", 16, grid_sample);
     reg.register("", "AffineGrid", 20, affine_grid);
+}
+
+fn max_roi_pool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    use onnx_runtime_ir::max_roi_pool::{Attributes, validate_shapes, validate_types};
+
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "MaxRoiPool".into(),
+        detail,
+    };
+    let attrs = Attributes::parse(ctx.node).map_err(invalid)?;
+    let dtype = validate_types(
+        ctx.opset(""),
+        [ctx.input_dtype(0), ctx.input_dtype(1), None],
+    )
+    .map_err(invalid)?;
+    let (x, rois) = (ctx.input_shape(0), ctx.input_shape(1));
+    validate_shapes(
+        x.map(<[_]>::len),
+        rois.map(<[_]>::len),
+        rois.and_then(|s| s.get(1))
+            .and_then(DimExpr::as_const)
+            .and_then(|n| usize::try_from(n).ok()),
+    )
+    .map_err(invalid)?;
+    let channels = x.and_then(|s| s.get(1)).cloned();
+    let regions = rois.and_then(|s| s.first()).cloned();
+    let y = vec![
+        regions.unwrap_or_else(|| ctx.fresh_dim()),
+        channels.unwrap_or_else(|| ctx.fresh_dim()),
+        DimExpr::constant(attrs.pooled[0]),
+        DimExpr::constant(attrs.pooled[1]),
+    ];
+    ctx.set_output(0, dtype.unwrap_or(DataType::Undefined), y);
+    Ok(())
 }
 
 fn deform_conv(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {

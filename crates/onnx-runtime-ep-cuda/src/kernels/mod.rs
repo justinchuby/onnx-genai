@@ -85,6 +85,7 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod max_roi_pool;
 mod max_unpool;
 mod mean_variance_normalization;
 mod metadata_workspace;
@@ -393,6 +394,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Resize",
     "ConvTranspose",
     "DeformConv",
+    "MaxRoiPool",
     "GridSample",
     "RoiAlign",
     "GatherBlockQuantized",
@@ -569,6 +571,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("MaxRoiPool", "") => onnx_runtime_ir::max_roi_pool::DTYPES,
         ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
@@ -733,8 +736,10 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescriptor> {
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .plugin_keys()
-        // RoiAlign is currently supported only in standalone nxrt.
-        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
+        // These ROI kernels are supported only in standalone nxrt.
+        .filter(|key| {
+            !(key.domain.is_empty() && matches!(key.op_type.as_str(), "RoiAlign" | "MaxRoiPool"))
+        })
         .map(|key| CudaOpDescriptor {
             op_type: key.op_type.clone(),
             domain: key.domain.clone(),
@@ -1192,6 +1197,16 @@ pub(crate) fn build_cuda_registry_for_contract(
             OpKey::new("DeformConv", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(deform_conv::Factory {
+                runtime: runtime.clone(),
+                version,
+            }),
+        );
+    }
+    for version in [1, 22] {
+        reg.register(
+            OpKey::new("MaxRoiPool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(max_roi_pool::Factory {
                 runtime: runtime.clone(),
                 version,
             }),
@@ -2442,30 +2457,32 @@ mod tests {
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
     )]
     #[test]
-    fn cuda_plugin_descriptors_exclude_standalone_roi_align() {
+    fn cuda_plugin_descriptors_exclude_standalone_roi_kernels() {
         let runtime = std::sync::Arc::new(
             crate::runtime::CudaRuntime::new(0)
                 .expect("CUDA plugin descriptor test requires a usable CUDA device 0"),
         );
         let registry = build_cuda_registry(runtime);
-        assert!(
-            registry.keys().any(|key| {
-                key.op_type == "RoiAlign" && matches!(key.domain.as_str(), "" | "ai.onnx")
-            }),
-            "standalone CUDA registry must contain ONNX RoiAlign before testing plugin exclusion"
-        );
         let descriptors = build_cuda_registry_descriptors(&registry);
         assert!(
             !descriptors.is_empty(),
             "CUDA plugin descriptors unexpectedly empty; exclusion check would be vacuous"
         );
-        assert!(
-            !descriptors.iter().any(|descriptor| {
-                descriptor.op_type == "RoiAlign"
-                    && matches!(descriptor.domain.as_str(), "" | "ai.onnx")
-            }),
-            "standalone-only ONNX RoiAlign must not be advertised by the CUDA ORT plugin"
-        );
+        for op in ["RoiAlign", "MaxRoiPool"] {
+            assert!(
+                registry.keys().any(|key| {
+                    key.op_type == op && onnx_runtime_ir::is_default_domain(&key.domain)
+                }),
+                "standalone CUDA registry must contain ONNX {op} before testing plugin exclusion"
+            );
+            assert!(
+                !descriptors.iter().any(|descriptor| {
+                    descriptor.op_type == op
+                        && onnx_runtime_ir::is_default_domain(&descriptor.domain)
+                }),
+                "standalone-only ONNX {op} must not be advertised by the CUDA ORT plugin"
+            );
+        }
         let cast_versions = descriptors
             .iter()
             .filter(|descriptor| descriptor.op_type == "Cast")
