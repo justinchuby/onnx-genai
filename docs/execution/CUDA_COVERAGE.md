@@ -131,7 +131,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
-| `Gelu` | `` | ✅ | **NVRTC-custom** | Standard-domain opset-20 exact or tanh-approximate GELU (`elementwise.rs`). |
+| `Gelu` | `` | ✅ | **NVRTC-custom** | Standard-domain opset-20 exact or tanh-approximate GELU for f16, bf16, f32, and native f64 (`elementwise.rs`). |
 | `SwiGLU`, `GeGLU` | `` | ✅ | **NVRTC-custom** | Opsets 28/29 respectively; identical input shapes, no broadcasting. f16/bf16/f32/f64. |
 | `Expm1`, `Log1p` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math in the elementwise kernel family. |
 | `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Log-domain prefix accumulation in the cumulative-sum kernel family. |
