@@ -636,6 +636,10 @@ negative/interior normalization axes, and dynamic quantization for mixed-sign,
 constant, and empty inputs. Historical snapshot after batch 10: **152** advertised CUDA op names, **157**
 CUDA `(domain, op_type)` pairs, and **134 / 145** CPU standard-domain op types.
 
+ONNX opset 22 adds BF16 to the three global pooling schemas. The `global_pool_v22`
+session tests check exact BF16 results on native CPU and on CUDA without fallback;
+the batch 10 tests retain legacy-opset kernel parity coverage.
+
 The issue #67 operator-coverage batch 11 adds `InstanceNormalization` and
 `GroupNormalization`; batch 12 adds `LpPool`, `CenterCropPad`, and `Col2Im`.
 The latter shares a general N-D pooling geometry path and a fixed-width index

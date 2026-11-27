@@ -175,6 +175,15 @@ if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
 fi
 echo ""
 
+# Opset 22 adds BF16 to the three global pooling operators.
+echo "── Native global pooling v22 BF16 reference cases ──"
+if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
+    --test global_pool_v22 -- --nocapture 2>&1; then
+    echo -e "${RED}FAILED: Global pooling v22 BF16 reference cases${NC}"
+    exit 1
+fi
+echo ""
+
 # Phase 5: Attention (critical path)
 echo "── Phase 5: Attention kernels ──"
 if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
