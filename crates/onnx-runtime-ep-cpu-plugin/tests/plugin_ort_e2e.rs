@@ -5243,6 +5243,141 @@ fn assignment_policy_always_claims_bfloat16_activations() {
     }
 }
 
+fn lp_normalization_model_text(name: &str, opset: i64, elem_type: i32) -> String {
+    format!(
+        r#"ir_version: 11
+graph {{
+  node {{
+    input: "X"
+    output: "Y"
+    op_type: "LpNormalization"
+    attribute {{ name: "axis" type: INT i: -1 }}
+    attribute {{ name: "p" type: INT i: 2 }}
+  }}
+  name: "{name}"
+  input {{
+    name: "X"
+    type {{ tensor_type {{ elem_type: {elem_type} shape {{
+      dim {{ dim_value: 2 }}
+      dim {{ dim_value: 3 }}
+    }} }} }}
+  }}
+  output {{
+    name: "Y"
+    type {{ tensor_type {{ elem_type: {elem_type} shape {{
+      dim {{ dim_value: 2 }}
+      dim {{ dim_value: 3 }}
+    }} }} }}
+  }}
+}}
+opset_import {{ version: {opset} }}
+"#
+    )
+}
+
+/// Pin the shipped plugin boundary against the workspace's upstream ORT 1.32.
+///
+/// Legal legacy Float32 at opset 21 and BF16 at opset 22 must both reach this
+/// EP's real `GetCapability` assignment. The paired opset-21 BF16 model must be
+/// rejected by ORT's authoritative schema validation before capability. Native
+/// nxrt intentionally accepts that semantically identical dtype extension.
+#[test]
+fn pinned_ort_assigns_schema_legal_lp_normalization_boundaries() {
+    let _lock = lock_ort_ep();
+    const FLOAT: i32 = 1;
+    const BFLOAT16: i32 = 16;
+    let Some(ep_path) = find_ep_cdylib() else {
+        eprintln!(
+            "*** SKIPPED: pinned_ort_assigns_schema_legal_lp_normalization_boundaries — \
+             EP cdylib not found ***"
+        );
+        return;
+    };
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+
+    for (label, opset, elem_type) in [("legacy_f32_v21", 21, FLOAT), ("bf16_v22", 22, BFLOAT16)] {
+        unsafe {
+            reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+        }
+        let model = lp_normalization_model_text(label, opset, elem_type);
+        let path = write_generated_model(label, &model);
+        let registration = format!("cpu_ep_lpnorm_{label}");
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(&registration, &path, true) })
+        else {
+            eprintln!(
+                "*** SKIPPED: pinned_ort_assigns_schema_legal_lp_normalization_boundaries — \
+                 ORT or EP cdylib not found ***"
+            );
+            return;
+        };
+        unsafe {
+            assert!(
+                read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") > 0,
+                "ORT 1.32 must enter plugin GetCapability for schema-legal LpNormalization {label}"
+            );
+            assert_ops_assigned_to_our_ep(
+                api,
+                session,
+                &["LpNormalization"],
+                &format!("LpNormalization {label}"),
+            );
+            conformance_teardown(api, env, opts, session, &registration);
+        }
+    }
+
+    unsafe {
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+    }
+    let invalid = lp_normalization_model_text("bf16_v21_invalid", 21, BFLOAT16);
+    let path = write_generated_model("bf16_v21_invalid", &invalid);
+    let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
+        conformance_setup_with_session_status(
+            "cpu_ep_lpnorm_bf16_v21_invalid",
+            &path,
+            false,
+            None,
+            &[],
+        )
+    }) else {
+        eprintln!(
+            "*** SKIPPED: pinned_ort_assigns_schema_legal_lp_normalization_boundaries — \
+             ORT or EP cdylib not found for negative case ***"
+        );
+        return;
+    };
+    assert!(
+        !status.is_null(),
+        "ORT 1.32 must reject LpNormalization-21 BFloat16 during authoritative schema validation"
+    );
+    assert_eq!(
+        unsafe { read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") },
+        0,
+        "ORT 1.32 must reject LpNormalization-21 BFloat16 before entering plugin GetCapability"
+    );
+    let message = unsafe { CStr::from_ptr(((*api).GetErrorMessage.unwrap())(status)) }
+        .to_string_lossy()
+        .into_owned();
+    let message_lower = message.to_ascii_lowercase();
+    assert!(
+        message_lower.contains("lpnormalization")
+            && (message_lower.contains("bfloat16") || message_lower.contains("type")),
+        "unexpected ORT 1.32 rejection for LpNormalization-21 BFloat16: {message}"
+    );
+    unsafe {
+        ((*api).ReleaseStatus.unwrap())(status);
+        conformance_teardown_with_custom_domain(
+            api,
+            env,
+            opts,
+            session,
+            "cpu_ep_lpnorm_bf16_v21_invalid",
+            domain,
+        );
+    }
+    drop(custom_op);
+}
+
 /// float16 `Gelu` must be claimed at **every** size, and the falsifier is the
 /// absence of an inlined function body.
 ///

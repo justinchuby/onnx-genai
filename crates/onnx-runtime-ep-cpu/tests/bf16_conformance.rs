@@ -24,7 +24,7 @@ use common::{FloatDType, PreparedKernel, Tensor};
 use half::bf16;
 use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, static_shape};
 
 /// One positional operator input.
 enum Inp {
@@ -177,6 +177,55 @@ fn window_pool_bf16_starts_at_opset_22_and_executes_natively() {
                 "{op_type} output {index}: got {actual}, expected {expected}"
             );
         }
+    }
+}
+
+#[test]
+fn lp_normalization_supported_dtypes_are_admitted_across_opsets() {
+    let ep = CpuExecutionProvider::new();
+    let node = Node::new(
+        NodeId(0),
+        "LpNormalization",
+        vec![Some(ValueId(0))],
+        vec![ValueId(1)],
+    );
+    let shape = static_shape([2, 3]);
+
+    for dtype in [
+        DataType::BFloat16,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+    ] {
+        for opset in [1, 21, 22] {
+            let claim = ep.supports_op(&node, opset, std::slice::from_ref(&shape), &[dtype], &[]);
+            assert!(
+                claim.is_supported(),
+                "{dtype:?} must remain legal at opset {opset}: {:?}",
+                claim.reason()
+            );
+        }
+    }
+}
+
+#[test]
+fn lp_normalization_bf16_legacy_opset_matches_independent_golden() {
+    let case = OpCase {
+        op: "LpNormalization",
+        domain: "",
+        opset: 1,
+        attrs: vec![("axis", Attribute::Int(-1)), ("p", Attribute::Int(2))],
+        inputs: vec![Inp::F(vec![2, 3], vec![3.0, 4.0, 0.0, 0.0, 0.0, 5.0])],
+        out_shape: vec![2, 3],
+        abs_tol: 0.0,
+    };
+    let actual = run_case(&case, FloatDType::Bf16);
+    let expected = [0.6, 0.8, 0.0, 0.0, 0.0, 1.0];
+    for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 0.004,
+            "LpNormalization BF16 golden index {index}: got {actual}, expected {expected}"
+        );
     }
 }
 

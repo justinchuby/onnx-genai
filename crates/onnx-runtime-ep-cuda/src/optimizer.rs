@@ -4517,6 +4517,10 @@ mod tests {
             lp.is_default_domain(),
             "LpNormalization stays default domain"
         );
+        assert_eq!(
+            lp.version, None,
+            "optimizer-created LpNormalization inherits the graph opset"
+        );
         assert_eq!(lp.inputs, vec![Some(x)], "reads the pre-norm activation x");
         assert_eq!(lp.outputs, vec![Some(output)], "keeps the Div output value");
         assert_eq!(
