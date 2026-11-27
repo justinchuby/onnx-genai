@@ -111,6 +111,7 @@ pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
 pub mod quantization;
+mod random;
 pub mod range;
 pub mod reduce;
 pub mod resize;
@@ -320,6 +321,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Shape",
     "Constant",
     "ConstantOfShape",
+    "RandomNormal",
+    "RandomNormalLike",
+    "RandomUniform",
+    "RandomUniformLike",
     "Concat",
     "Expand",
     "Reshape",
@@ -1349,6 +1354,18 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    for op in onnx_runtime_ep_api::random::OPS {
+        for version in onnx_runtime_ep_api::random::VERSIONS {
+            reg.register(
+                OpKey::new(op, "", version),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(random::RandomFactory {
+                    runtime: runtime.clone(),
+                    version,
+                }),
+            );
+        }
+    }
     // OneHot-28 reuses the v11 factory through version-floor lookup.
     for (opset, wrap_negative) in [(9, false), (11, true)] {
         reg.register(
@@ -2438,6 +2455,16 @@ mod tests {
             .keys()
             .map(|key| (key.domain.clone(), key.op_type.clone()))
             .collect();
+        let described: BTreeSet<_> = build_cuda_registry_descriptors(&registry)
+            .into_iter()
+            .map(|descriptor| (descriptor.domain, descriptor.op_type))
+            .collect();
+        let expected_described: BTreeSet<_> = pairs
+            .iter()
+            .filter(|(domain, op)| !(domain.is_empty() && op == "RoiAlign"))
+            .cloned()
+            .collect();
+        assert_eq!(expected_described, described);
         assert!(
             !pairs.is_empty(),
             "CUDA registry unexpectedly empty; census would be vacuous"

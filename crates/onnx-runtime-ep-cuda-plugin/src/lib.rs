@@ -532,7 +532,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                 unsafe {
                     onnx_runtime_ep_plugin::factory::exclude_operators(
                         factory,
-                        onnx_runtime_ep_plugin::ep::STANDALONE_CAUSAL_CONV_AND_RNN,
+                        onnx_runtime_ep_plugin::ep::STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM,
                     );
                 }
                 let api = unsafe {
@@ -559,6 +559,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                 // release retain the provider's cross-stream settlement fences.
                 // Compute errors retire the lane. This does not grant external
                 // graph capture any workspace pin or bypass capture validation.
+                // The live factory has its registry and has not been returned to ORT.
                 return unsafe {
                     onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(
                         factory,

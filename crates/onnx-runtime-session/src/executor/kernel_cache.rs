@@ -927,6 +927,7 @@ pub(crate) struct KernelCache {
     /// Node-scoped load-time owners survive specialization/variant eviction and
     /// are offered to the first kernel, including fully static materialization.
     pub(super) static_constant_states: HashMap<NodeId, StaticConstantState>,
+    node_run_states: HashMap<NodeId, Arc<dyn std::any::Any + Send + Sync>>,
     /// Logical time each entry was last served, for the per-node bound below.
     /// Kept beside `entries` rather than inside them so a shared-reference hit
     /// can record its use without the map itself becoming interior-mutable.
@@ -1336,6 +1337,9 @@ impl KernelCache {
                 Err(error) => return Err(error.into()),
             };
             kernel.configure_shape_facts(shape_facts);
+            kernel.bind_node_run_state(&mut |initial| {
+                Arc::clone(self.node_run_states.entry(node_id).or_insert(initial))
+            })?;
             kernel.set_constant_inputs(constant_inputs);
             let mut adopted = if let Some(state) = shared_constant_state {
                 kernel.adopt_shareable_constant_state(state)?
