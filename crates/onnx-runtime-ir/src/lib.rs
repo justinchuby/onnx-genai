@@ -69,6 +69,7 @@ pub mod linear_attention;
 pub mod lp_pool;
 pub mod max_roi_pool;
 pub mod max_unpool;
+pub mod modulo;
 mod node;
 pub mod onnx;
 pub mod opset26;

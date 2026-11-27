@@ -748,6 +748,14 @@ pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescr
                 && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
             {
                 onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
+            } else if key.op_type == "Mod" && key.domain.is_empty() {
+                if key.since_version >= onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE {
+                    onnx_runtime_ir::modulo::DTYPES
+                } else if registry.explicit_end_version(key) < u64::MAX {
+                    mod_op::LEGACY_DTYPES
+                } else {
+                    cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
+                }
             } else {
                 cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
             };
@@ -2001,14 +2009,30 @@ pub(crate) fn build_cuda_registry_for_contract(
         }),
     );
 
-    // Mod (mod_op.rs) — f32 (fmod=1) plus i32/i64 truncated and floor modulo.
-    reg.register(
+    let mod_28 = onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE;
+    let standalone = matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
+    );
+    reg.register_through(
         OpKey::new("Mod", "", 10),
+        if standalone { mod_28 - 1 } else { u64::MAX },
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(mod_op::ModFactory {
             runtime: runtime.clone(),
+            since_version: 10,
         }),
     );
+    if standalone {
+        reg.register(
+            OpKey::new("Mod", "", mod_28),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(mod_op::ModFactory {
+                runtime: runtime.clone(),
+                since_version: mod_28,
+            }),
+        );
+    }
 
     // ── CUDA Wave 3 — pointwise math / logical / comparison (pointwise.rs) ──
 

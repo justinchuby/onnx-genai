@@ -92,6 +92,37 @@ fn cast_keeps_shipped_ort_descriptors() {
     );
 }
 
+#[test]
+fn ort_mod_keeps_one_unbounded_legacy_entry() {
+    use onnx_runtime_ir::DataType::*;
+
+    let entries = build_kernel_registry_entries();
+    let mut entries = entries.iter().filter(|entry| entry.op_type == "Mod");
+    let entry = entries.next().unwrap();
+    assert!(entries.next().is_none());
+    let native = CpuExecutionProvider::new();
+    let native = native.registry();
+    let mut native_ranges: Vec<_> = native
+        .keys()
+        .filter(|key| key.op_type == "Mod")
+        .map(|key| (key.since_version, native.explicit_end_version(key)))
+        .collect();
+    native_ranges.sort_unstable();
+    assert_eq!(native_ranges, [(10, 27), (28, u64::MAX)]);
+    assert_eq!(
+        (entry.domain, entry.since_version, entry.end_version),
+        ("", 10, i32::MAX)
+    );
+    assert_eq!(
+        entry.supported_dtypes,
+        &[
+            Float32, Float16, BFloat16, Float64, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32,
+            Uint64
+        ]
+    );
+    assert!(entry.input_dtype_constraints.is_empty());
+}
+
 /// Opt this process out of the persistent SPMD decode pool.
 ///
 /// That pool exists for `onnx-genai-engine`'s native decode loop, which runs a
