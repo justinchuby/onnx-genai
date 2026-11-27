@@ -1035,6 +1035,29 @@ impl Executor {
             resolved.insert(outputs[0], output_shape);
         }
 
+        // The live control is authoritative even when model annotations or
+        // earlier inference supplied a concrete output shape.
+        if node.is_default_domain() && node.op_type == "MaxUnpool" {
+            use onnx_runtime_ir::max_unpool::{self as rules, Geometry};
+            let invalid = EpError::KernelFailed;
+            rules::validate_claim(node, effective_opset(&self.graph, node), input_dtypes)
+                .map_err(invalid)?;
+            let x = &input_shapes[0];
+            rules::validate_indices_shape(x, &input_shapes[1]).map_err(invalid)?;
+            let geometry = Geometry::from_node(node, x.len()).map_err(invalid)?;
+            let explicit = inputs.get(2).copied().flatten().map(|value| {
+                rules::validate_control_shape(x.len(), &input_shapes[2]).map_err(invalid)?;
+                self.shape_input_i64(value, &input_shapes[2], input_dtypes[2]).ok_or_else(|| {
+                    invalid("MaxUnpool: cannot read output_shape; supply an accessible rank-1 Int64 shape tensor".into())
+                })
+            }).transpose()?;
+            let shape = geometry
+                .output_shape(x, explicit.as_deref())
+                .map_err(invalid)?;
+            rules::checked_bytes("output", &shape, input_dtypes[0].byte_size()).map_err(invalid)?;
+            resolved.insert(outputs[0], shape);
+        }
+
         // Data-dependent shapes: if any output's shape is still unresolved,
         // compute it now from the concrete input shapes + the runtime *values*
         // of this node's integer inputs. Buffers are NOT sized here — a view

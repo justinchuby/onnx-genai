@@ -67,6 +67,7 @@ plugin EPs (via C ABI bridge) handle them.
 |----|-------------|-------|
 | Conv | 1 | Vision encoders, 1D conv in some LLMs. |
 | MaxPool | 1 | Vision. |
+| MaxRoiPool | 1, 22 | Standalone CPU and CUDA. Quantized, inclusive NCHW ROI pooling; opset 22 adds bfloat16. |
 | AveragePool | 1 | Vision. |
 | GlobalAveragePool | 1 | |
 | BatchNormalization | 7 | Vision backbones. |
@@ -85,7 +86,7 @@ plugin EPs (via C ABI bridge) handle them.
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
 | ScatterElements | 11 | Native CPU/CUDA; opset 29 adds mean reduction. |
-| OneHot | 9 | CPU implemented; categorical/position encodings. |
+| OneHot | 9, 11, 28 | Native CPU/CUDA; v11 enables negative-index wrapping. v28 adds BF16 values/output and is standalone nxrt only. |
 | Trilu | 14 | CPU implemented; causal mask generation, optional int64 `k` input. |
 | RotaryEmbedding | 22 | Added in opset 22 (ONNX standard). |
 
@@ -105,8 +106,8 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | LSTM / GRU | 7 | Rare in modern models. |
 | ConvTranspose | 1 | Diffusion decoders. |
 | InstanceNormalization | 6 | Style transfer, diffusion. |
-| DepthToSpace | 1 | Super-resolution, diffusion. |
-| SpaceToDepth | 1 | |
+| DepthToSpace | 1 | Standalone nxrt NCHW rearrangement; `mode` since opset 11 (DCR default, or CRD). |
+| SpaceToDepth | 1 | Standalone nxrt inverse NCHW rearrangement; `mode` since opset 28 (DCR default, or CRD). ORT plugin registration remains unchanged. |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
 | Compress | 9, 11, 28 | Compress-28 adds BF16. Native CPU and CUDA preserve BF16 element bits during selection. String tensors are not handled by the CUDA kernel. |

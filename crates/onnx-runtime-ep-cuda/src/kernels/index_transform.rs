@@ -132,7 +132,12 @@ extern "C" __global__ void col2im(
 }
 "#;
 
-fn device_i64(runtime: &CudaRuntime, input: &TensorView, op: &str, name: &str) -> Result<Vec<i64>> {
+pub(super) fn device_i64(
+    runtime: &CudaRuntime,
+    input: &TensorView,
+    op: &str,
+    name: &str,
+) -> Result<Vec<i64>> {
     if input.dtype != DataType::Int64 || !input.is_contiguous() {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep {op}: {name} must be a contiguous Int64 tensor"

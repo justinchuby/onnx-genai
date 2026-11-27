@@ -131,11 +131,14 @@ pub fn register(reg: &mut InferenceRegistry) {
         10,
         crate::handlers::elementwise::unary,
     );
-    reg.register("", "DepthToSpace", 1, depth_to_space);
-    reg.register("", "DepthToSpace", 11, depth_to_space);
-    reg.register("", "DepthToSpace", 13, depth_to_space);
-    reg.register("", "SpaceToDepth", 1, space_to_depth);
-    reg.register("", "SpaceToDepth", 13, space_to_depth);
+    for (op, versions) in [
+        ("DepthToSpace", &[1, 11, 13, 28][..]),
+        ("SpaceToDepth", &[1, 13, 28][..]),
+    ] {
+        for &version in versions {
+            reg.register("", op, version, infer_space_depth);
+        }
+    }
     // `Col2Im` (opset 18) folds columns back into an image; `CenterCropPad`
     // (opset 18) center-crops/pads selected axes to a target `shape`.
     reg.register("", "Col2Im", 18, col2im);

@@ -1046,7 +1046,7 @@ fn optimize_graph(graph: &mut onnx_runtime_ir::Graph, level: OptimizationLevel) 
 
     // Re-infer shapes over the rewritten graph: fused nodes' outputs (and any
     // value whose producer changed) must be re-resolved before compile.
-    let registry = onnx_runtime_shape_inference::InferenceRegistry::default_registry();
+    let registry = onnx_runtime_shape_inference::InferenceRegistry::native_runtime_registry();
     let opset_imports = graph.opset_imports.clone();
     {
         let mut span = trace_span("session.optimize_shape_inference", "session");
@@ -1369,7 +1369,7 @@ impl InferenceSession {
             let mut span = trace_span("session.normalize_validate", "session");
             graph.normalize_domains();
 
-            onnx_runtime_loader::validate_model(&graph)?;
+            onnx_runtime_loader::validate_model_for_native_execution(&graph)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
                     Args::new()

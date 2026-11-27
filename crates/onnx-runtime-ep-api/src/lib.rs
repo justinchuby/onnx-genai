@@ -45,6 +45,7 @@ pub mod gemm;
 pub mod host_parallel;
 pub mod kernel;
 pub mod mean_variance_normalization;
+pub mod one_hot;
 pub mod packed_routed;
 pub mod provider;
 pub mod registry;

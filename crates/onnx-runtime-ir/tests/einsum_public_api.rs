@@ -40,6 +40,22 @@ fn schema_aware_build_and_generic_fallback_are_public() {
 }
 
 #[test]
+fn native_dtype_policy_preserves_schema_revision_and_introduction_boundary() {
+    let shape = [2usize];
+    let inputs = [EinsumInput::new(DataType::BFloat16, &shape)];
+
+    assert!(EinsumPlan::build_for_opset("i->i", &inputs, 27).is_err());
+    let plan = EinsumPlan::build_for_native_opset("i->i", &inputs, 27).unwrap();
+    assert_eq!(plan.schema(), EinsumSchema::V12);
+    assert_eq!(plan.dtype(), DataType::BFloat16);
+    assert_eq!(
+        plan.precision_policy().intermediate_dtype(),
+        DataType::Float32
+    );
+    assert!(EinsumPlan::build_for_native_opset("i->i", &inputs, 11).is_err());
+}
+
+#[test]
 fn typed_einsum_plan_accepts_case_sensitive_ascii_labels() {
     let left = [2usize, 3];
     let right = [3usize, 4];

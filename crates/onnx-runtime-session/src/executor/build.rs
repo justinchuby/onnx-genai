@@ -81,7 +81,7 @@ pub(super) fn run_ep_scoped_passes(
     // Re-infer on a clone and adopt the refreshed shapes only on success so such
     // a failure neither aborts the build nor leaves the graph partially updated;
     // the executor's own resolution still validates shapes at run time.
-    let registry = InferenceRegistry::default_registry();
+    let registry = InferenceRegistry::native_runtime_registry();
     let opset_imports = graph.opset_imports.clone();
     let mut refreshed = graph.clone();
     if registry
@@ -1647,7 +1647,7 @@ impl Executor {
 
         // Re-resolve the merged interior shapes (Squeeze/Unsqueeze boundaries and
         // remapped body values) before build, mirroring `ChildExecutor::compile`.
-        let registry = InferenceRegistry::default_registry();
+        let registry = InferenceRegistry::native_runtime_registry();
         let opset_imports = graph.opset_imports.clone();
         registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
 
@@ -1683,7 +1683,7 @@ impl Executor {
         let mut graph = self.graph.clone();
         // Re-resolve interior shapes on the cloned (post-placement) graph before
         // build, mirroring `build_decode_inline_sibling`'s permissive re-inference.
-        let registry = InferenceRegistry::default_registry();
+        let registry = InferenceRegistry::native_runtime_registry();
         let opset_imports = graph.opset_imports.clone();
         registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
         let mut sibling = Self::build(

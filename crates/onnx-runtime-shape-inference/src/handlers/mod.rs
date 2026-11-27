@@ -67,6 +67,7 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     for version in onnx_runtime_ir::roi_align::VERSIONS {
         registry.register("", "RoiAlign", version, roi_align::infer);
     }
+
     recurrent::register(registry);
     selection::register(registry);
     sequence::register(registry);
@@ -77,4 +78,8 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     ml::register(registry);
     text::register(registry);
     container::register(registry);
+}
+
+pub(crate) fn register_native_einsum(registry: &mut InferenceRegistry) {
+    einsum::register_native(registry);
 }

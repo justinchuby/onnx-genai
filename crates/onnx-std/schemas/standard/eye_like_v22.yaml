@@ -8,5 +8,5 @@ attributes:
 inputs: [{ name: input, type_str: T1 }]
 outputs: [{ name: output, type_str: T2 }]
 type_constraints:
-  - { type_param: T1, allowed: [bfloat16, uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64] }
-  - { type_param: T2, allowed: [bfloat16, uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64] }
+  - { type_param: T1, allowed: [bool, bfloat16, uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64] }
+  - { type_param: T2, allowed: [bool, bfloat16, uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64] }

@@ -2,28 +2,6 @@
 
 use crate::DataType;
 
-pub const DTYPES: &[DataType] = &[
-    DataType::Float32,
-    DataType::Float16,
-    DataType::BFloat16,
-    DataType::Float64,
-    DataType::Int8,
-    DataType::Int16,
-    DataType::Int32,
-    DataType::Int64,
-    DataType::Uint8,
-    DataType::Uint16,
-    DataType::Uint32,
-    DataType::Uint64,
-    DataType::Bool,
-    DataType::Int4,
-    DataType::Uint4,
-    DataType::Float4E2M1,
-    DataType::Float8E8M0,
-    DataType::Int2,
-    DataType::Uint2,
-];
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Constant,

@@ -504,6 +504,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Err(reason) =
+            onnx_runtime_ir::pooling::validate_dtype_at_opset(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
@@ -521,6 +526,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         }
         if let Some(reason) =
             onnx_runtime_ep_api::det::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.is_default_domain()
+            && op.op_type == "MaxUnpool"
+            && let Err(reason) =
+                onnx_runtime_ir::max_unpool::validate_claim(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -582,6 +594,29 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             deny!("Dropout: {reason}");
         }
+        if op.op_type == "InstanceNormalization"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && opset < 22
+            && input_dtypes.first() == Some(&DataType::BFloat16)
+        {
+            deny!(
+                "InstanceNormalization input dtype BFloat16 requires ONNX opset 22 or later; export this node at opset 22+, or use Float16, Float32, or Float64 at opset {opset}"
+            );
+        }
+        if op.op_type == "OneHot"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ep_api::one_hot::validate_values_dtype(opset, input_dtypes)
+        {
+            deny!("OneHot: {reason}");
+        }
+        if op.op_type == "EyeLike"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ir::eye_like::validate_claim(op, opset, shapes, input_dtypes)
+        {
+            deny!("EyeLike: {reason}");
+        }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
             && onnx_runtime_ir::is_default_domain(&op.domain)
@@ -607,11 +642,29 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type
             );
         }
+        if op.op_type == "LpPool"
+            && domain == "ai.onnx"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::lp_pool::validate_dtype(opset, dtype)
+        {
+            return KernelMatch::unsupported(format!("LpPool: {reason}"));
+        }
         // Structural kernel limits belong to the versioned factory selected
         // above, alongside the parser that creation uses. No operator-name
         // dispatch table is needed here to keep those two boundaries aligned.
         if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
             return KernelMatch::unsupported(reason);
+        }
+        if self.standalone
+            && onnx_runtime_ir::space_depth::Direction::from_node(op).is_some()
+            && let Err(reason) = onnx_runtime_ir::space_depth::SpaceDepth::validate_claim(
+                op,
+                opset,
+                shapes,
+                input_dtypes,
+            )
+        {
+            return KernelMatch::unsupported(format!("{}: {reason}", op.op_type));
         }
         if op.op_type == "Pad"
             && op.is_default_domain()
@@ -2048,7 +2101,7 @@ mod tests {
                 onnx_runtime_ir::static_shape([3, 4]),
             ];
             assert!(
-                !ep.supports_op(&node, 12, &shapes, &[DataType::BFloat16; 2], &[])
+                ep.supports_op(&node, 12, &shapes, &[DataType::BFloat16; 2], &[])
                     .is_supported()
             );
             assert!(
@@ -2056,6 +2109,26 @@ mod tests {
                     .is_supported()
             );
         }
+    }
+
+    #[test]
+    fn ort_plugin_keeps_official_einsum_dtype_boundary() {
+        let ep = CpuExecutionProvider::for_ort_plugin();
+        let mut node = Node::new(NodeId(0), "Einsum", vec![], vec![]);
+        node.attributes.insert(
+            "equation".into(),
+            onnx_runtime_ir::Attribute::String("ij,jk->ik".into()),
+        );
+        let shapes = [
+            onnx_runtime_ir::static_shape([2, 3]),
+            onnx_runtime_ir::static_shape([3, 4]),
+        ];
+
+        let support = ep.supports_op(&node, 27, &shapes, &[DataType::BFloat16; 2], &[]);
+        let reason = support
+            .reason()
+            .expect("ORT plugin must retain the official Einsum-12 dtype boundary");
+        assert!(reason.contains("not admitted by Einsum-12"), "{reason}");
     }
 
     #[cfg(feature = "ops-cnn")]

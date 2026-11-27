@@ -1,4 +1,4 @@
-//! Opset-11 `OneHot`, including valid negative index wrapping.
+//! `OneHot` since opset 11, including valid negative index wrapping.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node};

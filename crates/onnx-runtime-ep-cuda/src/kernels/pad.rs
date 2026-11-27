@@ -159,12 +159,6 @@ fn device_bytes(runtime: &CudaRuntime, input: &TensorView) -> Result<Vec<u8>> {
 }
 
 fn device_i64(runtime: &CudaRuntime, input: &TensorView, name: &str) -> Result<Vec<i64>> {
-    if name == "axes" && input.dtype == DataType::Int32 {
-        return Ok(device_bytes(runtime, input)?
-            .chunks_exact(4)
-            .map(|bytes| i64::from(i32::from_ne_bytes(bytes.try_into().unwrap())))
-            .collect());
-    }
     if input.dtype != DataType::Int64 {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep Pad: {name} must have Int64 dtype"
@@ -317,10 +311,20 @@ impl PadKernel {
                 EpError::KernelFailed("cuda_ep Pad: missing pads input or attribute".into())
             })?
         };
-        let axes = if inputs.get(3).is_some_and(|input| !input.is_absent()) {
-            Some(device_i64(&self.runtime, &inputs[3], "axes")?)
-        } else {
-            None
+        let axes = match inputs.get(3).filter(|input| !input.is_absent()) {
+            Some(axes)
+                if axes.dtype == DataType::Int32
+                    && (packed || data.dtype == DataType::Float8E8M0) =>
+            {
+                Some(
+                    device_bytes(&self.runtime, axes)?
+                        .chunks_exact(4)
+                        .map(|bytes| i64::from(i32::from_ne_bytes(bytes.try_into().unwrap())))
+                        .collect(),
+                )
+            }
+            Some(axes) => Some(device_i64(&self.runtime, axes, "axes")?),
+            None => None,
         };
         let axis_count = axes.as_ref().map_or(rank, Vec::len);
         if pads.len() != 2 * axis_count {
