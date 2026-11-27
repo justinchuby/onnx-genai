@@ -805,7 +805,7 @@ jobs:
         run: |
           reference_dir="$RUNNER_TEMP/nxrt-ort-reference"
           cargo run --locked -p onnx-genai-ort-sys --example provision_runtime -- "$reference_dir"
-          reference_lib="$(python -c 'import pathlib,sys; print((pathlib.Path(sys.argv[1]) / "lib").resolve())' "$reference_dir")"
+          reference_lib="$reference_dir/lib"
           echo "ONNX_GENAI_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
           echo "NXRT_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
           echo "$reference_lib" >> "$GITHUB_PATH"
@@ -1210,7 +1210,7 @@ jobs:
         run: |
           reference_dir="$RUNNER_TEMP/nxrt-ort-reference"
           cargo run --locked -p onnx-genai-ort-sys --example provision_runtime -- "$reference_dir"
-          reference_lib="$(python -c 'import pathlib,sys; print((pathlib.Path(sys.argv[1]) / "lib").resolve())' "$reference_dir")"
+          reference_lib="$reference_dir/lib"
           echo "ONNX_GENAI_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
           echo "NXRT_ORT_LIB_DIR=$reference_lib" >> "$GITHUB_ENV"
           echo "$reference_lib" >> "$GITHUB_PATH"
