@@ -9,8 +9,10 @@
 //! ```
 //!
 //! Unlike [`super::layernorm::LayerNormKernel`] there is **no** mean removal and
-//! **no** bias term. Statistics are computed in f32 (`stash_type=1`, the only
-//! supported/default value). `scale` may be **any** shape unidirectionally
+//! **no** bias term. The default `stash_type=1` path uses the existing f32 SIMD
+//! implementation; schema-legal alternate stash types use a staged scalar path
+//! that rounds after every operation in the requested precision. `scale` may be
+//! **any** shape unidirectionally
 //! (NumPy-style, right-aligned) broadcastable to `X` — scalar, the normalized
 //! axes shape (`X.shape[axis:]`), or any intermediate — and is broadcast over
 //! `X` before the elementwise multiply.
@@ -19,7 +21,7 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
     WorkspacePreparation, WorkspaceView,
 };
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use super::typed_workspace::TypedWorkspace;
@@ -47,6 +49,36 @@ pub struct RmsNormKernel {
     kind: RmsKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RmsNormStash {
+    Float16,
+    Float32,
+    Float64,
+    BFloat16,
+}
+
+impl RmsNormStash {
+    fn from_onnx(value: i64) -> Result<Self> {
+        match value {
+            10 => Ok(Self::Float16),
+            1 => Ok(Self::Float32),
+            11 => Ok(Self::Float64),
+            16 => Ok(Self::BFloat16),
+            _ => Err(EpError::KernelFailed(format!(
+                "RMSNormalization: stash_type {value} is invalid; expected FLOAT (1), FLOAT16 (10), DOUBLE (11), or BFLOAT16 (16)"
+            ))),
+        }
+    }
+}
+
+struct StagedRmsNormKernel {
+    axis: i64,
+    epsilon: f32,
+    stash: RmsNormStash,
+}
+
+/// Factory reading `axis` (default -1), `epsilon` (default 1e-5) and
+/// `stash_type` (default 1).
 pub struct RmsNormFactory;
 
 impl KernelFactory for RmsNormFactory {
@@ -56,19 +88,22 @@ impl KernelFactory for RmsNormFactory {
             .attr("epsilon")
             .and_then(|a| a.as_float())
             .unwrap_or(1e-5);
-        let stash_type = node
-            .attr("stash_type")
-            .and_then(|a| a.as_int())
-            .unwrap_or(1);
-        if stash_type != 1 {
-            return Err(EpError::KernelFailed(format!(
-                "RMSNormalization: stash_type {stash_type} unsupported (only 1 = float)"
-            )));
+        let stash = RmsNormStash::from_onnx(
+            node.attr("stash_type")
+                .and_then(|a| a.as_int())
+                .unwrap_or(1),
+        )?;
+        if stash == RmsNormStash::Float32 {
+            return Ok(Box::new(RmsNormKernel {
+                axis,
+                epsilon,
+                kind: RmsKind::Standard,
+            }));
         }
-        Ok(Box::new(RmsNormKernel {
+        Ok(Box::new(StagedRmsNormKernel {
             axis,
             epsilon,
-            kind: RmsKind::Standard,
+            stash,
         }))
     }
 }
@@ -342,6 +377,180 @@ impl Kernel for RmsNormKernel {
     }
 }
 
+impl Kernel for StagedRmsNormKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("RMSNormalization", inputs, outputs, 2, 2, 1)?;
+        if outputs[0].dtype != inputs[0].dtype {
+            return Err(EpError::KernelFailed(format!(
+                "RMSNormalization: output dtype {:?} must match X dtype {:?}",
+                outputs[0].dtype, inputs[0].dtype
+            )));
+        }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let elements = inputs[0].numel() as u64;
+            let rank = inputs[0].shape.len() as i64;
+            let axis = if self.axis < 0 {
+                self.axis + rank
+            } else {
+                self.axis
+            };
+            let groups = if axis >= 0 && axis < rank {
+                crate::trace::product(inputs[0].shape[..axis as usize].iter().copied())
+            } else {
+                0
+            };
+            elements
+                .saturating_mul(4)
+                .saturating_add(groups.saturating_mul(4))
+        });
+        let x = to_dense_f32_widen("RMSNormalization", &inputs[0])?;
+        let scale = to_dense_f32_widen("RMSNormalization", &inputs[1])?;
+        let y = rms_norm_dense_staged(
+            &x,
+            inputs[0].shape,
+            inputs[0].dtype,
+            &scale,
+            inputs[1].shape,
+            self.axis,
+            self.epsilon,
+            self.stash,
+        )?;
+        write_dense_f32_narrow("RMSNormalization", &mut outputs[0], &y)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
+fn round_f32(value: f32, dtype: DataType) -> f32 {
+    match dtype {
+        DataType::Float16 => half::f16::from_f32(value).to_f32(),
+        DataType::BFloat16 => half::bf16::from_f32(value).to_f32(),
+        DataType::Float32 => value,
+        _ => unreachable!("RMSNormalization X dtype validated by the kernel registry"),
+    }
+}
+
+fn staged_f16(value: f32) -> f32 {
+    half::f16::from_f32(value).to_f32()
+}
+
+fn staged_bf16(value: f32) -> f32 {
+    half::bf16::from_f32(value).to_f32()
+}
+
+fn rms_norm_dense_staged(
+    x: &[f32],
+    x_shape: &[usize],
+    x_dtype: DataType,
+    scale: &[f32],
+    scale_shape: &[usize],
+    axis: i64,
+    epsilon: f32,
+    stash: RmsNormStash,
+) -> Result<Vec<f32>> {
+    let rank = x_shape.len();
+    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+    if axis < 0 || axis as usize >= rank {
+        return Err(EpError::KernelFailed(format!(
+            "RMSNormalization: axis {axis} out of range for rank {rank}"
+        )));
+    }
+    let axis = axis as usize;
+    let norm_size: usize = x_shape[axis..].iter().product();
+    let num_groups: usize = x_shape[..axis].iter().product();
+    if norm_size == 0 {
+        return Err(EpError::KernelFailed(
+            "RMSNormalization: empty normalization axis".into(),
+        ));
+    }
+    if scale_shape.len() > rank {
+        return Err(EpError::KernelFailed(format!(
+            "RMSNormalization: scale rank {} exceeds X rank {rank}",
+            scale_shape.len()
+        )));
+    }
+    let offset = rank - scale_shape.len();
+    let mut scale_strides = vec![0usize; rank];
+    let mut stride = 1usize;
+    for i in (0..scale_shape.len()).rev() {
+        let sdim = scale_shape[i];
+        let xdim = x_shape[offset + i];
+        if sdim != xdim && sdim != 1 {
+            return Err(EpError::KernelFailed(format!(
+                "RMSNormalization: scale shape {scale_shape:?} not broadcastable to X shape {x_shape:?}"
+            )));
+        }
+        scale_strides[offset + i] = if sdim == 1 { 0 } else { stride };
+        stride *= sdim;
+    }
+    if scale.len() != scale_shape.iter().product::<usize>() {
+        return Err(EpError::KernelFailed(format!(
+            "RMSNormalization: scale has {} elements, expected {} for shape {scale_shape:?}",
+            scale.len(),
+            scale_shape.iter().product::<usize>()
+        )));
+    }
+    let mut x_strides = vec![1usize; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        x_strides[i] = x_strides[i + 1] * x_shape[i + 1];
+    }
+    let scale_index = |flat: usize| -> usize {
+        let mut si = 0usize;
+        let mut rem = flat;
+        for d in 0..rank {
+            let coord = rem / x_strides[d];
+            rem %= x_strides[d];
+            si += coord * scale_strides[d];
+        }
+        si
+    };
+
+    let mut y = vec![0.0f32; x.len()];
+    for group in 0..num_groups {
+        let base = group * norm_size;
+        match stash {
+            RmsNormStash::Float16 | RmsNormStash::BFloat16 => {
+                let round = if stash == RmsNormStash::Float16 {
+                    staged_f16
+                } else {
+                    staged_bf16
+                };
+                let mut sum = 0.0f32;
+                for &value in &x[base..base + norm_size] {
+                    let xu = round(value);
+                    sum += round(xu * xu);
+                }
+                let mean = round(sum / norm_size as f32);
+                let rms = round(round(mean + round(epsilon)).sqrt());
+                for element in 0..norm_size {
+                    let index = base + element;
+                    let normalized = round(round(x[index]) / rms);
+                    y[index] = round_f32(normalized, x_dtype) * scale[scale_index(index)];
+                }
+            }
+            RmsNormStash::Float64 => {
+                let mut sum = 0.0f64;
+                for &value in &x[base..base + norm_size] {
+                    let xu = f64::from(value);
+                    sum += xu * xu;
+                }
+                let rms = (sum / norm_size as f64 + f64::from(epsilon)).sqrt();
+                for element in 0..norm_size {
+                    let index = base + element;
+                    let normalized = f64::from(x[index]) / rms;
+                    y[index] = round_f32(normalized as f32, x_dtype) * scale[scale_index(index)];
+                }
+            }
+            RmsNormStash::Float32 => {
+                unreachable!("the default FLOAT stash uses the existing SIMD path")
+            }
+        }
+    }
+    Ok(y)
+}
+
 /// Shared f32 arithmetic writes only to the caller's admitted staging regions.
 fn rms_norm_into(
     geometry: &RmsGeometry,
@@ -422,6 +631,100 @@ mod tests {
         let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
         let inv = 1.0 / (mean_sq + eps).sqrt();
         row.iter().zip(scale).map(|(v, s)| v * inv * s).collect()
+    }
+
+    #[test]
+    fn rmsnorm_rejects_non_schema_stash_type() {
+        let error = RmsNormStash::from_onnx(6).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "stash_type 6 is invalid; expected FLOAT (1), FLOAT16 (10), DOUBLE (11), or BFLOAT16 (16)"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rmsnorm_float16_stash_rounds_each_stage() {
+        let x = [300.0f32, 300.0];
+        let scale = [1.0f32, 1.0];
+        let staged = rms_norm_dense_staged(
+            &x,
+            &[1, 2],
+            DataType::Float32,
+            &scale,
+            &[2],
+            -1,
+            0.0,
+            RmsNormStash::Float16,
+        )
+        .unwrap();
+        assert_eq!(staged, [0.0, 0.0], "300² overflows FLOAT16 stage one");
+        assert!(reference(&x, &scale, 0.0).iter().all(|value| *value > 0.99));
+    }
+
+    #[test]
+    fn rmsnorm_bfloat16_stash_casts_x_before_statistics() {
+        let x = [1.001f32, 1.002];
+        let scale = [1.0f32, 1.0];
+        let staged = rms_norm_dense_staged(
+            &x,
+            &[1, 2],
+            DataType::Float32,
+            &scale,
+            &[2],
+            -1,
+            0.0,
+            RmsNormStash::BFloat16,
+        )
+        .unwrap();
+        assert_eq!(
+            staged,
+            [1.0, 1.0],
+            "both inputs cast to the same BFLOAT16 value before normalization"
+        );
+        let float = reference(&x, &scale, 0.0);
+        assert_ne!(float[0].to_bits(), float[1].to_bits());
+    }
+
+    #[test]
+    fn rmsnorm_bfloat16_stash_reduce_mean_rounds_only_the_result() {
+        let x = vec![1.0f32; 512];
+        let scale = vec![1.0f32; 512];
+        let staged = rms_norm_dense_staged(
+            &x,
+            &[1, 512],
+            DataType::Float32,
+            &scale,
+            &[512],
+            -1,
+            0.0,
+            RmsNormStash::BFloat16,
+        )
+        .unwrap();
+        assert!(
+            staged.iter().all(|value| *value == 1.0),
+            "ReduceMean accumulates the BFLOAT16 squared inputs before rounding its result"
+        );
+    }
+
+    #[test]
+    fn rmsnorm_double_stash_avoids_float_square_overflow() {
+        let x = [1.0e20f32, 1.0e20];
+        let scale = [1.0f32, 1.0];
+        let staged = rms_norm_dense_staged(
+            &x,
+            &[1, 2],
+            DataType::Float32,
+            &scale,
+            &[2],
+            -1,
+            0.0,
+            RmsNormStash::Float64,
+        )
+        .unwrap();
+        assert_eq!(staged, [1.0, 1.0]);
+        assert_eq!(reference(&x, &scale, 0.0), [0.0, 0.0]);
     }
 
     #[test]

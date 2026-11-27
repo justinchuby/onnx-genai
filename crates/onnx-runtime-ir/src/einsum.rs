@@ -65,6 +65,16 @@ impl EinsumSchema {
     pub const fn supports_dtype(self, dtype: DataType) -> bool {
         is_base_numeric_dtype(dtype) || matches!((self, dtype), (Self::V28, DataType::BFloat16))
     }
+
+    /// Whether the standalone native runtime can execute `dtype` under this
+    /// schema revision without changing the node's resolved opset.
+    ///
+    /// BFloat16 was added to the authoritative type constraint in Einsum-28,
+    /// but the operator semantics are unchanged from Einsum-12. Schema-facing
+    /// validation and plugin contracts continue to use [`Self::supports_dtype`].
+    pub const fn supports_native_dtype(self, dtype: DataType) -> bool {
+        self.supports_dtype(dtype) || matches!(dtype, DataType::BFloat16)
+    }
 }
 
 impl fmt::Display for EinsumSchema {
@@ -501,6 +511,15 @@ impl EinsumPrecisionPolicy {
     /// reparsing the equation or reconstructing the schema/type table.
     pub fn for_schema(schema: EinsumSchema, dtype: DataType) -> Option<Self> {
         if schema.supports_dtype(dtype) {
+            Some(Self::for_dtype(dtype))
+        } else {
+            None
+        }
+    }
+
+    /// Native-runtime precision policy for an already-resolved schema.
+    pub fn for_native_schema(schema: EinsumSchema, dtype: DataType) -> Option<Self> {
+        if schema.supports_native_dtype(dtype) {
             Some(Self::for_dtype(dtype))
         } else {
             None
@@ -1444,6 +1463,25 @@ impl EinsumPlan {
         Self::build_for_schema(equation, inputs, schema).map_err(EinsumOpsetPlanError::Planning)
     }
 
+    /// Resolve the applicable schema and build for standalone native execution.
+    ///
+    /// This preserves the resolved schema revision and all of its structural
+    /// semantics while applying the native executable-dtype policy.
+    pub fn build_for_native_opset<D: EinsumDimensionValue>(
+        equation: &str,
+        inputs: &[EinsumInput<'_, D>],
+        imported_opset: u64,
+    ) -> Result<Self, EinsumOpsetPlanError> {
+        let schema = EinsumSchema::resolve(imported_opset).map_err(|_| {
+            EinsumOpsetPlanError::UnsupportedOpset {
+                equation: normalize_equation(equation),
+                imported_opset,
+            }
+        })?;
+        Self::build_for_native_schema(equation, inputs, schema)
+            .map_err(EinsumOpsetPlanError::Planning)
+    }
+
     /// Parse and validate against an already-resolved schema proof.
     pub fn build_for_schema<D: EinsumDimensionValue>(
         equation: &str,
@@ -1453,6 +1491,22 @@ impl EinsumPlan {
         Self::build_for_schema_with_budget(equation, inputs, schema, EinsumPlannerBudget::default())
     }
 
+    /// Parse and validate for standalone native execution under a resolved
+    /// schema revision.
+    pub fn build_for_native_schema<D: EinsumDimensionValue>(
+        equation: &str,
+        inputs: &[EinsumInput<'_, D>],
+        schema: EinsumSchema,
+    ) -> Result<Self, EinsumPlanError> {
+        Self::build_for_schema_with_budget_and_dtype_policy(
+            equation,
+            inputs,
+            schema,
+            EinsumPlannerBudget::default(),
+            true,
+        )
+    }
+
     /// Build with explicit bounded-planner budgets.
     pub fn build_for_schema_with_budget<D: EinsumDimensionValue>(
         equation: &str,
@@ -1460,12 +1514,28 @@ impl EinsumPlan {
         schema: EinsumSchema,
         planner_budget: EinsumPlannerBudget,
     ) -> Result<Self, EinsumPlanError> {
+        Self::build_for_schema_with_budget_and_dtype_policy(
+            equation,
+            inputs,
+            schema,
+            planner_budget,
+            false,
+        )
+    }
+
+    fn build_for_schema_with_budget_and_dtype_policy<D: EinsumDimensionValue>(
+        equation: &str,
+        inputs: &[EinsumInput<'_, D>],
+        schema: EinsumSchema,
+        planner_budget: EinsumPlannerBudget,
+        native_runtime: bool,
+    ) -> Result<Self, EinsumPlanError> {
         let normalized = normalize_equation(equation);
         let parsed = ParsedEquation::parse(&normalized, inputs.len())?;
         if inputs.iter().any(|input| input.shape.is_none()) {
             validate_partial_input_shapes(&normalized, &parsed, inputs, schema, planner_budget)?;
         }
-        let (dtype, input_meta) = validate_inputs(&normalized, inputs, schema)?;
+        let (dtype, input_meta) = validate_inputs(&normalized, inputs, schema, native_runtime)?;
         let precision = EinsumPrecisionPolicy::for_dtype(dtype);
         let shape = build_shape_plan(normalized, parsed, input_meta, schema, planner_budget)?;
         Ok(Self {
@@ -2320,6 +2390,7 @@ fn validate_inputs<D: EinsumDimensionValue>(
     equation: &str,
     inputs: &[EinsumInput<'_, D>],
     schema: EinsumSchema,
+    native_runtime: bool,
 ) -> Result<(DataType, Vec<InputMeta>), EinsumPlanError> {
     let mut expected_dtype = None;
     let mut missing_dtype = None;
@@ -2328,7 +2399,12 @@ fn validate_inputs<D: EinsumDimensionValue>(
             missing_dtype.get_or_insert(input);
             continue;
         };
-        if !schema.supports_dtype(dtype) {
+        let supported = if native_runtime {
+            schema.supports_native_dtype(dtype)
+        } else {
+            schema.supports_dtype(dtype)
+        };
+        if !supported {
             return Err(EinsumPlanError::new_for_schema(
                 equation,
                 EinsumPlanErrorKind::UnsupportedInputDtype { input, dtype },

@@ -1,5 +1,5 @@
 //! CUDA kernels for dtype-agnostic structural operators: `GatherND`,
-//! `SpaceToDepth`, and `EyeLike`.
+//! `DepthToSpace`, `SpaceToDepth`, and `EyeLike`.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -8,6 +8,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
+use onnx_runtime_ir::space_depth::{Direction, Order, SpaceDepth};
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::movement::PersistentMetadata;
@@ -15,7 +16,7 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
-const MODULE: &str = "structural_ops_v1";
+const MODULE: &str = "structural_ops_v2";
 
 const SOURCE: &str = r#"
 extern "C" __global__ void gather_nd_bytes(
@@ -67,14 +68,19 @@ extern "C" __global__ void gather_nd_bytes(
   }
 }
 
-extern "C" __global__ void space_to_depth_bytes(
+template <bool TO_DEPTH, bool CRD>
+__device__ void space_depth(
     const unsigned char* input, unsigned char* output,
     unsigned long long channels, unsigned long long height,
     unsigned long long width, unsigned long long block,
     int element_bytes, unsigned long long elements) {
-  const unsigned long long output_height = height / block;
-  const unsigned long long output_width = width / block;
-  const unsigned long long output_channels = channels * block * block;
+  const unsigned long long area = block * block;
+  const unsigned long long depth_height = height / block;
+  const unsigned long long depth_width = width / block;
+  const unsigned long long depth_channels = channels * area;
+  const unsigned long long output_height = TO_DEPTH ? depth_height : height;
+  const unsigned long long output_width = TO_DEPTH ? depth_width : width;
+  const unsigned long long output_channels = TO_DEPTH ? depth_channels : channels;
   for (unsigned long long output_index = blockIdx.x * blockDim.x + threadIdx.x;
        output_index < elements;
        output_index += (unsigned long long)gridDim.x * blockDim.x) {
@@ -85,19 +91,38 @@ extern "C" __global__ void space_to_depth_bytes(
     rem /= output_height;
     const unsigned long long output_channel = rem % output_channels;
     const unsigned long long batch = rem / output_channels;
-    const unsigned long long channel = output_channel % channels;
-    const unsigned long long block_offset = output_channel / channels;
-    const unsigned long long block_y = block_offset / block;
-    const unsigned long long block_x = block_offset % block;
-    const unsigned long long input_y = output_y * block + block_y;
-    const unsigned long long input_x = output_x * block + block_x;
-    const unsigned long long input_index =
-        ((batch * channels + channel) * height + input_y) * width + input_x;
+    unsigned long long input_index;
+    if (TO_DEPTH) {
+      const unsigned long long channel = CRD ? output_channel / area : output_channel % channels;
+      const unsigned long long offset = CRD ? output_channel % area : output_channel / channels;
+      const unsigned long long y = output_y * block + offset / block;
+      const unsigned long long x = output_x * block + offset % block;
+      input_index = ((batch * channels + channel) * height + y) * width + x;
+    } else {
+      const unsigned long long offset = (output_y % block) * block + output_x % block;
+      const unsigned long long channel = CRD ? output_channel * area + offset : offset * channels + output_channel;
+      input_index = ((batch * depth_channels + channel) * depth_height + output_y / block)
+          * depth_width + output_x / block;
+    }
     for (int byte = 0; byte < element_bytes; ++byte)
       output[output_index * element_bytes + byte] =
           input[input_index * element_bytes + byte];
   }
 }
+
+#define SPACE_DEPTH_KERNEL(name, to_depth, crd) \
+extern "C" __global__ void name( \
+    const unsigned char* input, unsigned char* output, \
+    unsigned long long channels, unsigned long long height, \
+    unsigned long long width, unsigned long long block, \
+    int element_bytes, unsigned long long elements) { \
+  space_depth<to_depth, crd>(input, output, channels, height, width, block, element_bytes, elements); \
+}
+
+SPACE_DEPTH_KERNEL(space_to_depth_bytes, true, false)
+SPACE_DEPTH_KERNEL(space_to_depth_crd_bytes, true, true)
+SPACE_DEPTH_KERNEL(depth_to_space_bytes, false, false)
+SPACE_DEPTH_KERNEL(depth_to_space_crd_bytes, false, true)
 
 extern "C" __global__ void eye_like_bytes(
     unsigned char* output, unsigned long long columns, long long k,
@@ -376,85 +401,139 @@ impl Kernel for GatherNdKernel {
     }
 }
 
-pub struct SpaceToDepthFactory {
+pub struct SpaceDepthFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub standalone: bool,
 }
 
-impl KernelFactory for SpaceToDepthFactory {
+impl KernelFactory for SpaceDepthFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let block_size = node
-            .attr("blocksize")
-            .and_then(Attribute::as_int)
-            .ok_or_else(|| {
-                EpError::KernelFailed("cuda_ep SpaceToDepth: blocksize is required".into())
-            })?;
-        if block_size <= 0 {
-            return Err(EpError::KernelFailed(
-                "cuda_ep SpaceToDepth: blocksize must be positive".into(),
-            ));
-        }
-        Ok(Box::new(SpaceToDepthKernel {
-            block_size: block_size as usize,
+        let config = if self.standalone {
+            let params =
+                SpaceDepth::parse(node, node.local_opset().unwrap_or(1)).map_err(|detail| {
+                    EpError::KernelFailed(format!("cuda_ep {}: {detail}", node.op_type))
+                })?;
+            SpaceDepthConfig::Standalone(params)
+        } else {
+            let block = node
+                .attr("blocksize")
+                .and_then(Attribute::as_int)
+                .ok_or_else(|| {
+                    EpError::KernelFailed("cuda_ep SpaceToDepth: blocksize is required".into())
+                })?;
+            if block <= 0 {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep SpaceToDepth: blocksize must be positive".into(),
+                ));
+            }
+            SpaceDepthConfig::Legacy(block as usize)
+        };
+        Ok(Box::new(SpaceDepthKernel {
+            config,
+            op: node.op_type.clone(),
             runtime: self.runtime.clone(),
         }))
     }
 }
 
-struct SpaceToDepthKernel {
-    block_size: usize,
+#[derive(Clone, Copy)]
+enum SpaceDepthConfig {
+    Legacy(usize),
+    Standalone(SpaceDepth),
+}
+
+struct SpaceDepthKernel {
+    config: SpaceDepthConfig,
+    op: String,
     runtime: Arc<CudaRuntime>,
 }
 
-impl Kernel for SpaceToDepthKernel {
+impl Kernel for SpaceDepthKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         if inputs.len() != 1 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep SpaceToDepth: expected 1 input and 1 output, got {} and {}",
+                "cuda_ep {}: expected 1 input and 1 output, got {} and {}",
+                self.op,
                 inputs.len(),
                 outputs.len()
             )));
         }
-        require_dense("SpaceToDepth", inputs, outputs)?;
+        require_dense(&self.op, inputs, outputs)?;
         let input = &inputs[0];
-        if input.shape.len() != 4 {
-            return Err(EpError::KernelFailed(
-                "cuda_ep SpaceToDepth: input must have rank 4".into(),
-            ));
-        }
-        let [batch, channels, height, width] =
-            <[usize; 4]>::try_from(input.shape).expect("rank checked above");
-        let block = self.block_size;
-        if height % block != 0 || width % block != 0 {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep SpaceToDepth: spatial dimensions {height}x{width} must be divisible by blocksize {block}"
-            )));
-        }
-        let output_shape = [
-            batch,
-            channels * block * block,
-            height / block,
-            width / block,
-        ];
+        let (output_shape, direction, order, block) = match self.config {
+            SpaceDepthConfig::Legacy(block) => {
+                let [n, c, h, w] = <[usize; 4]>::try_from(input.shape).map_err(|_| {
+                    EpError::KernelFailed("cuda_ep SpaceToDepth: input must have rank 4".into())
+                })?;
+                if h % block != 0 || w % block != 0 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep SpaceToDepth: spatial dimensions {h}x{w} must be divisible by blocksize {block}"
+                    )));
+                }
+                (
+                    [n, c * block * block, h / block, w / block],
+                    Direction::SpaceToDepth,
+                    Order::Dcr,
+                    block as u64,
+                )
+            }
+            SpaceDepthConfig::Standalone(params) => {
+                let shape = params.output_shape(input.shape).map_err(|detail| {
+                    EpError::KernelFailed(format!("cuda_ep {}: {detail}", self.op))
+                })?;
+                (
+                    shape,
+                    params.direction,
+                    params.order,
+                    params.blocksize() as u64,
+                )
+            }
+        };
         if outputs[0].dtype != input.dtype || outputs[0].shape != output_shape {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep SpaceToDepth: output must have dtype {:?} and shape {output_shape:?}",
-                input.dtype
+                "cuda_ep {}: output must have dtype {:?} and shape {output_shape:?}",
+                self.op, input.dtype,
             )));
         }
-        let elements = outputs[0].numel();
+        let standalone_bytes = match self.config {
+            SpaceDepthConfig::Legacy(_) => None,
+            SpaceDepthConfig::Standalone(_) => {
+                Some(SpaceDepth::element_bytes(input.dtype).map_err(|detail| {
+                    EpError::KernelFailed(format!("cuda_ep {}: {detail}", self.op))
+                })?)
+            }
+        };
+        let elements = if standalone_bytes.is_some() {
+            if output_shape.contains(&0) {
+                return Ok(());
+            }
+            product(&output_shape, &self.op)?
+        } else {
+            outputs[0].numel()
+        };
         if elements == 0 {
             return Ok(());
         }
-        let function = self
-            .runtime
-            .nvrtc_function(MODULE, SOURCE, "space_to_depth_bytes")?;
+        let [_, channels, height, width] = match direction {
+            Direction::SpaceToDepth => input.shape.try_into().expect("rank already validated"),
+            Direction::DepthToSpace => output_shape,
+        };
+        let name = match (direction, order) {
+            (Direction::SpaceToDepth, Order::Dcr) => "space_to_depth_bytes",
+            (Direction::SpaceToDepth, Order::Crd) => "space_to_depth_crd_bytes",
+            (Direction::DepthToSpace, Order::Dcr) => "depth_to_space_bytes",
+            (Direction::DepthToSpace, Order::Crd) => "depth_to_space_crd_bytes",
+        };
+        let function = self.runtime.nvrtc_function(MODULE, SOURCE, name)?;
         let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let channels = channels as u64;
         let height = height as u64;
         let width = width as u64;
-        let block = block as u64;
-        let element_bytes = fixed_width("SpaceToDepth", input.dtype)? as i32;
+        let element_bytes = match standalone_bytes {
+            Some(bytes) => bytes,
+            None => fixed_width(&self.op, input.dtype)?,
+        } as i32;
         let elements_u64 = elements as u64;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
@@ -473,7 +552,7 @@ impl Kernel for SpaceToDepthKernel {
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|error| driver_err("launch space_to_depth_bytes", error))?;
+        .map_err(|error| driver_err(&format!("launch {name}"), error))?;
         if self.runtime.is_capturing()? {
             return Ok(());
         }
@@ -491,23 +570,9 @@ pub struct EyeLikeFactory {
 
 impl KernelFactory for EyeLikeFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let k = node.attr("k").and_then(Attribute::as_int).unwrap_or(0);
-        let dtype = match node.attr("dtype") {
-            None => None,
-            Some(Attribute::Int(value)) => {
-                let value = i32::try_from(*value).map_err(|_| {
-                    EpError::KernelFailed(format!("cuda_ep EyeLike: invalid dtype {value}"))
-                })?;
-                Some(DataType::from_onnx(value).ok_or_else(|| {
-                    EpError::KernelFailed(format!("cuda_ep EyeLike: invalid dtype {value}"))
-                })?)
-            }
-            Some(_) => {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep EyeLike: dtype must be an integer".into(),
-                ));
-            }
-        };
+        let onnx_runtime_ir::eye_like::Attributes { k, dtype } =
+            onnx_runtime_ir::eye_like::Attributes::parse(node)
+                .map_err(|reason| EpError::KernelFailed(format!("cuda_ep EyeLike: {reason}")))?;
         Ok(Box::new(EyeLikeKernel {
             k,
             dtype,

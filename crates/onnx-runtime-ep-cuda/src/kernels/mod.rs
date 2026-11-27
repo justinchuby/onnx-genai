@@ -70,6 +70,7 @@ mod gqa_decode;
 mod gqa_decode_bf16;
 mod gqa_decode_fp16;
 pub mod grid_sample;
+mod grid_sample_ort;
 pub mod group_normalization;
 pub mod group_query_attention;
 mod grouped_matmul;
@@ -84,6 +85,8 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod max_roi_pool;
+mod max_unpool;
 mod mean_variance_normalization;
 mod metadata_workspace;
 pub mod mod_op;
@@ -233,6 +236,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "DFT",
     "STFT",
     "MaxPool",
+    "MaxUnpool",
     "AveragePool",
     "LpPool",
     "Relu",
@@ -356,6 +360,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ArgMax",
     "ArgMin",
     "GatherND",
+    "DepthToSpace",
     "SpaceToDepth",
     "EyeLike",
     "Pad",
@@ -389,6 +394,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Resize",
     "ConvTranspose",
     "DeformConv",
+    "MaxRoiPool",
     "GridSample",
     "RoiAlign",
     "GatherBlockQuantized",
@@ -565,6 +571,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("MaxRoiPool", "") => onnx_runtime_ir::max_roi_pool::DTYPES,
         ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
@@ -662,8 +669,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Where", _)
         | ("Cast", _)
         | ("CastLike", _)
-        | ("TopK", _)
-        | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        | ("TopK", _) => CUDA_ALL_DTYPES,
+        ("EyeLike", "") => onnx_runtime_ir::eye_like::DTYPES,
         ("MeanVarianceNormalization", "") => onnx_runtime_ep_api::mean_variance_normalization::DTYPES,
         ("Range", "") => &[
             DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
@@ -719,7 +726,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
     }
 }
 
-/// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
+/// Derive kernel-registry descriptors from the ORT plugin's CUDA [`OpRegistry`].
 ///
 /// One descriptor per plugin-eligible `(op_type, domain, since_version)` key, with
 /// the domain taken verbatim from the registry (so `com.microsoft` kernels are
@@ -729,14 +736,26 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescriptor> {
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .plugin_keys()
-        // RoiAlign is currently supported only in standalone nxrt.
-        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
-        .map(|key| CudaOpDescriptor {
-            op_type: key.op_type.clone(),
-            domain: key.domain.clone(),
-            since_version: key.since_version,
-            end_version: registry.explicit_end_version(key),
-            supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
+        // These ROI kernels are supported only in standalone nxrt.
+        .filter(|key| {
+            !(key.domain.is_empty() && matches!(key.op_type.as_str(), "RoiAlign" | "MaxRoiPool"))
+        })
+        .map(|key| {
+            let supported_dtypes = if key.op_type == "Conv"
+                && key.domain.is_empty()
+                && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
+            {
+                onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
+            } else {
+                cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
+            };
+            CudaOpDescriptor {
+                op_type: key.op_type.clone(),
+                domain: key.domain.clone(),
+                since_version: key.since_version,
+                end_version: registry.explicit_end_version(key),
+                supported_dtypes,
+            }
         })
         .collect();
     // Deterministic order so the advertisement is stable across runs.
@@ -980,13 +999,31 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
-    reg.register(
-        OpKey::new("SpaceToDepth", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(structural::SpaceToDepthFactory {
-            runtime: runtime.clone(),
-        }),
+    let standalone = matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
     );
+    if standalone {
+        for op in ["DepthToSpace", "SpaceToDepth"] {
+            reg.register(
+                OpKey::new(op, "", 1),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(structural::SpaceDepthFactory {
+                    runtime: runtime.clone(),
+                    standalone,
+                }),
+            );
+        }
+    } else {
+        reg.register(
+            OpKey::new("SpaceToDepth", "", 13),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(structural::SpaceDepthFactory {
+                runtime: runtime.clone(),
+                standalone,
+            }),
+        );
+    }
     reg.register(
         OpKey::new("EyeLike", "", 9),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1175,14 +1212,35 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
-    for since_version in [16_u32, 20] {
+    for version in [1, 22] {
         reg.register(
-            OpKey::new("GridSample", "", u64::from(since_version)),
+            OpKey::new("MaxRoiPool", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(grid_sample::GridSampleFactory {
+            Box::new(max_roi_pool::Factory {
+                runtime: runtime.clone(),
+                version,
+            }),
+        );
+    }
+    let grid_sample_versions: &[u32] = match conv_transpose_contract {
+        conv_transpose::Contract::Standalone => &[16, 20, 22],
+        conv_transpose::Contract::OrtPlugin => &[16, 20],
+    };
+    for &since_version in grid_sample_versions {
+        let factory: Box<dyn onnx_runtime_ep_api::KernelFactory> = match conv_transpose_contract {
+            conv_transpose::Contract::Standalone => Box::new(grid_sample::GridSampleFactory {
                 runtime: runtime.clone(),
                 since_version,
             }),
+            conv_transpose::Contract::OrtPlugin => Box::new(grid_sample_ort::GridSampleFactory {
+                runtime: runtime.clone(),
+                since_version,
+            }),
+        };
+        reg.register(
+            OpKey::new("GridSample", "", u64::from(since_version)),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            factory,
         );
     }
     for version in onnx_runtime_ir::roi_align::VERSIONS {
@@ -1279,6 +1337,7 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    // OneHot-28 reuses the v11 factory through version-floor lookup.
     for (opset, wrap_negative) in [(9, false), (11, true)] {
         reg.register(
             OpKey::new("OneHot", "", opset),
@@ -1527,8 +1586,16 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
+    reg.register_through(
         OpKey::new("Conv", "", 1),
+        onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET - 1,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(conv::ConvFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Conv", "", onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(conv::ConvFactory {
             runtime: runtime.clone(),
@@ -1548,13 +1615,24 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
+    for version in [19, 22] {
+        reg.register(
+            OpKey::new("AveragePool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(pooling::PoolFactory {
+                kind: pooling::PoolKind::Average,
+                runtime: runtime.clone(),
+                average_supports_dilation: true,
+            }),
+        );
+    }
     reg.register(
-        OpKey::new("AveragePool", "", 19),
-        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        OpKey::new("MaxPool", "", 22),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::PoolFactory {
-            kind: pooling::PoolKind::Average,
+            kind: pooling::PoolKind::Max,
             runtime: runtime.clone(),
-            average_supports_dilation: true,
+            average_supports_dilation: false,
         }),
     );
     reg.register(
@@ -1571,6 +1649,16 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    for version in [9, 11, 22] {
+        reg.register(
+            OpKey::new("MaxUnpool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(max_unpool::MaxUnpoolFactory {
+                version,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("Col2Im", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -2412,30 +2500,32 @@ mod tests {
         ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
     )]
     #[test]
-    fn cuda_plugin_descriptors_exclude_standalone_roi_align() {
+    fn cuda_plugin_descriptors_exclude_standalone_roi_kernels() {
         let runtime = std::sync::Arc::new(
             crate::runtime::CudaRuntime::new(0)
                 .expect("CUDA plugin descriptor test requires a usable CUDA device 0"),
         );
         let registry = build_cuda_registry(runtime);
-        assert!(
-            registry.keys().any(|key| {
-                key.op_type == "RoiAlign" && matches!(key.domain.as_str(), "" | "ai.onnx")
-            }),
-            "standalone CUDA registry must contain ONNX RoiAlign before testing plugin exclusion"
-        );
         let descriptors = build_cuda_registry_descriptors(&registry);
         assert!(
             !descriptors.is_empty(),
             "CUDA plugin descriptors unexpectedly empty; exclusion check would be vacuous"
         );
-        assert!(
-            !descriptors.iter().any(|descriptor| {
-                descriptor.op_type == "RoiAlign"
-                    && matches!(descriptor.domain.as_str(), "" | "ai.onnx")
-            }),
-            "standalone-only ONNX RoiAlign must not be advertised by the CUDA ORT plugin"
-        );
+        for op in ["RoiAlign", "MaxRoiPool"] {
+            assert!(
+                registry.keys().any(|key| {
+                    key.op_type == op && onnx_runtime_ir::is_default_domain(&key.domain)
+                }),
+                "standalone CUDA registry must contain ONNX {op} before testing plugin exclusion"
+            );
+            assert!(
+                !descriptors.iter().any(|descriptor| {
+                    descriptor.op_type == op
+                        && onnx_runtime_ir::is_default_domain(&descriptor.domain)
+                }),
+                "standalone-only ONNX {op} must not be advertised by the CUDA ORT plugin"
+            );
+        }
         let cast_versions = descriptors
             .iter()
             .filter(|descriptor| descriptor.op_type == "Cast")

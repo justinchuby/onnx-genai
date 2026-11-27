@@ -4,7 +4,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::{check_arity, write_dense_bytes};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
 
 /// Dispatch counter for the BNNS pooling fast path (macOS/iOS).
@@ -192,6 +192,34 @@ pub struct PoolKernel {
     kind: PoolKind,
 }
 
+trait PoolScalar: Copy + PartialOrd + std::ops::AddAssign + std::ops::Div<Output = Self> {
+    const ZERO: Self;
+    const NEG_INFINITY: Self;
+    fn from_count(count: usize) -> Self;
+    fn lp_power(self, p: i32) -> Self;
+    fn lp_root(self, p: i32) -> Self;
+}
+
+macro_rules! impl_pool_scalar {
+    ($t:ty) => {
+        impl PoolScalar for $t {
+            const ZERO: Self = 0.0;
+            const NEG_INFINITY: Self = <$t>::NEG_INFINITY;
+            fn from_count(count: usize) -> Self {
+                count as Self
+            }
+            fn lp_power(self, p: i32) -> Self {
+                self.abs().powi(p)
+            }
+            fn lp_root(self, p: i32) -> Self {
+                self.powf(1.0 / p as Self)
+            }
+        }
+    };
+}
+impl_pool_scalar!(f32);
+impl_pool_scalar!(f64);
+
 pub struct AveragePoolFactory;
 pub struct LpPoolFactory;
 pub struct MaxPoolFactory;
@@ -236,13 +264,20 @@ impl KernelFactory for LpPoolFactory {
             .len()
             .checked_sub(2)
             .ok_or_else(|| EpError::KernelFailed("LpPool: input must have rank >= 3".into()))?;
-        let p = node.attr("p").and_then(Attribute::as_int).unwrap_or(2);
+        let p = node
+            .attr("p")
+            .map_or(Some(2), Attribute::as_int)
+            .unwrap_or(0);
         if p <= 0 || p > i32::MAX as i64 {
             return Err(EpError::KernelFailed(
                 "LpPool: p must be a positive 32-bit integer".into(),
             ));
         }
-        let (params, auto_pad, ceil_mode) = pool_params(node, dims)?;
+        let (mut params, mut auto_pad, ceil_mode) = pool_params(node, dims)?;
+        if matches!(auto_pad, AutoPad::Valid) {
+            params.pads.fill(0);
+            auto_pad = AutoPad::NotSet;
+        }
         Ok(Box::new(PoolKernel {
             params,
             auto_pad,
@@ -280,14 +315,14 @@ impl PoolKernel {
     /// Walk the validated dense input in row-major kernel order. Output staging
     /// remains call-local so strided/aliased tensor boundaries keep their prior
     /// materialization semantics; only the window-coordinate scratch is reused.
-    fn pool_dense(
+    fn pool_dense<T: PoolScalar>(
         &self,
-        x: &[f32],
+        x: &[T],
         x_shape: &[usize],
         output_spatial: &[usize],
         pads: &[usize],
         indices_requested: bool,
-    ) -> (Vec<f32>, Vec<i64>) {
+    ) -> (Vec<T>, Vec<i64>) {
         let spatial = &x_shape[2..];
         let spatial_size = numel(spatial);
         let kernel_size = numel(&self.params.kernel);
@@ -312,9 +347,9 @@ impl PoolKernel {
                     *start = (out_coords[axis] * self.params.strides[axis]) as isize
                         - pads[axis] as isize;
                 }
-                let mut sum = 0.0;
+                let mut sum = T::ZERO;
                 let mut count = 0usize;
-                let mut maximum = f32::NEG_INFINITY;
+                let mut maximum = T::NEG_INFINITY;
                 let mut maximum_index = 0usize;
                 kernel_coords.fill(0);
                 for _ in 0..kernel_size {
@@ -342,7 +377,7 @@ impl PoolKernel {
                             count += 1;
                         }
                         PoolKind::Lp { p } => {
-                            sum += value.abs().powi(p);
+                            sum += value.lp_power(p);
                             count += 1;
                         }
                         PoolKind::Max { storage_order } => {
@@ -360,17 +395,13 @@ impl PoolKernel {
                     PoolKind::Average { include_pad } => {
                         let divisor = if include_pad { kernel_size } else { count };
                         values.push(if divisor == 0 {
-                            0.0
+                            T::ZERO
                         } else {
-                            sum / divisor as f32
+                            sum / T::from_count(divisor)
                         });
                     }
                     PoolKind::Lp { p } => {
-                        values.push(if count == 0 {
-                            0.0
-                        } else {
-                            sum.powf(1.0 / p as f32)
-                        });
+                        values.push(if count == 0 { T::ZERO } else { sum.lp_root(p) });
                     }
                     PoolKind::Max { .. } => {
                         values.push(maximum);
@@ -440,6 +471,19 @@ impl Kernel for PoolKernel {
         }
         POOL_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        if matches!(self.kind, PoolKind::Lp { .. }) {
+            if inputs[0].dtype != outputs[0].dtype {
+                return Err(EpError::KernelFailed(format!(
+                    "LpPool: output Y must match input X dtype {:?}, got {:?}",
+                    inputs[0].dtype, outputs[0].dtype
+                )));
+            }
+            if inputs[0].dtype == DataType::Float64 {
+                let x = to_dense::<f64>(&inputs[0])?;
+                let (values, _) = self.pool_dense(&x, x_shape, &output_spatial, &pads, false);
+                return write_dense(&mut outputs[0], &values);
+            }
+        }
         let x = to_dense_f32_widen("Pool", &inputs[0])?;
         let (values, indices) =
             self.pool_dense(&x, x_shape, &output_spatial, &pads, outputs.len() == 2);

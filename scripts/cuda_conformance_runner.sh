@@ -148,6 +148,15 @@ if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
 fi
 echo ""
 
+# LpPool needs an independent reference, with native CUDA required.
+echo "── LpPool-22 reference conformance ──"
+if ! ONNX_GENAI_REQUIRE_CUDA=1 cargo test --locked -p onnx-runtime-session --features gpu-tests \
+    --test lp_pool_v22 lp_pool_v22_cuda_matches_onnx_reference_without_fallback -- --exact --nocapture 2>&1; then
+    echo -e "${RED}FAILED: LpPool-22 CUDA conformance${NC}"
+    exit 1
+fi
+echo ""
+
 # Packed producer graphs must select and execute the native CUDA fusions.
 echo "── Packed producer graph selection and parity ──"
 if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
@@ -171,6 +180,15 @@ echo "── Dynamic Shape and Size on CUDA ──"
 if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
     --test modern_shape_size -- _dynamic_cuda --nocapture 2>&1; then
     echo -e "${RED}FAILED: Dynamic Shape and Size on CUDA${NC}"
+    exit 1
+fi
+echo ""
+
+# Opset 22 adds BF16 to the three global pooling operators.
+echo "── Native global pooling v22 BF16 reference cases ──"
+if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
+    --test global_pool_v22 -- --nocapture 2>&1; then
+    echo -e "${RED}FAILED: Global pooling v22 BF16 reference cases${NC}"
     exit 1
 fi
 echo ""

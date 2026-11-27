@@ -291,6 +291,14 @@ pub fn dropout(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `EyeLike`: preserve the matrix shape and optionally override its dtype.
 fn eye_like(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "EyeLike".into(),
+        detail,
+    };
+    let attrs = onnx_runtime_ir::eye_like::Attributes::parse(ctx.node).map_err(invalid)?;
+    let dtype = attrs
+        .resolve_dtype(ctx.opset(""), ctx.input_type(0).map(|input| input.dtype))
+        .map_err(invalid)?;
     let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
     };
@@ -302,14 +310,7 @@ fn eye_like(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             detail: "input must be a rank-2 tensor".into(),
         });
     }
-    let dtype = match ctx.node.attr("dtype").and_then(Attribute::as_int) {
-        Some(raw) => DataType::from_onnx(raw as i32).ok_or_else(|| ShapeInferError::Invalid {
-            op: "EyeLike".into(),
-            detail: format!("unknown output dtype {raw}"),
-        })?,
-        None => input.dtype,
-    };
-    ctx.set_output(0, dtype, input.shape);
+    ctx.set_output(0, dtype.unwrap_or(input.dtype), input.shape);
     Ok(())
 }
 

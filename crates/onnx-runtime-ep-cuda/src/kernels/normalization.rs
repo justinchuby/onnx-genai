@@ -410,6 +410,103 @@ extern "C" __global__ void rmsnorm_bf16(
         y[base + j] = __float2bfloat16_rn(o);
     }
 }
+
+__device__ __forceinline__ float load_rmsnorm_value(
+    const void* values, const int dtype, const size_t index) {
+    if (dtype == 1) return __half2float(((const __half*)values)[index]);
+    if (dtype == 2) return __bfloat162float(((const __nv_bfloat16*)values)[index]);
+    return ((const float*)values)[index];
+}
+
+__device__ __forceinline__ float round_rmsnorm_storage(
+    const float value, const int dtype) {
+    if (dtype == 1) return __half2float(__float2half_rn(value));
+    if (dtype == 2) return __bfloat162float(__float2bfloat16_rn(value));
+    return value;
+}
+
+__device__ __forceinline__ void store_rmsnorm_value(
+    void* values, const int dtype, const size_t index, const float value) {
+    if (dtype == 1) {
+        ((__half*)values)[index] = __float2half_rn(value);
+    } else if (dtype == 2) {
+        ((__nv_bfloat16*)values)[index] = __float2bfloat16_rn(value);
+    } else {
+        ((float*)values)[index] = value;
+    }
+}
+
+__device__ __forceinline__ float round_rmsnorm_stash(
+    const float value, const int stash_type) {
+    return stash_type == 10
+        ? __half2float(__float2half_rn(value))
+        : __bfloat162float(__float2bfloat16_rn(value));
+}
+
+extern "C" __global__ void rmsnorm_staged(
+    const void*  x,
+    const void*  scale,
+    void*        y,
+    const int    num_groups,
+    const int    norm_size,
+    const int    x_dtype,
+    const int    scale_dtype,
+    const int    stash_type,
+    const float  epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    extern __shared__ unsigned char scratch[];
+
+    if (tid == 0) {
+        if (stash_type == 11) {
+            double sum = 0.0;
+            for (int j = 0; j < norm_size; ++j) {
+                const double xu = (double)load_rmsnorm_value(x, x_dtype, base + j);
+                sum += xu * xu;
+            }
+            ((double*)scratch)[0] =
+                sqrt(sum / (double)norm_size + (double)epsilon);
+        } else {
+            float sum = 0.0f;
+            for (int j = 0; j < norm_size; ++j) {
+                const float xu = round_rmsnorm_stash(
+                    load_rmsnorm_value(x, x_dtype, base + j), stash_type);
+                const float square = round_rmsnorm_stash(xu * xu, stash_type);
+                sum += square;
+            }
+            const float mean =
+                round_rmsnorm_stash(sum / (float)norm_size, stash_type);
+            const float eps = round_rmsnorm_stash(epsilon, stash_type);
+            const float with_epsilon =
+                round_rmsnorm_stash(mean + eps, stash_type);
+            ((float*)scratch)[0] =
+                round_rmsnorm_stash(sqrtf(with_epsilon), stash_type);
+        }
+    }
+    __syncthreads();
+
+    for (int j = tid; j < norm_size; j += nt) {
+        const size_t index = base + j;
+        float normalized;
+        if (stash_type == 11) {
+            const double xu = (double)load_rmsnorm_value(x, x_dtype, index);
+            normalized = (float)(xu / ((double*)scratch)[0]);
+        } else {
+            const float xu = round_rmsnorm_stash(
+                load_rmsnorm_value(x, x_dtype, index), stash_type);
+            normalized = round_rmsnorm_stash(
+                xu / ((float*)scratch)[0], stash_type);
+        }
+        const float normalized_t = round_rmsnorm_storage(normalized, x_dtype);
+        const float output =
+            normalized_t * load_rmsnorm_value(scale, scale_dtype, j);
+        store_rmsnorm_value(y, x_dtype, index, output);
+    }
+}
 "#;
 
 /// NVRTC source for `com.microsoft::SkipSimplifiedLayerNormalization`.
@@ -1533,6 +1630,46 @@ fn rmsnorm_entry(dtype: DataType) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RmsNormStash {
+    Float16,
+    Float32,
+    Float64,
+    BFloat16,
+}
+
+impl RmsNormStash {
+    fn from_onnx(value: i64) -> Result<Self> {
+        match value {
+            10 => Ok(Self::Float16),
+            1 => Ok(Self::Float32),
+            11 => Ok(Self::Float64),
+            16 => Ok(Self::BFloat16),
+            _ => Err(EpError::KernelFailed(format!(
+                "RMSNormalization: stash_type {value} is invalid; expected FLOAT (1), FLOAT16 (10), DOUBLE (11), or BFLOAT16 (16)"
+            ))),
+        }
+    }
+
+    fn onnx_value(self) -> i32 {
+        match self {
+            Self::Float16 => 10,
+            Self::Float32 => 1,
+            Self::Float64 => 11,
+            Self::BFloat16 => 16,
+        }
+    }
+}
+
+fn rmsnorm_storage_code(dtype: DataType) -> i32 {
+    match dtype {
+        DataType::Float32 => 0,
+        DataType::Float16 => 1,
+        DataType::BFloat16 => 2,
+        _ => unreachable!("RMSNormalization dtype must be validated before dispatch"),
+    }
+}
+
 /// Reject a strided view with a "materialise first" error.
 fn require_contiguous(op: &str, name: &str, contiguous: bool) -> Result<()> {
     if !contiguous {
@@ -1831,14 +1968,11 @@ pub struct RmsNormFactory {
 
 impl KernelFactory for RmsNormFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        if node
-            .attr("stash_type")
-            .is_some_and(|attribute| attribute.as_int() != Some(1))
-        {
-            return Err(EpError::KernelFailed(
-                "RMSNormalization: stash_type must be 1 (float)".into(),
-            ));
-        }
+        let stash = RmsNormStash::from_onnx(
+            node.attr("stash_type")
+                .and_then(|attribute| attribute.as_int())
+                .unwrap_or(1),
+        )?;
         let axis = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1);
         let epsilon = node
             .attr("epsilon")
@@ -1847,6 +1981,7 @@ impl KernelFactory for RmsNormFactory {
         Ok(Box::new(RmsNormKernel {
             axis,
             epsilon,
+            stash,
             runtime: self.runtime.clone(),
             warmed_signature: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
@@ -1859,6 +1994,7 @@ impl KernelFactory for RmsNormFactory {
 pub struct RmsNormKernel {
     axis: i64,
     epsilon: f32,
+    stash: RmsNormStash,
     runtime: Arc<CudaRuntime>,
     warmed_signature: Mutex<Option<NormCaptureSignature>>,
     last_call_capture_safe: AtomicBool,
@@ -1874,6 +2010,12 @@ impl RmsNormKernel {
                  (Y[, InvStdDev]), got {} and {}",
                 inputs.len(),
                 outputs.len()
+            )));
+        }
+        if self.stash != RmsNormStash::Float32 && outputs.len() != 1 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: stash_type={} supports only the schema-defined Y output; remove the extra InvStdDev output or use the default FLOAT stash",
+                self.stash.onnx_value()
             )));
         }
         let x = &inputs[0];
@@ -1961,7 +2103,11 @@ impl RmsNormKernel {
             ));
         }
 
-        let entry = rmsnorm_entry(x.dtype);
+        let entry = if self.stash == RmsNormStash::Float32 {
+            rmsnorm_entry(x.dtype)
+        } else {
+            "rmsnorm_staged"
+        };
         let func = self
             .runtime
             .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, entry)?;
@@ -1975,31 +2121,51 @@ impl RmsNormKernel {
                 caps.multiprocessor_count(),
                 caps.max_threads_per_block(),
             ),
-            std::mem::size_of::<f32>() as u32,
+            if self.stash == RmsNormStash::Float32 {
+                std::mem::size_of::<f32>() as u32
+            } else {
+                std::mem::size_of::<f64>() as u32
+            },
         )?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
         let scale_is_half = i32::from(scale.dtype == DataType::Float16);
         let scale_is_bf16 = i32::from(scale.dtype == DataType::BFloat16);
-        builder
-            .arg(&x_ptr)
-            .arg(&scale_ptr)
-            .arg(&y_ptr)
-            .arg(&invstd_ptr)
-            .arg(&groups_i)
-            .arg(&norm_i);
-        match x.dtype {
-            DataType::Float16 => {
-                builder.arg(&scale_is_half).arg(&eps);
+        if self.stash == RmsNormStash::Float32 {
+            builder
+                .arg(&x_ptr)
+                .arg(&scale_ptr)
+                .arg(&y_ptr)
+                .arg(&invstd_ptr)
+                .arg(&groups_i)
+                .arg(&norm_i);
+            match x.dtype {
+                DataType::Float16 => {
+                    builder.arg(&scale_is_half).arg(&eps);
+                }
+                DataType::BFloat16 => {
+                    builder.arg(&scale_is_bf16).arg(&eps);
+                }
+                DataType::Float32 => {
+                    builder.arg(&eps);
+                }
+                _ => unreachable!("RMSNormalization dtype validated above"),
             }
-            DataType::BFloat16 => {
-                builder.arg(&scale_is_bf16).arg(&eps);
-            }
-            DataType::Float32 => {
-                builder.arg(&eps);
-            }
-            _ => unreachable!("RMSNormalization dtype validated above"),
+        } else {
+            let x_dtype = rmsnorm_storage_code(x.dtype);
+            let scale_dtype = rmsnorm_storage_code(scale.dtype);
+            let stash_type = self.stash.onnx_value();
+            builder
+                .arg(&x_ptr)
+                .arg(&scale_ptr)
+                .arg(&y_ptr)
+                .arg(&groups_i)
+                .arg(&norm_i)
+                .arg(&x_dtype)
+                .arg(&scale_dtype)
+                .arg(&stash_type)
+                .arg(&eps);
         }
         // SAFETY: `func` is the compiled rmsnorm entry; the argument list/ABI
         // match; pointers are live device allocations sized as validated.
@@ -4116,6 +4282,7 @@ mod tests {
         RmsNormKernel {
             axis: -1,
             epsilon: 1e-5,
+            stash: RmsNormStash::Float32,
             runtime: runtime.clone(),
             warmed_signature: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
@@ -4395,6 +4562,7 @@ mod tests {
             RmsNormKernel {
                 axis: -1,
                 epsilon: 1e-5,
+                stash: RmsNormStash::Float32,
                 runtime: runtime.clone(),
                 warmed_signature: Mutex::new(None),
                 last_call_capture_safe: AtomicBool::new(false),
@@ -4886,6 +5054,7 @@ mod tests {
         RmsNormKernel {
             axis: -1,
             epsilon,
+            stash: RmsNormStash::Float32,
             runtime: runtime.clone(),
             warmed_signature: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
