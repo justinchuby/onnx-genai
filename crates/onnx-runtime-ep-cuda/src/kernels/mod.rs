@@ -85,6 +85,7 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod max_unpool;
 mod mean_variance_normalization;
 mod metadata_workspace;
 pub mod mod_op;
@@ -234,6 +235,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "DFT",
     "STFT",
     "MaxPool",
+    "MaxUnpool",
     "AveragePool",
     "LpPool",
     "Relu",
@@ -1589,6 +1591,16 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    for version in [9, 11, 22] {
+        reg.register(
+            OpKey::new("MaxUnpool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(max_unpool::MaxUnpoolFactory {
+                version,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("Col2Im", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,

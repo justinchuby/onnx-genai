@@ -423,6 +423,9 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/scatter_elements_v29.yaml"),
     include_str!("../../schemas/standard/constant_of_shape.yaml"),
     include_str!("../../schemas/standard/max_pool.yaml"),
+    include_str!("../../schemas/standard/max_unpool_v9.yaml"),
+    include_str!("../../schemas/standard/max_unpool_v11.yaml"),
+    include_str!("../../schemas/standard/max_unpool.yaml"),
     include_str!("../../schemas/standard/average_pool_19.yaml"),
     include_str!("../../schemas/standard/average_pool.yaml"),
     include_str!("../../schemas/standard/global_average_pool.yaml"),
@@ -746,6 +749,7 @@ type_constraints:
             "ScatterElements",
             "ConstantOfShape",
             "MaxPool",
+            "MaxUnpool",
             "AveragePool",
             "GlobalAveragePool",
             "GlobalMaxPool",
@@ -761,8 +765,8 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 118);
-        assert_eq!(registry.iter().count(), 144);
+        assert_eq!(registry.schemas.len(), 119);
+        assert_eq!(registry.iter().count(), 147);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
@@ -1049,6 +1053,33 @@ type_constraints:
             assert_eq!(schema.since_version, since_version, "{name}");
             assert_eq!(schema.inputs.len(), inputs, "{name}");
             assert_eq!(schema.outputs.len(), outputs, "{name}");
+        }
+
+        assert!(registry.lookup("MaxUnpool", "", 8).is_none());
+        for (opset, since_version) in [(9, 9), (10, 9), (11, 11), (21, 11), (22, 22), (25, 22)] {
+            let schema = registry.lookup("MaxUnpool", "", opset).unwrap();
+            assert_eq!(
+                schema.since_version, since_version,
+                "MaxUnpool at opset {opset}"
+            );
+            assert_eq!(schema.inputs.len(), 3);
+            assert_eq!(schema.outputs.len(), 1);
+            assert!(!schema.inputs[0].optional && !schema.inputs[1].optional);
+            assert_eq!(schema.inputs[2].name, "output_shape");
+            assert!(schema.inputs[2].optional);
+
+            let mut value_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+            if since_version == 22 {
+                value_types.push(DataType::BFloat16);
+            }
+            let values = &schema.type_constraints[0];
+            let indices = &schema.type_constraints[1];
+            assert_eq!(values.allowed, value_types);
+            assert_eq!(indices.allowed, [DataType::Int64]);
+            assert_eq!(schema.inputs[0].type_str, values.type_param);
+            assert_eq!(schema.outputs[0].type_str, values.type_param);
+            assert_eq!(schema.inputs[1].type_str, indices.type_param);
+            assert_eq!(schema.inputs[2].type_str, indices.type_param);
         }
 
         let max_pool = registry.lookup("MaxPool", "", 25).unwrap();

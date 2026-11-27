@@ -605,6 +605,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("ConvTranspose", "")
         | ("AveragePool", "")
         | ("MaxPool", "")
+        | ("MaxUnpool", "")
         | ("GlobalAveragePool", "")
         | ("GlobalMaxPool", "")
         | ("LpPool", "")
@@ -757,6 +758,7 @@ operator_group_modules!(
     conv_transpose,
     deform_conv,
     grid_sample,
+    max_unpool,
     mean_variance_normalization,
     norm_ops,
     pooling,
@@ -989,6 +991,13 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(affine_grid::AffineGridFactory),
     );
+    for version in [9, 11, 22] {
+        registry.register(
+            OpKey::new("MaxUnpool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(max_unpool::MaxUnpoolFactory(version)),
+        );
+    }
     registry.register(
         OpKey::new("Col2Im", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::None,
