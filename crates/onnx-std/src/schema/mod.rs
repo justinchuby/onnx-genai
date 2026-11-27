@@ -1121,9 +1121,6 @@ type_constraints:
         let registry = SchemaRegistry::builtins();
         for (name, since_version, inputs, outputs) in [
             ("MaxPool", 22, 1, 2),
-            ("MaxUnpool", 9, 3, 1),
-            ("MaxUnpool", 11, 3, 1),
-            ("MaxUnpool", 22, 3, 1),
             ("AveragePool", 22, 1, 1),
             ("Resize", 19, 4, 1),
             ("QuantizeLinear", 21, 3, 1),
@@ -1134,6 +1131,33 @@ type_constraints:
             assert_eq!(schema.since_version, since_version, "{name}");
             assert_eq!(schema.inputs.len(), inputs, "{name}");
             assert_eq!(schema.outputs.len(), outputs, "{name}");
+        }
+
+        assert!(registry.lookup("MaxUnpool", "", 8).is_none());
+        for (opset, since_version) in [(9, 9), (10, 9), (11, 11), (21, 11), (22, 22), (25, 22)] {
+            let schema = registry.lookup("MaxUnpool", "", opset).unwrap();
+            assert_eq!(
+                schema.since_version, since_version,
+                "MaxUnpool at opset {opset}"
+            );
+            assert_eq!(schema.inputs.len(), 3);
+            assert_eq!(schema.outputs.len(), 1);
+            assert!(!schema.inputs[0].optional && !schema.inputs[1].optional);
+            assert_eq!(schema.inputs[2].name, "output_shape");
+            assert!(schema.inputs[2].optional);
+
+            let mut value_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+            if since_version == 22 {
+                value_types.push(DataType::BFloat16);
+            }
+            let values = &schema.type_constraints[0];
+            let indices = &schema.type_constraints[1];
+            assert_eq!(values.allowed, value_types);
+            assert_eq!(indices.allowed, [DataType::Int64]);
+            assert_eq!(schema.inputs[0].type_str, values.type_param);
+            assert_eq!(schema.outputs[0].type_str, values.type_param);
+            assert_eq!(schema.inputs[1].type_str, indices.type_param);
+            assert_eq!(schema.inputs[2].type_str, indices.type_param);
         }
 
         let max_pool = registry.lookup("MaxPool", "", 25).unwrap();
