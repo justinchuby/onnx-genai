@@ -658,6 +658,14 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(format!("{}: {reason}", op.op_type));
         }
+        if let Some(reason) = onnx_runtime_ep_api::reverse_sequence::unsupported_reason(
+            op,
+            opset,
+            shapes,
+            input_dtypes,
+        ) {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "GatherND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(&dtype) = input_dtypes.get(1)
