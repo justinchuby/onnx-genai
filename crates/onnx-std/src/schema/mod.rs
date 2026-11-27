@@ -473,6 +473,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/unsqueeze_v13.yaml"),
     include_str!("../../schemas/standard/unsqueeze.yaml"),
     include_str!("../../schemas/standard/bit_shift.yaml"),
+    include_str!("../../schemas/standard/bit_shift_v28.yaml"),
     include_str!("../../schemas/standard/bitwise_and.yaml"),
     include_str!("../../schemas/standard/bitwise_or.yaml"),
     include_str!("../../schemas/standard/bitwise_xor.yaml"),
@@ -796,7 +797,7 @@ type_constraints:
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
         assert_eq!(registry.schemas.len(), 122);
-        assert_eq!(registry.iter().count(), 153);
+        assert_eq!(registry.iter().count(), BUILTIN_YAML.len());
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
@@ -826,6 +827,33 @@ type_constraints:
 
         assert_eq!(registry.lookup("Range", "", 26).unwrap().since_version, 11);
         assert_eq!(registry.lookup("Range", "", 27).unwrap().since_version, 27);
+
+        let bitshift11 = registry.lookup("BitShift", "", 27).unwrap();
+        let bitshift28 = registry.lookup("BitShift", "", 28).unwrap();
+        assert_eq!(bitshift11.since_version, 11);
+        assert_eq!(bitshift28.since_version, 28);
+        assert_eq!(
+            bitshift11.type_constraints[0].allowed,
+            [
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
+        );
+        assert_eq!(
+            bitshift28.type_constraints[0].allowed,
+            [
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64,
+                DataType::Int8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
+            ]
+        );
 
         for (name, since_version) in [
             ("DequantizePacked", 29),

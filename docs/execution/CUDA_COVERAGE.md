@@ -271,7 +271,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `BlockQuantizedMatMul`, `BlockQuantizedMoE` | `pkg.nxrt._private` | ✅ | **NVRTC quantized kernels** | Runtime block-quantized dense and expert paths; packed formats, scales, auxiliary indices, and device geometry are validated by their claim gates. |
 | `GatherBlockQuantized` | `com.microsoft` | ✅ | **NVRTC quantized kernel** | Block-quantized embedding gather; packed formats, scales, indices, and device geometry are validated by its claim gate. |
 | `Mish`, `Celu`, `IsInf`, `IsNaN`, `PRelu`, `LogSoftmax`, `Hardmax` | `` | ✅ | **NVRTC-custom** | Implemented activation, predicate, and softmax-family kernels with dtype/attribute bounds locked by the conformance profile. |
-| `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family, including broadcasting and CPU-matched over-shift behavior. |
+| `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family with broadcasting. Standalone nxrt supports signed and unsigned 8/16/32/64-bit `BitShift` from opset 11. Signed types are a native extension before opset 28; the shipped ORT plugin remains unsigned-only. |
 | `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
 | `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
 | `QLinearMatMul` | `` | ✅ | **NVRTC quantization** | Int8/Uint8 operands and output. Standalone nxrt accepts a common scale dtype of Float32, Float16, or BFloat16 at opset 10+. Half scales before opset 21 are an nxrt extension, not ONNX conformance. The ORT plugin still requires Float32 scales. FP8 storage is not supported. |
@@ -548,13 +548,15 @@ coverage to **99 / 141**.
 
 The issue #67 operator-coverage batch 4 adds seven more advertised op names — the
 integer **bitwise** family (`BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
-over all integer dtypes, broadcasting) plus unsigned `BitShift` (LEFT/RIGHT), and
+over all integer dtypes, broadcasting) plus integer `BitShift` (LEFT/RIGHT), and
 the softmax-family axis reductions `LogSoftmax` (f32/f16/bf16, opset-13 per-axis
 and legacy opset-≤12 coerce-to-2D) and `Hardmax` (f32/f16/bf16, first-argmax
 one-hot). All are **NVRTC-custom** kernels matched to the CPU EP: `LogSoftmax`
 uses the stable shifted-`logsumexp` formulation (`max + log(sum(exp(x - max)))`,
-the #266 overflow lesson), and `BitShift` mirrors the CPU `checked_shl`/
-`checked_shr` contract (an amount `>=` the operand width yields `0`). Each is
+the #266 overflow lesson), and `BitShift` preserves the CPU's unsigned
+`checked_shl`/`checked_shr` behavior. Signed right shifts are arithmetic; a
+negative or out-of-width count produces sign fill for right shifts and zero
+for left shifts. Each is
 GPU-validated against the CPU oracle on the local CUDA host across the
 dtypes/attributes it claims (signed + unsigned bitwise with broadcasting,
 over-shift, `LogSoftmax` large-magnitude rows and interior axes, `Hardmax` ties

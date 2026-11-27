@@ -1166,7 +1166,9 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                         .iter()
                         .any(|dtype| !matches!(dtype, DataType::String | DataType::Undefined))
                 });
-            let supported_dtypes = if key.op_type == "Conv"
+            let supported_dtypes = if key.op_type == "BitShift" && key.domain.is_empty() {
+                onnx_runtime_ep_api::bitshift::ORT_DTYPES
+            } else if key.op_type == "Conv"
                 && key.domain.is_empty()
                 && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
             {
@@ -2177,7 +2179,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(onehot::OneHotFactory),
     );
     rec.register(
-        OpKey::new("BitShift", "", 11),
+        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SINCE_VERSION),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitshift::BitShiftFactory),
     );
@@ -4050,8 +4052,7 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op revision other than the standalone-only
-        // revisions must have a plugin descriptor.
+        // Every plugin-visible registration must have a descriptor.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -4076,7 +4077,7 @@ mod tests {
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
         #[cfg(feature = "ops-cnn")]
-        let expected = onnx_runtime_ir::roi_align::VERSIONS
+        let expected: std::collections::BTreeSet<_> = onnx_runtime_ir::roi_align::VERSIONS
             .into_iter()
             .map(|version| ("RoiAlign", "", version))
             .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
@@ -4089,6 +4090,29 @@ mod tests {
             descriptors.len() + missing.len(),
             reg.len(),
             "plugin descriptors plus standalone-only entries must match the registry exactly"
+        );
+    }
+
+    #[test]
+    fn bitshift_plugin_descriptor_keeps_open_ended_unsigned_coverage() {
+        let (_, descriptors) = shared_registry_with_descriptors();
+        let shifts: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.domain.is_empty() && d.op_type == "BitShift")
+            .collect();
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(
+            (shifts[0].since_version, shifts[0].end_version),
+            (11, u64::MAX)
+        );
+        assert_eq!(
+            shifts[0].supported_dtypes,
+            &[
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
         );
     }
 

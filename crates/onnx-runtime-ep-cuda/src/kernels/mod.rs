@@ -186,8 +186,8 @@ use pointwise::{
 /// * **Modulo** — `Mod` (f32 with `fmod=1`, plus i32/i64 truncated and
 ///   floor modulo).
 /// * **Bitwise** — `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
-///   (all integer dtypes, broadcasting) and unsigned `BitShift`
-///   (LEFT/RIGHT), matched to the CPU EP `bitwise.rs`/`bitshift.rs`.
+///   (all integer dtypes, broadcasting) and native integer `BitShift` from
+///   opset 11, matched to the CPU EP.
 /// * **LogSoftmax / Hardmax** — numerically-stable axis-reduction ops
 ///   (f32/f16/bf16), matched to the CPU EP; `LogSoftmax` uses the stable
 ///   shifted-logsumexp formulation.
@@ -741,7 +741,9 @@ pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescr
             !(key.domain.is_empty() && matches!(key.op_type.as_str(), "RoiAlign" | "MaxRoiPool"))
         })
         .map(|key| {
-            let supported_dtypes = if key.op_type == "Conv"
+            let supported_dtypes = if key.op_type == "BitShift" && key.domain.is_empty() {
+                onnx_runtime_ep_api::bitshift::ORT_DTYPES
+            } else if key.op_type == "Conv"
                 && key.domain.is_empty()
                 && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
             {
@@ -2148,10 +2150,8 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
-    // Unsigned BitShift (LEFT/RIGHT via the `direction` attribute); matches the
-    // CPU EP `bitshift.rs` checked-shift contract.
     reg.register(
-        OpKey::new("BitShift", "", 11),
+        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SINCE_VERSION),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitShiftFactory {
             runtime: runtime.clone(),
@@ -2405,6 +2405,25 @@ mod tests {
                 .expect("CUDA registry census requires a usable CUDA device 0"),
         );
         let registry = build_cuda_registry(runtime);
+        let descriptors = build_cuda_registry_descriptors(&registry);
+        let shifts: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.domain.is_empty() && d.op_type == "BitShift")
+            .collect();
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(
+            (shifts[0].since_version, shifts[0].end_version),
+            (11, u64::MAX)
+        );
+        assert_eq!(
+            shifts[0].supported_dtypes,
+            &[
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
+        );
         let pairs: BTreeSet<(String, String)> = registry
             .keys()
             .map(|key| (key.domain.clone(), key.op_type.clone()))
