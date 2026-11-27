@@ -66,8 +66,10 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "Conv", 1, OPS_CNN),
     entry("", "ConvTranspose", 1, OPS_CNN),
     entry("", "DeformConv", 19, OPS_CNN),
+    entry("", "DepthToSpace", 1, OPS_CNN),
     entry("", "GlobalAveragePool", 1, OPS_CNN),
     entry("", "GlobalMaxPool", 1, OPS_CNN),
+    entry("", "MaxRoiPool", 1, OPS_CNN),
     entry("", "GlobalLpPool", 2, OPS_CNN),
     entry("", "GroupNormalization", 18, OPS_CNN),
     entry("", "GridSample", 16, OPS_CNN),
@@ -75,9 +77,10 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "InstanceNormalization", 6, OPS_CNN),
     entry("", "LpPool", 18, OPS_CNN),
     entry("", "MaxPool", 1, OPS_CNN),
+    entry("", "MaxUnpool", 9, OPS_CNN),
     entry("", "PRelu", 16, OPS_CNN),
     entry("", "Resize", 10, OPS_CNN),
-    entry("", "SpaceToDepth", 13, OPS_CNN),
+    entry("", "SpaceToDepth", 1, OPS_CNN),
 ];
 
 const fn entry(
@@ -133,5 +136,12 @@ mod tests {
     fn rejects_opsets_before_the_registered_version() {
         assert!(find_cpu_operator("ai.onnx", "Attention", 22).is_none());
         assert!(find_cpu_operator("ai.onnx", "Attention", 23).is_some());
+    }
+
+    #[test]
+    fn standalone_spatial_transforms_select_cnn_from_opset_one() {
+        for op in ["DepthToSpace", "SpaceToDepth"] {
+            assert_eq!(find_cpu_operator("", op, 1).unwrap().group, OPS_CNN);
+        }
     }
 }

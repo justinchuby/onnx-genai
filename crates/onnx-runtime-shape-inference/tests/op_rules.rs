@@ -670,7 +670,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        244,
+        245,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        297,
+        303,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -3042,7 +3042,7 @@ fn depth_to_space_known_dims_and_modes_across_schema_versions() {
     assert_eq!(out_shape(&outs), vec![c(2), c(3), c(10), c(14)]);
     assert_eq!(out_dtype(&outs), DataType::Uint8);
 
-    for opset in [11, 13] {
+    for opset in [11, 13, 28] {
         for mode in ["DCR", "CRD"] {
             let n = with_attr(
                 with_attr(node("DepthToSpace", 1, 1), "blocksize", Attribute::Int(2)),
@@ -3080,8 +3080,17 @@ fn depth_to_space_rejects_non_divisible_channels() {
 
 #[test]
 fn space_to_depth_known_dims_across_schema_versions() {
-    for opset in [1, 13] {
-        let n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+    for (opset, mode) in [
+        (1, None),
+        (13, None),
+        (28, None),
+        (28, Some("DCR")),
+        (28, Some("CRD")),
+    ] {
+        let mut n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+        if let Some(mode) = mode {
+            n = with_attr(n, "mode", Attribute::String(mode.as_bytes().to_vec()));
+        }
         let outs = run(
             &n,
             vec![tin(DataType::Int32, vec![c(2), c(3), c(10), c(14)])],
@@ -3089,6 +3098,27 @@ fn space_to_depth_known_dims_across_schema_versions() {
         );
         assert_eq!(out_shape(&outs), vec![c(2), c(12), c(5), c(7)]);
         assert_eq!(out_dtype(&outs), DataType::Int32);
+    }
+}
+
+#[test]
+fn spatial_rearrangements_validate_mode_at_effective_opset() {
+    for (op, first) in [("DepthToSpace", 11), ("SpaceToDepth", 28)] {
+        let mut n = with_attr(
+            with_attr(node(op, 1, 1), "blocksize", Attribute::Int(2)),
+            "mode",
+            Attribute::String(b"CRD".to_vec()),
+        );
+        let inputs = || vec![f32in(vec![c(1), c(8), c(4), c(6)])];
+        let err = try_run(&n, inputs(), first - 1).unwrap_err().to_string();
+        assert!(err.contains("'mode' is not defined"), "{err}");
+        n.version = Some(first as i64);
+        assert!(try_run(&n, inputs(), first - 1).is_ok());
+        for value in [Attribute::String(b"crd".to_vec()), Attribute::Int(1)] {
+            n.attributes.insert("mode".into(), value);
+            let err = try_run(&n, inputs(), first).unwrap_err().to_string();
+            assert!(err.contains("must be DCR or CRD"), "{err}");
+        }
     }
 }
 
@@ -5351,6 +5381,60 @@ fn ints(values: &[i64]) -> Attribute {
 }
 
 #[test]
+fn max_roi_pool_preserves_symbolic_region_and_channel_dims() {
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[2, 3]));
+    assert_eq!(
+        out_shape(&run(
+            &n,
+            vec![
+                tin(DataType::BFloat16, vec![c(2), sym(0), c(8), c(9)]),
+                tin(DataType::BFloat16, vec![sym(1), c(5)]),
+            ],
+            22,
+        )),
+        vec![sym(1), sym(0), c(2), c(3)],
+    );
+}
+
+#[test]
+fn max_roi_pool_shape_and_versioned_type_contract() {
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[2, 3]));
+    let inputs = |x, rois, columns| {
+        vec![
+            tin(x, vec![c(2), c(5), c(8), c(9)]),
+            tin(rois, vec![c(7), c(columns)]),
+        ]
+    };
+    use DataType::{BFloat16, Float32, Float64};
+    assert_eq!(
+        out_shape(&run(&n, inputs(Float64, Float64, 5), 19)),
+        vec![c(7), c(5), c(2), c(3)]
+    );
+    assert_eq!(
+        out_shape(&run(&n, inputs(BFloat16, BFloat16, 5), 22)),
+        vec![c(7), c(5), c(2), c(3)]
+    );
+    for (x, rois, columns, opset, reason) in [
+        (BFloat16, BFloat16, 5, 21, "requires opset 22"),
+        (Float32, Float64, 5, 22, "must match"),
+        (Float32, Float32, 4, 22, "5 columns"),
+    ] {
+        let error = try_run(&n, inputs(x, rois, columns), opset).unwrap_err();
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    let wide = i64::from(i32::MAX) + 1;
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[1, wide]));
+    assert_eq!(
+        out_shape(&run(
+            &n,
+            vec![f32in(vec![c(1), c(5), c(8), c(9)]), f32in(vec![c(0), c(5)])],
+            22,
+        )),
+        vec![c(0), c(5), c(1), c(wide)],
+    );
+}
+
+#[test]
 fn deform_conv_shapes_follow_geometry_and_versioned_types() {
     let n = with_attr(node("DeformConv", 3, 1), "strides", ints(&[2]));
     let inputs = |dtype, offset_channels| {
@@ -6136,7 +6220,11 @@ fn max_unpool_uses_transpose_formula_or_explicit_output_shape() {
 
     // The optional output_shape input (slot 2) overrides the formula.
     let out = run(
-        &node("MaxUnpool", 3, 1),
+        &with_attr(
+            node("MaxUnpool", 3, 1),
+            "kernel_shape",
+            Attribute::Ints(vec![2, 2]),
+        ),
         vec![
             f32in(vec![c(1), c(1), c(2), c(2)]),
             tin(DataType::Int64, vec![c(1), c(1), c(2), c(2)]),
@@ -7440,6 +7528,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Atanh", 9),
     ("", "Attention", 23),
     ("", "AveragePool", 1),
+    ("", "AveragePool", 22),
     ("", "BatchNormalization", 9),
     ("", "BatchNormalization", 14),
     ("", "BatchNormalization", 15),
@@ -7479,6 +7568,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "DepthToSpace", 1),
     ("", "DepthToSpace", 11),
     ("", "DepthToSpace", 13),
+    ("", "DepthToSpace", 28),
     ("", "DequantizeLinear", 10),
     ("", "DequantizeLinear", 13),
     ("", "DequantizeLinear", 19),
@@ -7546,8 +7636,12 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "MatMul", 1),
     ("", "Max", 1),
     ("", "MaxPool", 1),
+    ("", "MaxPool", 22),
+    ("", "MaxRoiPool", 1),
+    ("", "MaxRoiPool", 22),
     ("", "MaxUnpool", 9),
     ("", "MaxUnpool", 11),
+    ("", "MaxUnpool", 22),
     ("", "Mean", 1),
     ("", "MeanVarianceNormalization", 9),
     ("", "MelWeightMatrix", 17),
@@ -7644,6 +7738,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Softsign", 1),
     ("", "SpaceToDepth", 1),
     ("", "SpaceToDepth", 13),
+    ("", "SpaceToDepth", 28),
     ("", "Split", 1),
     ("", "SplitToSequence", 11),
     ("", "Sqrt", 1),

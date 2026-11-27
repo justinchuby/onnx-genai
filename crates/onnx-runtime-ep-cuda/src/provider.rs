@@ -4558,6 +4558,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "MaxRoiPool"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Err(reason) =
+                onnx_runtime_ir::max_roi_pool::validate_claim(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(format!("MaxRoiPool: {reason}"));
+        }
         if (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) = crate::kernels::standard_claims::unsupported_reason_at_opset(
                 op,

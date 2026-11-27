@@ -1938,6 +1938,47 @@ fn einsum_model_text_typed(
     text
 }
 
+fn conv_bfloat16_model_text(name: &str, opset: i64) -> String {
+    let mut text = String::new();
+    writeln!(text, "ir_version: 11").unwrap();
+    writeln!(text, "graph {{").unwrap();
+    writeln!(text, "  node {{").unwrap();
+    for input in ["X", "W", "B"] {
+        writeln!(text, "    input: \"{input}\"").unwrap();
+    }
+    writeln!(text, "    output: \"Y\"").unwrap();
+    writeln!(text, "    op_type: \"Conv\"").unwrap();
+    writeln!(text, "  }}").unwrap();
+    writeln!(text, "  name: \"{name}\"").unwrap();
+    for (name, shape) in [
+        ("X", &[1, 1, 3, 3][..]),
+        ("W", &[1, 1, 2, 2][..]),
+        ("B", &[1][..]),
+    ] {
+        writeln!(
+            text,
+            "  input {{ name: \"{name}\" type {{ tensor_type {{ elem_type: 16 shape {{"
+        )
+        .unwrap();
+        for dim in shape {
+            writeln!(text, "    dim {{ dim_value: {dim} }}").unwrap();
+        }
+        writeln!(text, "  }} }} }} }}").unwrap();
+    }
+    writeln!(
+        text,
+        "  output {{ name: \"Y\" type {{ tensor_type {{ elem_type: 16 shape {{"
+    )
+    .unwrap();
+    for dim in [1, 1, 2, 2] {
+        writeln!(text, "    dim {{ dim_value: {dim} }}").unwrap();
+    }
+    writeln!(text, "  }} }} }} }}").unwrap();
+    writeln!(text, "}}").unwrap();
+    writeln!(text, "opset_import {{ version: {opset} }}").unwrap();
+    text
+}
+
 #[cfg(feature = "einsum_concurrency_probe")]
 unsafe fn run_concurrent_einsum_once(
     api: *const ort::OrtApi,
@@ -3745,6 +3786,140 @@ fn conformance_add_bfloat16() {
         conformance_teardown(api, env, opts, session, "cpu_ep_bf16");
         eprintln!("\n✅ conformance_add_bfloat16: PASSED");
     }
+}
+
+/// Real ORT owns the schema boundary even though standalone nxrt intentionally
+/// accepts kernel-supported BF16 on earlier semantically compatible revisions.
+#[test]
+fn conformance_conv_bfloat16_follows_ort_schema_and_descriptor_boundary() {
+    let _lock = lock_ort_ep();
+    let ep_path = skip_if_missing!(
+        find_ep_cdylib(),
+        "conformance_conv_bfloat16_follows_ort_schema_and_descriptor_boundary: EP cdylib not found"
+    );
+    let ep_lib = unsafe { libloading::Library::new(&ep_path) }.expect("dlopen EP cdylib");
+
+    let legal_model = write_generated_model(
+        "conv_bfloat16_opset22",
+        &conv_bfloat16_model_text("conv_bfloat16_opset22", 22),
+    );
+    unsafe {
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+    }
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_conv_bfloat16_v22", &legal_model, true) })
+    else {
+        eprintln!(
+            "*** SKIPPED: conformance_conv_bfloat16_follows_ort_schema_and_descriptor_boundary — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        assert!(
+            read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") > 0,
+            "Conv-22 BF16 must reach the plugin GetCapability callback"
+        );
+
+        let mut x_data = [
+            0x3F80u16, 0x4000, 0x4040, 0x4080, 0x40A0, 0x40C0, 0x40E0, 0x4100, 0x4110,
+        ];
+        let mut w_data = [0x3F80u16, 0x4000, 0xBF80, 0x3F00];
+        let mut b_data = [0x3E80u16];
+        let x = make_bfloat16_tensor(api, &mut x_data, &[1, 1, 3, 3]);
+        let w = make_bfloat16_tensor(api, &mut w_data, &[1, 1, 2, 2]);
+        let b = make_bfloat16_tensor(api, &mut b_data, &[1]);
+        let input_names = [c"X".as_ptr(), c"W".as_ptr(), c"B".as_ptr()];
+        let inputs: [*const ort::OrtValue; 3] = [x, w, b];
+        let output_names = [c"Y".as_ptr()];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            inputs.len(),
+            output_names.as_ptr(),
+            output_names.len(),
+            &mut output,
+        );
+        check_status(api, status, "Run(Conv-22 BFloat16)");
+        assert!(!output.is_null(), "Conv-22 BFloat16 returned a null output");
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(Conv-22 BFloat16)");
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 4);
+        let expected = [0x4070u16, 0x40C8, 0x4134, 0x415C];
+        assert_eq!(
+            result, expected,
+            "Conv-22 BFloat16 output bits differ from the independent convolution result"
+        );
+
+        assert_ops_assigned_to_our_ep(api, session, &["Conv"], "conformance_conv_bfloat16_v22");
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x);
+        ((*api).ReleaseValue.unwrap())(w);
+        ((*api).ReleaseValue.unwrap())(b);
+        conformance_teardown(api, env, opts, session, "cpu_ep_conv_bfloat16_v22");
+    }
+
+    let illegal_model = write_generated_model(
+        "conv_bfloat16_opset11",
+        &conv_bfloat16_model_text("conv_bfloat16_opset11", 11),
+    );
+    unsafe {
+        reset_ep_counter(&ep_lib, b"nxrt_ep_reset_get_capability_call_count");
+    }
+    let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
+        conformance_setup_with_session_status(
+            "cpu_ep_conv_bfloat16_v11",
+            &illegal_model,
+            true,
+            None,
+            &[],
+        )
+    }) else {
+        eprintln!(
+            "*** SKIPPED: conformance_conv_bfloat16_follows_ort_schema_and_descriptor_boundary — \
+             ORT or EP cdylib not found for the Conv-11 rejection half ***"
+        );
+        return;
+    };
+
+    assert!(
+        !status.is_null(),
+        "ORT must reject schema-illegal Conv-11 BFloat16 before plugin assignment"
+    );
+    assert_eq!(
+        unsafe { read_ep_counter(&ep_lib, b"nxrt_ep_get_capability_call_count") },
+        0,
+        "Conv-11 BFloat16 must be rejected during ORT schema validation before GetCapability"
+    );
+    let message = unsafe { CStr::from_ptr(((*api).GetErrorMessage.unwrap())(status)) }
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        message.contains("Conv")
+            && (message.contains("BFloat16")
+                || message.contains("bfloat16")
+                || message.contains("type")),
+        "unexpected Conv-11 BFloat16 schema rejection: {message}"
+    );
+    unsafe {
+        ((*api).ReleaseStatus.unwrap())(status);
+        conformance_teardown_with_custom_domain(
+            api,
+            env,
+            opts,
+            session,
+            "cpu_ep_conv_bfloat16_v11",
+            domain,
+        );
+    }
+    drop(custom_op);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
