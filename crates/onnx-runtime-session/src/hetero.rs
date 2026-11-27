@@ -612,7 +612,7 @@ fn inline_model_function_node(graph: &mut Graph, node_id: NodeId) -> Result<()> 
 }
 
 fn refresh_shapes(graph: &mut Graph) -> Result<()> {
-    let registry = onnx_runtime_shape_inference::InferenceRegistry::default_registry();
+    let registry = onnx_runtime_shape_inference::InferenceRegistry::native_runtime_registry();
     let opset_imports = graph.opset_imports.clone();
     registry.infer_graph(
         graph,

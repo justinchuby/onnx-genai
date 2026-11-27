@@ -521,7 +521,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ],
 
         // IsInf, IsNaN: float inputs.
-        ("IsInf", "") | ("IsNaN", "") | ("EyeLike", "") => FLOAT_DTYPES,
+        ("IsInf", "") | ("IsNaN", "") => FLOAT_DTYPES,
+        ("EyeLike", "") => onnx_runtime_ir::eye_like::DTYPES,
 
         // Quantization: specific types but advertise broad.
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
@@ -599,8 +600,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
-        ("Conv", "") => FLOAT_COMPUTE_DTYPES,
+        ("Conv", "") => onnx_runtime_ir::conv::DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("MaxRoiPool", "") => onnx_runtime_ir::max_roi_pool::DTYPES,
         ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
 
         // The rest of the CNN family dispatches through `dispatch_float!` and
@@ -608,6 +610,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("ConvTranspose", "")
         | ("AveragePool", "")
         | ("MaxPool", "")
+        | ("MaxUnpool", "")
         | ("GlobalAveragePool", "")
         | ("GlobalMaxPool", "")
         | ("LpPool", "")
@@ -763,12 +766,14 @@ operator_group_modules!(
     conv_transpose,
     deform_conv,
     grid_sample,
+    max_roi_pool,
+    max_unpool,
     mean_variance_normalization,
     norm_ops,
     pooling,
     resize,
     roi_align,
-    space_to_depth,
+    space_depth,
 );
 
 #[cfg(all(feature = "ops-cnn", feature = "mlas"))]
@@ -1000,6 +1005,13 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(affine_grid::AffineGridFactory),
     );
+    for version in [9, 11, 22] {
+        registry.register(
+            OpKey::new("MaxUnpool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(max_unpool::MaxUnpoolFactory(version)),
+        );
+    }
     registry.register(
         OpKey::new("Col2Im", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1017,8 +1029,21 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
             Box::new(deform_conv::Factory(version)),
         );
     }
-    registry.register(
+    for version in [1, 22] {
+        registry.register(
+            OpKey::new("MaxRoiPool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(max_roi_pool::Factory(version)),
+        );
+    }
+    registry.register_through(
         OpKey::new("Conv", "", 1),
+        onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET - 1,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(conv::ConvFactory),
+    );
+    registry.register(
+        OpKey::new("Conv", "", onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(conv::ConvFactory),
     );
@@ -1027,14 +1052,14 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(center_crop_pad::CenterCropPadFactory),
     );
-    for version in [1, 7, 10, 11, 19] {
+    for version in [1, 7, 10, 11, 19, 22] {
         registry.register(
             OpKey::new("AveragePool", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(pooling::AveragePoolFactory),
         );
     }
-    for version in [1, 8, 10, 11, 12] {
+    for version in [1, 8, 10, 11, 12, 22] {
         registry.register(
             OpKey::new("MaxPool", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1064,7 +1089,7 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     registry.register(
         OpKey::new("SpaceToDepth", "", 13),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(space_to_depth::SpaceToDepthFactory),
+        Box::new(space_depth::LegacySpaceToDepthFactory),
     );
     // BatchNormalization inference semantics are stable since opset 7, when
     // the legacy `is_test` attribute was removed.
@@ -1108,18 +1133,7 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    let mut registry =
-        build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), true);
-    register_standalone_linear_attention(&mut registry);
-    registry
-}
-
-pub(crate) fn register_standalone_linear_attention(reg: &mut OpRegistry) {
-    reg.register(
-        OpKey::new("LinearAttention", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(linear_attention::LinearAttentionFactory),
-    );
+    build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), true)
 }
 
 /// Build the shared CPU registry and derive the ORT plugin's advertised keys.
@@ -1148,8 +1162,10 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
         .plugin_keys()
-        // RoiAlign is currently supported only in standalone nxrt.
-        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
+        // These ROI kernels are supported only in standalone nxrt.
+        .filter(|key| {
+            !(key.domain.is_empty() && matches!(key.op_type.as_str(), "RoiAlign" | "MaxRoiPool"))
+        })
         .map(|key| {
             let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
                 .iter()
@@ -1159,12 +1175,20 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                         .iter()
                         .any(|dtype| !matches!(dtype, DataType::String | DataType::Undefined))
                 });
+            let supported_dtypes = if key.op_type == "Conv"
+                && key.domain.is_empty()
+                && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
+            {
+                onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
+            } else {
+                supported_dtypes_for_op(&key.op_type, &key.domain)
+            };
             CpuOpDescriptor {
                 op_type: key.op_type.clone(),
                 domain: key.domain.clone(),
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
-                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+                supported_dtypes,
                 supports_raw_tensor_abi,
             }
         })
@@ -1181,7 +1205,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
 /// Build all factories against one immutable set of session memory resources.
 pub(crate) fn build_cpu_registry_with_resources(
     resources: crate::CpuMemoryResources,
-    standalone_celu: bool,
+    standalone: bool,
 ) -> OpRegistry {
     let host_cache = resources.expert_cache().clone();
     let derived_weights = resources.weight_memory().clone();
@@ -1241,6 +1265,22 @@ pub(crate) fn build_cpu_registry_with_resources(
         );
     }
     register_cnn_ops(&mut rec);
+    #[cfg(feature = "ops-cnn")]
+    if standalone {
+        for (op, version) in [
+            ("DepthToSpace", 1),
+            ("SpaceToDepth", 1),
+            ("SpaceToDepth", 13),
+        ] {
+            rec.register(
+                OpKey::new(op, "", version),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(space_depth::SpaceDepthFactory),
+            );
+        }
+    }
+    #[cfg(not(feature = "ops-cnn"))]
+    let _ = standalone;
     rec.register(
         OpKey::new("MatMul", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1249,7 +1289,10 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("Einsum", "", 12),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(einsum::EinsumFactory::new(resources.clone())),
+        Box::new(einsum::EinsumFactory::new_with_native_dtype_extensions(
+            resources.clone(),
+            standalone,
+        )),
     );
     rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
@@ -1437,6 +1480,13 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
+    if standalone {
+        rec.register(
+            OpKey::new("LinearAttention", "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(linear_attention::LinearAttentionFactory),
+        );
+    }
     // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
     // (the Qwen3.5 `embed_tokens` table is uint8 with `bits = 8`). Shape-driven,
     // dequantizes on the fly to the graph's activation dtype.
@@ -1953,9 +2003,9 @@ pub(crate) fn build_cpu_registry_with_resources(
     // opset keeps older models routing to whatever handled them before.
     let celu12 = OpKey::new("Celu", "", 12);
     let legacy = Box::new(activations::CeluFactory {
-        require_same_dtype: standalone_celu,
+        require_same_dtype: standalone,
     });
-    if standalone_celu {
+    if standalone {
         rec.register_through(
             celu12,
             27,
@@ -2169,6 +2219,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(tensor_scatter::TensorScatterFactory),
     );
+    // OneHot-28 reuses this factory through version-floor lookup.
     rec.register(
         OpKey::new("OneHot", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3717,9 +3768,9 @@ mod tests {
         // QuantizeLinear and DequantizeLinear each add six versioned entries,
         // while DynamicQuantizeLinear and QLinearMatMul add one each
         // (twenty-nine over the
-        // op-name count). Pooling adds twelve more versioned entries: five each
+        // op-name count). Pooling adds fourteen more versioned entries: six each
         // for AveragePool and MaxPool, plus the two global pool operators, for
-        // forty over the op-name count. ScatterElements also has distinct
+        // forty-two over the op-name count. ScatterElements also has distinct
         // opset-11 and opset-16 registrations. BatchNormalization,
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
@@ -3749,15 +3800,17 @@ mod tests {
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed). Standard
-        // Conv is always registered, using the pure-Rust reference kernel without
-        // `mlas` and the optimized implementation with it.
+        // Conv is registered twice so schema-governed plugin descriptors can
+        // advertise opsets 1-21 and 22+ accurately. Standalone execution uses
+        // the same factory for both ranges and may accept additional
+        // kernel-supported dtypes when the operator semantics are unchanged.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
         // standard-domain `CausalConvWithState` (opsets 27 and 29) adds two alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
-        // DeformConv adds separate opset-19 and opset-22 entries.
+        // DeformConv and MaxRoiPool each add two schema-version entries.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
@@ -3770,7 +3823,7 @@ mod tests {
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 137
+                + 142
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
                 + onnx_runtime_ep_api::reverse_sequence::VERSIONS.len()
@@ -3802,6 +3855,8 @@ mod tests {
         assert!(reg.lookup("DFT", "", 17).is_some());
         assert!(reg.lookup("STFT", "", 17).is_some());
         assert!(reg.lookup("Conv", "", 22).is_some());
+        assert!(reg.lookup("AveragePool", "", 22).is_some());
+        assert!(reg.lookup("MaxPool", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
         assert!(reg.lookup("SpaceToDepth", "", 13).is_some());
@@ -4058,8 +4113,8 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op other than explicitly standalone-only entries
-        // must have a descriptor.
+        // Every registered op revision other than the standalone-only
+        // revisions must have a plugin descriptor.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -4085,12 +4140,14 @@ mod tests {
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
         #[cfg(feature = "ops-cnn")]
-        let roi_align = onnx_runtime_ir::roi_align::VERSIONS
+        let cnn_only = onnx_runtime_ir::roi_align::VERSIONS
             .into_iter()
-            .map(|version| ("RoiAlign", "", version));
+            .map(|version| ("RoiAlign", "", version))
+            .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
+            .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)]);
         #[cfg(not(feature = "ops-cnn"))]
-        let roi_align = std::iter::empty();
-        let expected = roi_align
+        let cnn_only = std::iter::empty();
+        let expected = cnn_only
             .chain([
                 ("Cast", "", 19),
                 ("Cast", "", 24),
@@ -4131,6 +4188,23 @@ mod tests {
         for want in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert!(dtypes.contains(&want), "Conv must still advertise {want:?}");
         }
+    }
+
+    #[test]
+    fn conv_descriptors_advertise_bf16_only_from_opset_22() {
+        let (_, descriptors) = shared_registry_with_descriptors();
+        let conv = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.domain.is_empty() && descriptor.op_type == "Conv")
+            .collect::<Vec<_>>();
+        assert_eq!(conv.len(), 2);
+        assert_eq!((conv[0].since_version, conv[0].end_version), (1, 21));
+        assert_eq!(
+            conv[0].supported_dtypes,
+            onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
+        );
+        assert_eq!((conv[1].since_version, conv[1].end_version), (22, u64::MAX));
+        assert_eq!(conv[1].supported_dtypes, onnx_runtime_ir::conv::DTYPES);
     }
 
     #[test]

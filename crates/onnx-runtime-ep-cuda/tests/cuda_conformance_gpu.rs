@@ -1057,35 +1057,295 @@ fn grid_sample_cases() -> Vec<Case> {
     let image = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let grid = [-1.4, -1.2, 0.0, 0.0, 1.3, 1.4, 0.6, -0.7];
     [
-        ("bilinear", "zeros", 0, DataType::Float32, 1e-5),
-        ("bilinear", "border", 1, DataType::Float16, 3e-3),
-        ("bilinear", "reflection", 0, DataType::BFloat16, 3e-2),
-        ("nearest", "zeros", 1, DataType::Float32, 1e-5),
-        ("nearest", "border", 0, DataType::Float16, 3e-3),
-        ("nearest", "reflection", 1, DataType::BFloat16, 3e-2),
+        (16, "bilinear", "zeros", 0, DataType::Float32, 1e-5),
+        (20, "linear", "border", 1, DataType::Float16, 3e-3),
+        (22, "linear", "reflection", 0, DataType::BFloat16, 3e-2),
+        (16, "nearest", "zeros", 1, DataType::Float32, 1e-5),
+        (20, "nearest", "border", 0, DataType::Float16, 3e-3),
+        (22, "nearest", "reflection", 1, DataType::BFloat16, 3e-2),
     ]
     .into_iter()
-    .map(|(mode, padding, align_corners, dtype, tolerance)| Case {
-        label: format!("GridSample[{mode},{padding},align-corners={align_corners},out-of-bounds]"),
-        op: "GridSample",
-        domain: "",
-        opset: 20,
-        inputs: vec![
-            float_input(dtype, &[1, 1, 2, 3], &image),
-            float_input(dtype, &[1, 2, 2, 2], &grid),
-        ],
-        outputs: vec![(dtype, vec![1, 1, 2, 2])],
-        attrs: vec![
-            ("mode", Attribute::String(mode.as_bytes().to_vec())),
-            (
-                "padding_mode",
-                Attribute::String(padding.as_bytes().to_vec()),
+    .map(
+        |(opset, mode, padding, align_corners, dtype, tolerance)| Case {
+            label: format!(
+                "GridSample[{mode},{padding},align-corners={align_corners},out-of-bounds]"
             ),
-            ("align_corners", Attribute::Int(align_corners)),
-        ],
-        compare: Compare::Float { tol: tolerance },
-    })
+            op: "GridSample",
+            domain: "",
+            opset,
+            inputs: vec![
+                float_input(dtype, &[1, 1, 2, 3], &image),
+                float_input(dtype, &[1, 2, 2, 2], &grid),
+            ],
+            outputs: vec![(dtype, vec![1, 1, 2, 2])],
+            attrs: vec![
+                ("mode", Attribute::String(mode.as_bytes().to_vec())),
+                (
+                    "padding_mode",
+                    Attribute::String(padding.as_bytes().to_vec()),
+                ),
+                ("align_corners", Attribute::Int(align_corners)),
+            ],
+            compare: Compare::Float { tol: tolerance },
+        },
+    )
     .collect()
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn grid_sample_ort_plugin_keeps_existing_routes() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ir::{Node, NodeId, ValueId, static_shape};
+
+    let plugin = CudaExecutionProvider::new_for_ort_plugin().expect("ORT plugin CUDA provider");
+    let native = require_cuda();
+    let versions = |ep: &CudaExecutionProvider| {
+        onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry())
+            .into_iter()
+            .filter(|entry| entry.domain.is_empty() && entry.op_type == "GridSample")
+            .map(|entry| (entry.since_version, entry.end_version))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(versions(&plugin), [(16, u64::MAX), (20, u64::MAX)]);
+    assert_eq!(
+        versions(&native),
+        [(16, u64::MAX), (20, u64::MAX), (22, u64::MAX)]
+    );
+
+    let f32 = DataType::Float32;
+    let image = [
+        float_input(f32, &[1, 1, 2, 3], &[1., 2., 3., 4., 5., 6.]),
+        float_input(f32, &[1, 1, 1, 2], &[0., 0.]),
+    ];
+    for (opset, mode) in [(19, "bilinear"), (20, "linear"), (22, "linear")] {
+        let output = run_cuda(
+            &plugin,
+            "GridSample",
+            "",
+            opset,
+            &image,
+            &[(f32, vec![1, 1, 1, 1])],
+            &[("mode", Attribute::String(mode.into()))],
+        );
+        assert_eq!(decode_floats(&output[0], f32), [3.5]);
+    }
+
+    let image = [static_shape([1, 1, 2, 3]), static_shape([1, 1, 1, 2])];
+    let volume = [static_shape([1, 1, 2, 3, 4]), static_shape([1, 1, 1, 1, 3])];
+    for (opset, mode, shapes, dtypes, reason) in [
+        (19, "bicubic", &image, [f32, f32], "mode"),
+        (20, "cubic", &image, [f32, f32], "mode"),
+        (20, "nearest", &volume, [f32, f32], "rank 5"),
+        (22, "linear", &image, [f32, DataType::BFloat16], "dtype"),
+    ] {
+        let mut node = Node::new(
+            NodeId(0),
+            "GridSample",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        node.attributes
+            .insert("mode".into(), Attribute::String(mode.into()));
+        assert!(
+            native
+                .supports_op(&node, opset, shapes, &dtypes, &[])
+                .is_supported()
+        );
+        let claim = plugin.supports_op(&node, opset, shapes, &dtypes, &[]);
+        assert!(
+            !claim.is_supported(),
+            "{mode}/{opset} must remain standalone-only"
+        );
+        assert!(
+            claim.reason().is_some_and(|text| text.contains(reason)),
+            "{claim:?}"
+        );
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn grid_sample_matches_pinned_onnx() {
+    let ep = require_cuda();
+    let check = |label: &str,
+                 opset,
+                 mode: &str,
+                 padding: &str,
+                 aligned,
+                 inputs: &[Tensor],
+                 dtype,
+                 output_shape: &[usize],
+                 expected: &[f32]| {
+        let output = run_cuda(
+            &ep,
+            "GridSample",
+            "",
+            opset,
+            inputs,
+            &[(dtype, output_shape.to_vec())],
+            &[
+                ("mode", Attribute::String(mode.into())),
+                ("padding_mode", Attribute::String(padding.into())),
+                ("align_corners", Attribute::Int(aligned)),
+            ],
+        );
+        assert_close(
+            label,
+            dtype,
+            &decode_floats(&output[0], dtype),
+            expected,
+            1e-4,
+        );
+    };
+    let f32 = DataType::Float32;
+    // ONNX 622adf94d4e720142950aa8178f7357d52e63db0, backend/test/case/node/gridsample.py.
+    let image = [
+        float_input(f32, &[1, 1, 3, 2], &[0., 1., 2., 3., 4., 5.]),
+        float_input(
+            f32,
+            &[1, 2, 4, 2],
+            &[
+                -1., -0.8, -0.6, -0.5, -0.1, -0.2, 0.7, 0., 0., 0.4, 0.2, -0.2, -0.3, 0.5, -1., 1.,
+            ],
+        ),
+    ];
+    for (opset, mode) in [(19, "bicubic"), (20, "cubic"), (22, "cubic")] {
+        for (aligned, expected) in [
+            (
+                0,
+                [
+                    -0.173250, 0.284265, 1.923106, 2.568000, 5.170375, 2.284414, 4.744844, 1.046875,
+                ],
+            ),
+            (
+                1,
+                [
+                    0.304001, 1.128750, 2.266270, 3.144844, 4.531500, 2.455360, 4.599819, 4.000000,
+                ],
+            ),
+        ] {
+            check(
+                &format!("pinned bicubic/{opset}/align={aligned}"),
+                opset,
+                mode,
+                "zeros",
+                aligned,
+                &image,
+                f32,
+                &[1, 1, 2, 4],
+                &expected,
+            );
+        }
+    }
+    let volume = [
+        float_input(
+            f32,
+            &[1, 1, 3, 2, 2],
+            &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+        ),
+        float_input(
+            f32,
+            &[1, 2, 4, 2, 3],
+            &[
+                -1., -1., -1., -1., -0.5, 0.3, -0.5, -0.5, -0.5, 1., -0.6, -1., -0.2, -0.2, -0.2,
+                0.4, 0.2, 0.6, 0., 0., 0., -1., 0., 0., 0., 0., 0., -1., 1., 0., -0.2, -0.2, -0.2,
+                1., 0.4, -0.2, 0.5, 0.5, 0.5, -1., -0.8, 0.8, 1., 1., 1., 0.4, 0.6, -0.3,
+            ],
+        ),
+    ];
+    for (mode, aligned, expected) in [
+        (
+            "nearest",
+            0,
+            [
+                1., 5., 1., 0., 5., 12., 5., 5., 5., 0., 5., 0., 12., 9., 0., 8.,
+            ],
+        ),
+        (
+            "nearest",
+            1,
+            [
+                1., 5., 1., 2., 5., 12., 5., 5., 5., 7., 5., 8., 12., 9., 12., 8.,
+            ],
+        ),
+        (
+            "linear",
+            0,
+            [
+                0.125, 3.4, 2., 0.45, 4.7, 10.9, 6.5, 3., 6.5, 1.75, 4.7, 3.3, 11., 2.52, 1.5, 5.49,
+            ],
+        ),
+        (
+            "linear",
+            1,
+            [
+                1., 6.7, 3.75, 2.4, 5.4, 9.3, 6.5, 6., 6.5, 7., 5.4, 6.6, 9.25, 8.4, 12., 6.1,
+            ],
+        ),
+    ] {
+        check(
+            &format!("pinned volume/{mode}/align={aligned}"),
+            20,
+            mode,
+            "zeros",
+            aligned,
+            &volume,
+            f32,
+            &[1, 1, 2, 4, 2],
+            &expected,
+        );
+    }
+
+    // An impulse at one corner at the center sample uses the inner cubic weight on all three axes.
+    let impulse = [
+        float_input(f32, &[1, 1, 2, 2, 2], &[1., 0., 0., 0., 0., 0., 0., 0.]),
+        float_input(DataType::Float16, &[1, 1, 1, 1, 3], &[0., 0., 0.]),
+    ];
+    check(
+        "tricubic impulse",
+        20,
+        "cubic",
+        "zeros",
+        0,
+        &impulse,
+        f32,
+        &[1, 1, 1, 1, 1],
+        &[0.59375f32.powi(3)],
+    );
+
+    // At x=-0.5, the four cubic taps are at -2, -1, 0, 1. Border clamps
+    // both negatives to 0; half-pixel reflection maps them to 1 and 0.
+    let line = [
+        float_input(f32, &[1, 1, 3], &[2., 6., 10.]),
+        float_input(DataType::BFloat16, &[1, 2, 1], &[-1., -5.]),
+    ];
+    let border_line = [
+        float_input(f32, &[1, 1, 3], &[2., 6., 10.]),
+        float_input(DataType::BFloat16, &[1, 4, 1], &[-1., -1.25, 1.25, 1.]),
+    ];
+    check(
+        "cubic line/border",
+        22,
+        "cubic",
+        "border",
+        0,
+        &border_line,
+        f32,
+        &[1, 1, 4],
+        &[1.625, 2., 10., 10.375],
+    );
+    check(
+        "cubic line/reflection",
+        22,
+        "cubic",
+        "reflection",
+        0,
+        &line,
+        f32,
+        &[1, 1, 2],
+        &[1.25, 1.25],
+    );
 }
 
 fn dropout_cases() -> Vec<Case> {
@@ -1322,7 +1582,7 @@ fn lp_pool_cases() -> Vec<Case> {
             label: "LpPool[p=2,dilation,bf16]".into(),
             op: "LpPool",
             domain: "",
-            opset: 18,
+            opset: 22,
             inputs: vec![float_input(
                 DataType::BFloat16,
                 &[1, 1, 4, 4],
@@ -2644,7 +2904,7 @@ fn eye_like_cases() -> Vec<Case> {
             label: format!("EyeLike[{dtype:?}-override,positive-offset]"),
             op: "EyeLike",
             domain: "",
-            opset: 9,
+            opset: if dtype == DataType::BFloat16 { 22 } else { 9 },
             inputs: vec![input(DataType::Float32, &[3, 4], &[9.0_f32; 12])],
             outputs: vec![(dtype, vec![3, 4])],
             attrs: vec![
@@ -3093,6 +3353,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("GatherND", gather_nd_cases()));
     p.push(sweep("SpaceToDepth", space_to_depth_cases()));
     p.push(dedicated(
+        "DepthToSpace",
+        "cuda_conformance_gpu.rs",
+        "Independent DCR/CRD value fixtures in space_depth_modes_match_onnx",
+    ));
+    p.push(dedicated(
         "ReverseSequence",
         "cuda_conformance_gpu.rs",
         "Direct CUDA execution against independent byte-exact expectations",
@@ -3131,6 +3396,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "DeformConv",
         "deform_conv_gpu.rs",
         "Upstream ONNX and independently calculated N-D fixtures on both native EPs",
+    ));
+    p.push(dedicated(
+        "MaxRoiPool",
+        "max_roi_pool_gpu.rs",
+        "Quantized inclusive ROI pooling, versioned dtypes, and clipping on both native EPs",
     ));
     p.push(sweep("Dropout", dropout_cases()));
     p.push(sweep("NonZero", nonzero_cases()));
@@ -3270,6 +3540,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "native 1-D / cuDNN 2-D conv",
     ));
     p.push(dedicated("MaxPool", "pooling_gpu.rs", "cuDNN pooling"));
+    p.push(dedicated(
+        "MaxUnpool",
+        "pooling_gpu.rs",
+        "NVRTC row-major scatter against pinned ONNX expectations",
+    ));
     p.push(dedicated(
         "AveragePool",
         "pooling_gpu.rs",
@@ -3869,6 +4144,122 @@ fn resize_19_symmetric_matches_onnx_and_cpu() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn space_depth_modes_match_onnx() {
+    let ep = require_cuda();
+    let values: Vec<f32> = (0..16).map(|value| value as f32).collect();
+    for (op, src, dst, dcr, crd) in [
+        (
+            "SpaceToDepth",
+            [1, 2, 2, 4],
+            [1, 8, 1, 2],
+            [
+                0., 2., 8., 10., 1., 3., 9., 11., 4., 6., 12., 14., 5., 7., 13., 15.,
+            ],
+            [
+                0., 2., 1., 3., 4., 6., 5., 7., 8., 10., 9., 11., 12., 14., 13., 15.,
+            ],
+        ),
+        (
+            "DepthToSpace",
+            [1, 8, 1, 2],
+            [1, 2, 2, 4],
+            [
+                0., 4., 1., 5., 8., 12., 9., 13., 2., 6., 3., 7., 10., 14., 11., 15.,
+            ],
+            [
+                0., 2., 1., 3., 4., 6., 5., 7., 8., 10., 9., 11., 12., 14., 13., 15.,
+            ],
+        ),
+    ] {
+        for (opset, mode, expected) in [
+            (1, None, dcr),
+            (28, None, dcr),
+            (28, Some("DCR"), dcr),
+            (28, Some("CRD"), crd),
+        ] {
+            let mut attrs = vec![("blocksize", Attribute::Int(2))];
+            if let Some(mode) = mode {
+                attrs.push(("mode", Attribute::String(mode.as_bytes().to_vec())));
+            }
+            let case = Case {
+                label: format!("{op}-{opset}[{mode:?}]"),
+                op,
+                domain: "",
+                opset,
+                inputs: vec![input(DataType::Float32, &src, &values)],
+                outputs: vec![(DataType::Float32, dst.to_vec())],
+                attrs,
+                compare: Compare::ExactBytes,
+            };
+            let output = run_case(&ep, &case);
+            assert_eq!(
+                decode_floats(&output[0], DataType::Float32),
+                expected,
+                "{}",
+                case.label
+            );
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn ort_plugin_keeps_the_space_to_depth_13_contract() {
+    let ep = CudaExecutionProvider::new_for_ort_plugin().expect("CUDA device for ORT plugin");
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
+    let spatial: Vec<_> = descriptors
+        .iter()
+        .filter(|d| {
+            d.domain.is_empty() && matches!(d.op_type.as_str(), "SpaceToDepth" | "DepthToSpace")
+        })
+        .collect();
+    let [descriptor] = spatial.as_slice() else {
+        panic!(
+            "unexpected number of plugin spatial descriptors: {}",
+            spatial.len()
+        );
+    };
+    assert_eq!(descriptor.op_type, "SpaceToDepth");
+    assert_eq!(descriptor.since_version, 13);
+    assert_eq!(descriptor.end_version, u64::MAX);
+    assert_eq!(
+        descriptor.supported_dtypes,
+        &[DataType::Float32, DataType::Float16, DataType::BFloat16]
+    );
+    assert!(!ep.registry().supports("SpaceToDepth", "", 12));
+    assert!(!ep.registry().supports("DepthToSpace", "", 28));
+    // At the legacy provider boundary, `mode` was ignored by both the claim
+    // and kernel. Keep this probe below the plugin's independent shape filter.
+    let output = run_cuda(
+        &ep,
+        "SpaceToDepth",
+        "",
+        28,
+        &[input(
+            DataType::Float32,
+            &[1, 2, 2, 2],
+            &[0_f32, 1., 2., 3., 4., 5., 6., 7.],
+        )],
+        &[(DataType::Float32, vec![1, 8, 1, 1])],
+        &[
+            ("blocksize", Attribute::Int(2)),
+            ("mode", Attribute::String(b"CRD".to_vec())),
+        ],
+    );
+    assert_eq!(
+        decode_floats(&output[0], DataType::Float32),
+        [0., 4., 1., 5., 2., 6., 3., 7.]
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn tensor_scatter_batch_offsets_match_cpu() {
     let ep = require_cuda();
     for case in tensor_scatter_cases() {
@@ -4153,5 +4544,71 @@ fn celu12_native_cuda_preserves_legacy_float_dtypes() {
             let expected = float_input(dtype, &[3], &[2.0, -3.436_563_7, 0.0]);
             assert_eq!(y[0], expected.bytes, "{dtype:?} at opset {opset}");
         }
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn eye_like_22_native_cuda_matches_onnx_reference() {
+    use DataType::{BFloat16, Float32};
+    use onnx_runtime_ep_api::ExecutionProvider;
+    let ep = require_cuda();
+    // ONNX 1.24 ReferenceEvaluator, opset 22, 2x3 input filled with sevens.
+    let bf16_one = 0x3f80_u16;
+    let shape = [2, 3];
+    let shape_for_claim = [onnx_runtime_ir::static_shape(shape)];
+    for (input_tensor, output_dtype, attrs, edge, expected) in [
+        (
+            input(BFloat16, &shape, &[0x40e0_u16; 6]),
+            BFloat16,
+            vec![],
+            "input",
+            [bf16_one, 0, 0, 0, bf16_one, 0]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            input(BFloat16, &shape, &[0x40e0_u16; 6]),
+            Float32,
+            vec![
+                ("dtype", Attribute::Int(i64::from(Float32.to_onnx()))),
+                ("k", Attribute::Int(-1)),
+            ],
+            "input",
+            [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        ),
+        (
+            input(Float32, &shape, &[7.0_f32; 6]),
+            BFloat16,
+            vec![
+                ("dtype", Attribute::Int(i64::from(BFloat16.to_onnx()))),
+                ("k", Attribute::Int(1)),
+            ],
+            "output",
+            [0, bf16_one, 0, 0, 0, bf16_one]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        ),
+    ] {
+        let input_dtype = input_tensor.dtype;
+        let inputs = [input_tensor];
+        let outputs = [(output_dtype, shape.to_vec())];
+        let (graph, id) = common::build_graph("EyeLike", "", 21, &inputs, &outputs, &attrs);
+        let claim = ep.supports_op(graph.node(id), 21, &shape_for_claim, &[input_dtype], &[]);
+        let reason = claim.reason().expect("EyeLike-9 must not claim BF16");
+        assert!(
+            reason.contains(&format!("{edge} dtype BFloat16")),
+            "{reason}"
+        );
+        assert_eq!(
+            run_cuda(&ep, "EyeLike", "", 22, &inputs, &outputs, &attrs),
+            vec![expected],
+            "{input_dtype:?} to {output_dtype:?}"
+        );
     }
 }

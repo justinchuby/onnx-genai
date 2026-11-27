@@ -6,6 +6,7 @@ use onnx_runtime_einsum_conformance::{
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
 use onnx_runtime_loader::{
     LoaderError, load_model_bytes, load_model_ir_bytes, proto::onnx, validate_model,
+    validate_model_for_native_execution,
 };
 
 fn tensor_type(elem_type: i32, shape: Option<&[i64]>) -> onnx::TypeProto {
@@ -119,6 +120,18 @@ fn loader_resolves_einsum_schema_from_imported_opset() {
     }
 
     validate_model(&einsum_graph(28, DataType::BFloat16)).unwrap();
+}
+
+#[test]
+fn native_execution_relaxes_only_the_einsum_dtype_extension() {
+    for opset in [12, 27, 28] {
+        validate_model_for_native_execution(&einsum_graph(opset, DataType::BFloat16)).unwrap();
+    }
+
+    let error =
+        validate_model_for_native_execution(&einsum_graph(11, DataType::BFloat16)).unwrap_err();
+    assert!(matches!(error, LoaderError::InvalidEinsum { .. }));
+    assert!(error.to_string().contains("predates Einsum-12"));
 }
 
 #[test]
@@ -299,13 +312,14 @@ fn tensor_type_without_shape_is_known_type_not_a_declared_scalar() {
 
 #[test]
 fn partial_metadata_still_rejects_every_known_invalid_fact() {
-    let invalid_dtype = load_model_bytes(&model(
+    let native_dtype_extension = load_model_bytes(&model(
         27,
         value_info("X", Some(16), None),
         value_info("Y", None, None),
         vec![einsum_node("X", "Y", "i->i")],
     ))
-    .unwrap_err();
+    .unwrap();
+    let invalid_dtype = validate_model(&native_dtype_extension).unwrap_err();
     assert!(
         invalid_dtype
             .to_string()

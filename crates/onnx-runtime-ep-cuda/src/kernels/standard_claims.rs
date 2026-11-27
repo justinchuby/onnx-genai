@@ -14,12 +14,28 @@ pub(crate) fn unsupported_reason_at_opset(
     input_dtypes: &[DataType],
     conv_transpose_contract: super::conv_transpose::Contract,
 ) -> Option<String> {
+    if node.op_type == "MaxUnpool" {
+        return onnx_runtime_ir::max_unpool::validate_claim(node, opset, input_dtypes).err();
+    }
     let result = match node.op_type.as_str() {
         "RNN" => return onnx_runtime_ep_api::rnn::unsupported_reason(node, input_dtypes),
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "OneHot" => one_hot(node, opset, input_dtypes),
+        "GridSample" => match conv_transpose_contract {
+            super::conv_transpose::Contract::Standalone => {
+                super::grid_sample::validate_claim(node, opset, input_shapes, input_dtypes)
+            }
+            super::conv_transpose::Contract::OrtPlugin => {
+                grid_sample(node, input_shapes, input_dtypes)
+            }
+        },
         "Dropout" => {
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
+        }
+        "LpPool" => lp_pool(node, opset, input_dtypes),
+        "EyeLike" => {
+            onnx_runtime_ir::eye_like::validate_claim(node, opset, input_shapes, input_dtypes)
         }
         "ReverseSequence" => {
             return onnx_runtime_ep_api::reverse_sequence::unsupported_reason(
@@ -33,6 +49,10 @@ pub(crate) fn unsupported_reason_at_opset(
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
                 .err()
                 .map(|error| error.to_string());
+        }
+        "MaxPool" => {
+            return onnx_runtime_ir::pooling::validate_dtype_at_opset(node, opset, input_dtypes)
+                .err();
         }
         "ConvTranspose" => conv_transpose(
             node,
@@ -50,6 +70,20 @@ pub(crate) fn unsupported_reason_at_opset(
             required_arity(node, input_dtypes, 1, 1, 1)
                 .and_then(|()| require_one_of(input_dtypes, 0, super::celu_dtypes(opset), "X"))
         }
+        "DepthToSpace" | "SpaceToDepth"
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) =>
+        {
+            onnx_runtime_ir::space_depth::SpaceDepth::validate_claim(
+                node,
+                opset,
+                input_shapes,
+                input_dtypes,
+            )
+        }
+        "InstanceNormalization" => instance_normalization(node, opset, input_dtypes),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -75,9 +109,7 @@ pub(crate) fn unsupported_reason(
         "Expand" => expand(node, input_dtypes),
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
         "Gelu" => gelu(node, input_dtypes),
-        "OneHot" => one_hot(node, input_dtypes),
-        "SpaceToDepth" => space_to_depth(node, input_dtypes),
-        "EyeLike" => eye_like(node, input_dtypes),
+        "SpaceToDepth" => legacy_space_to_depth(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
         | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
@@ -96,13 +128,11 @@ pub(crate) fn unsupported_reason(
         "GlobalAveragePool" | "GlobalMaxPool" => global_pool(node, input_dtypes),
         "GlobalLpPool" => global_lp_pool(node, input_dtypes),
         "LpNormalization" => lp_normalization(node, input_dtypes),
-        "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
-        "LpPool" => lp_pool(node, input_dtypes),
+        "GroupNormalization" => normalization(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
-        "GridSample" => grid_sample(node, input_shapes, input_dtypes),
         _ => return None,
     };
     result
@@ -114,7 +144,7 @@ const CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, D
 
 fn affine_grid(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "theta")?;
+    super::data_transform::AffineGridDtype::from_theta(input_dtypes[0])?;
     require_dtype(input_dtypes, 1, DataType::Int64, "size")?;
     bool_attribute(node, "align_corners")
 }
@@ -183,9 +213,23 @@ fn normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     Ok(())
 }
 
-fn lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn instance_normalization(
+    node: &Node,
+    opset: u64,
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
+    normalization(node, input_dtypes)?;
+    if input_dtypes.first() == Some(&DataType::BFloat16) && opset < 22 {
+        return Err(format!(
+            "input 'X' dtype BFloat16 requires ONNX opset 22 or later; export this node at opset 22+, or use Float16 or Float32 at opset {opset}"
+        ));
+    }
+    Ok(())
+}
+
+fn lp_pool(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 1, 1, 1)?;
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")
+    onnx_runtime_ir::lp_pool::validate_dtype(opset, input_dtypes[0])
 }
 
 fn center_crop_pad(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
@@ -548,8 +592,11 @@ fn rms_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
 
     match node.attr("stash_type") {
         None => Ok(()),
-        Some(attribute) if attribute.as_int() == Some(1) => Ok(()),
-        Some(_) => Err("attribute 'stash_type' must be 1 (float)".into()),
+        Some(attribute) if matches!(attribute.as_int(), Some(1 | 10 | 11 | 16)) => Ok(()),
+        Some(attribute) => Err(format!(
+            "attribute 'stash_type' must be FLOAT (1), FLOAT16 (10), DOUBLE (11), or BFLOAT16 (16), got {:?}",
+            attribute.as_int()
+        )),
     }
 }
 
@@ -659,50 +706,11 @@ fn gather_nd(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), S
     Ok(())
 }
 
-fn space_to_depth(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn legacy_space_to_depth(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 1, 1, 1)?;
     require_fixed_width(input_dtypes, 0, "input")?;
     if !matches!(node.attr("blocksize").and_then(Attribute::as_int), Some(value) if value > 0) {
         return Err("attribute 'blocksize' must be a positive integer".into());
-    }
-    Ok(())
-}
-
-fn eye_like(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
-    required_arity(node, input_dtypes, 1, 1, 1)?;
-    require_fixed_width(input_dtypes, 0, "input")?;
-    if node
-        .attr("k")
-        .is_some_and(|attribute| attribute.as_int().is_none())
-    {
-        return Err("attribute 'k' must be an integer".into());
-    }
-    if let Some(attribute) = node.attr("dtype") {
-        let value = attribute
-            .as_int()
-            .ok_or_else(|| "attribute 'dtype' must be an integer".to_string())?;
-        let value = i32::try_from(value)
-            .map_err(|_| format!("attribute 'dtype' value {value} is invalid"))?;
-        let dtype = DataType::from_onnx(value)
-            .ok_or_else(|| format!("attribute 'dtype' value {value} is invalid"))?;
-        if !matches!(
-            dtype,
-            DataType::Bool
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Uint8
-                | DataType::Uint16
-                | DataType::Uint32
-                | DataType::Uint64
-                | DataType::Float16
-                | DataType::BFloat16
-                | DataType::Float32
-                | DataType::Float64
-        ) {
-            return Err(format!("attribute 'dtype' selects unsupported {dtype:?}"));
-        }
     }
     Ok(())
 }
@@ -799,7 +807,7 @@ fn gelu(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn one_hot(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 3, 1, 1)?;
     require_one_of(
         input_dtypes,
@@ -813,7 +821,8 @@ fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         &[DataType::Int32, DataType::Int64],
         "depth",
     )?;
-    require_fixed_width(input_dtypes, 2, "values")
+    require_fixed_width(input_dtypes, 2, "values")?;
+    onnx_runtime_ep_api::one_hot::validate_values_dtype(opset, input_dtypes)
 }
 
 /// `ReduceProd`/`ReduceSumSquare`/`ReduceL1`/`ReduceL2`/`ReduceLogSum`/

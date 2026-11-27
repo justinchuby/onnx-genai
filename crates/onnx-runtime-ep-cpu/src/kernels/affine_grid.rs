@@ -1,10 +1,12 @@
 //! `AffineGrid` sampling-grid generation.
 
+use std::ops::{Add, Div, Mul, Sub};
+
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::{check_arity, to_dense_i64};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 
 pub struct AffineGridKernel {
     align_corners: bool,
@@ -24,16 +26,61 @@ impl KernelFactory for AffineGridFactory {
     }
 }
 
-fn coordinate(index: usize, extent: usize, align_corners: bool) -> f32 {
-    if align_corners {
-        if extent <= 1 {
-            0.0
-        } else {
-            2.0 * index as f32 / (extent - 1) as f32 - 1.0
-        }
-    } else {
-        (2.0 * index as f32 + 1.0) / extent as f32 - 1.0
+fn sampling_grid<T>(
+    theta: &[T],
+    batch: usize,
+    dims: &[usize],
+    align_corners: bool,
+    cast: impl Fn(usize) -> T,
+) -> Vec<T>
+where
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Div<Output = T>,
+{
+    if batch == 0 || dims.contains(&0) {
+        return Vec::new();
     }
+    let coordinate = |index, extent| {
+        if align_corners {
+            if extent <= 1 {
+                cast(0)
+            } else {
+                cast(2) * cast(index) / cast(extent - 1) - cast(1)
+            }
+        } else {
+            (cast(2) * cast(index) + cast(1)) / cast(extent) - cast(1)
+        }
+    };
+    let mut out = Vec::with_capacity(batch * dims.len() * dims.iter().product::<usize>());
+    if let &[height, width] = dims {
+        for n in 0..batch {
+            let t = &theta[n * 6..n * 6 + 6];
+            for y in 0..height {
+                let y = coordinate(y, height);
+                for x in 0..width {
+                    let x = coordinate(x, width);
+                    out.push(t[0] * x + t[1] * y + t[2]);
+                    out.push(t[3] * x + t[4] * y + t[5]);
+                }
+            }
+        }
+    } else if let &[depth, height, width] = dims {
+        for n in 0..batch {
+            let t = &theta[n * 12..n * 12 + 12];
+            for z in 0..depth {
+                let z = coordinate(z, depth);
+                for y in 0..height {
+                    let y = coordinate(y, height);
+                    for x in 0..width {
+                        let x = coordinate(x, width);
+                        out.push(t[0] * x + t[1] * y + t[2] * z + t[3]);
+                        out.push(t[4] * x + t[5] * y + t[6] * z + t[7]);
+                        out.push(t[8] * x + t[9] * y + t[10] * z + t[11]);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 impl Kernel for AffineGridKernel {
@@ -79,39 +126,13 @@ impl Kernel for AffineGridKernel {
             )));
         }
 
-        let theta = to_dense_f32_widen("AffineGrid", &inputs[0])?;
-        let mut out = Vec::with_capacity(expected_shape.iter().product());
-        if spatial_rank == 2 {
-            let (height, width) = (dims[0], dims[1]);
-            for n in 0..batch {
-                let t = &theta[n * 6..n * 6 + 6];
-                for y in 0..height {
-                    let y = coordinate(y, height, self.align_corners);
-                    for x in 0..width {
-                        let x = coordinate(x, width, self.align_corners);
-                        out.push(t[0] * x + t[1] * y + t[2]);
-                        out.push(t[3] * x + t[4] * y + t[5]);
-                    }
-                }
-            }
-        } else {
-            let (depth, height, width) = (dims[0], dims[1], dims[2]);
-            for n in 0..batch {
-                let t = &theta[n * 12..n * 12 + 12];
-                for z in 0..depth {
-                    let z = coordinate(z, depth, self.align_corners);
-                    for y in 0..height {
-                        let y = coordinate(y, height, self.align_corners);
-                        for x in 0..width {
-                            let x = coordinate(x, width, self.align_corners);
-                            out.push(t[0] * x + t[1] * y + t[2] * z + t[3]);
-                            out.push(t[4] * x + t[5] * y + t[6] * z + t[7]);
-                            out.push(t[8] * x + t[9] * y + t[10] * z + t[11]);
-                        }
-                    }
-                }
-            }
+        if inputs[0].dtype == DataType::Float64 {
+            let theta = to_dense::<f64>(&inputs[0])?;
+            let out = sampling_grid(&theta, batch, &dims, self.align_corners, |i| i as f64);
+            return write_dense(&mut outputs[0], &out);
         }
+        let theta = to_dense_f32_widen("AffineGrid", &inputs[0])?;
+        let out = sampling_grid(&theta, batch, &dims, self.align_corners, |i| i as f32);
         write_dense_f32_narrow("AffineGrid", &mut outputs[0], &out)
     }
 
@@ -124,6 +145,33 @@ impl Kernel for AffineGridKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn affine_grid_f64_preserves_double_precision() {
+        let scale = 1.0 + 2f64.powi(-30);
+        let theta = Owned::f64(&[1, 2, 3], &[scale, 0., 0., 0., 1., scale]);
+        let size = Owned::i64(&[4], &[1, 1, 1, 3]);
+        let mut out = Owned::zeros(DataType::Float64, &[1, 1, 3, 2]);
+        AffineGridKernel {
+            align_corners: false,
+        }
+        .execute(&[theta.view(), size.view()], &mut [out.view_mut()])
+        .unwrap();
+        let expected = [
+            -scale * (2.0 / 3.0),
+            scale,
+            0.0,
+            scale,
+            scale * (2.0 / 3.0),
+            scale,
+        ];
+        for (index, (got, expected)) in out.to_f64().into_iter().zip(expected).enumerate() {
+            assert!(
+                (got - expected).abs() <= 1e-14,
+                "AffineGrid FLOAT64 output {index}: got {got}, expected {expected}"
+            );
+        }
+    }
 
     #[test]
     fn affine_grid_bf16_matches_widened_f32_reference() {

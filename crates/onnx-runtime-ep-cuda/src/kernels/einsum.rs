@@ -181,8 +181,17 @@ fn einsum_dtype(dtype: DataType) -> Result<GemmDtype> {
     }
 }
 
-fn validate_einsum_dtype(schema: EinsumSchema, dtype: DataType) -> Result<()> {
-    if schema.supports_dtype(dtype) {
+fn validate_einsum_dtype(
+    schema: EinsumSchema,
+    dtype: DataType,
+    native_runtime: bool,
+) -> Result<()> {
+    let supported = if native_runtime {
+        schema.supports_native_dtype(dtype)
+    } else {
+        schema.supports_dtype(dtype)
+    };
+    if supported {
         Ok(())
     } else {
         Err(not_implemented(format!(
@@ -326,6 +335,7 @@ fn unsupported_reason_impl(
     shapes: &[Shape],
     input_dtypes: &[DataType],
     layouts: &[TensorLayout],
+    native_runtime: bool,
 ) -> Option<String> {
     let equation = match equation(node) {
         Ok(equation) => equation,
@@ -350,11 +360,16 @@ fn unsupported_reason_impl(
         .zip(input_dtypes)
         .map(|(shape, &dtype)| EinsumInput::new(dtype, shape.as_slice()))
         .collect::<Vec<_>>();
-    let plan = match EinsumPlan::build_for_opset(equation, &inputs, opset) {
+    let planned = if native_runtime {
+        EinsumPlan::build_for_native_opset(equation, &inputs, opset)
+    } else {
+        EinsumPlan::build_for_opset(equation, &inputs, opset)
+    };
+    let plan = match planned {
         Ok(plan) => plan,
         Err(error) => return Some(format!("cuda_ep Einsum `{equation}`: {error}")),
     };
-    validate_einsum_dtype(plan.schema(), plan.dtype())
+    validate_einsum_dtype(plan.schema(), plan.dtype(), native_runtime)
         .err()
         .map(|error| error.to_string())
 }
@@ -381,7 +396,29 @@ pub fn unsupported_reason_for_opset(
     input_dtypes: &[DataType],
     layouts: &[TensorLayout],
 ) -> Option<String> {
-    let reason = unsupported_reason_impl(node, opset, shapes, input_dtypes, layouts);
+    recorded_unsupported_reason(node, opset, shapes, input_dtypes, layouts, false)
+}
+
+pub(crate) fn unsupported_reason_for_native_opset(
+    node: &Node,
+    opset: u64,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+    layouts: &[TensorLayout],
+) -> Option<String> {
+    recorded_unsupported_reason(node, opset, shapes, input_dtypes, layouts, true)
+}
+
+fn recorded_unsupported_reason(
+    node: &Node,
+    opset: u64,
+    shapes: &[Shape],
+    input_dtypes: &[DataType],
+    layouts: &[TensorLayout],
+    native_runtime: bool,
+) -> Option<String> {
+    let reason =
+        unsupported_reason_impl(node, opset, shapes, input_dtypes, layouts, native_runtime);
     if let Some(reason) = &reason {
         CLAIM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         *LAST_FALLBACK_REASON
@@ -1333,7 +1370,7 @@ impl EinsumKernel {
             self.plan.equation(),
         )?;
         let dtype = inputs[0].dtype;
-        validate_einsum_dtype(self.plan.schema(), dtype)?;
+        validate_einsum_dtype(self.plan.schema(), dtype, true)?;
         for (index, (input, expected_shape)) in inputs.iter().zip(&self.input_shapes).enumerate() {
             input.validate().map_err(|error| {
                 EpError::KernelFailed(format!(
@@ -2185,7 +2222,7 @@ impl Kernel for EinsumKernel {
         if inputs.len() != 1 || num_outputs != 1 || output_shapes.len() != 1 {
             return None;
         }
-        validate_einsum_dtype(self.plan.schema(), inputs[0].dtype).ok()?;
+        validate_einsum_dtype(self.plan.schema(), inputs[0].dtype, true).ok()?;
         if inputs[0].shape != self.input_shapes[0] {
             return None;
         }
@@ -2421,6 +2458,7 @@ mod tests {
                     TensorLayout::contiguous(),
                     TensorLayout::contiguous(),
                 ],
+                false,
             ),
             None
         );
@@ -2444,7 +2482,7 @@ mod tests {
         let dtypes = vec![DataType::Float32; arity];
         let layouts = vec![TensorLayout::contiguous(); arity];
         assert_eq!(
-            unsupported_reason_impl(&node, 12, &shapes, &dtypes, &layouts),
+            unsupported_reason_impl(&node, 12, &shapes, &dtypes, &layouts, false),
             None
         );
     }
@@ -2460,15 +2498,21 @@ mod tests {
         let layouts = [TensorLayout::contiguous()];
 
         let opset11 =
-            unsupported_reason_impl(&node, 11, &shapes, &[DataType::Float32], &layouts).unwrap();
+            unsupported_reason_impl(&node, 11, &shapes, &[DataType::Float32], &layouts, false)
+                .unwrap();
         assert!(opset11.contains("predates Einsum-12"), "{opset11}");
 
         let opset27 =
-            unsupported_reason_impl(&node, 27, &shapes, &[DataType::BFloat16], &layouts).unwrap();
+            unsupported_reason_impl(&node, 27, &shapes, &[DataType::BFloat16], &layouts, false)
+                .unwrap();
         assert!(opset27.contains("not admitted by Einsum-12"), "{opset27}");
+        assert_eq!(
+            unsupported_reason_impl(&node, 27, &shapes, &[DataType::BFloat16], &layouts, true,),
+            None
+        );
 
         assert_eq!(
-            unsupported_reason_impl(&node, 28, &shapes, &[DataType::BFloat16], &layouts),
+            unsupported_reason_impl(&node, 28, &shapes, &[DataType::BFloat16], &layouts, false,),
             None
         );
     }

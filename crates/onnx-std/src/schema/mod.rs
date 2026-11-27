@@ -424,11 +424,19 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/scatter_elements.yaml"),
     include_str!("../../schemas/standard/scatter_elements_v29.yaml"),
     include_str!("../../schemas/standard/constant_of_shape.yaml"),
+    include_str!("../../schemas/standard/max_pool_12.yaml"),
     include_str!("../../schemas/standard/max_pool.yaml"),
+    include_str!("../../schemas/standard/max_unpool_v9.yaml"),
+    include_str!("../../schemas/standard/max_unpool_v11.yaml"),
+    include_str!("../../schemas/standard/max_unpool.yaml"),
     include_str!("../../schemas/standard/average_pool_19.yaml"),
     include_str!("../../schemas/standard/average_pool.yaml"),
     include_str!("../../schemas/standard/global_average_pool.yaml"),
+    include_str!("../../schemas/standard/global_lp_pool_v2.yaml"),
+    include_str!("../../schemas/standard/global_lp_pool.yaml"),
     include_str!("../../schemas/standard/global_max_pool.yaml"),
+    include_str!("../../schemas/standard/lp_pool_v18.yaml"),
+    include_str!("../../schemas/standard/lp_pool.yaml"),
     include_str!("../../schemas/standard/resize.yaml"),
     include_str!("../../schemas/standard/quantize_linear.yaml"),
     include_str!("../../schemas/standard/dequantize_linear.yaml"),
@@ -477,6 +485,8 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/eye_like_v22.yaml"),
     include_str!("../../schemas/standard/group_normalization.yaml"),
     include_str!("../../schemas/standard/group_normalization_v21.yaml"),
+    include_str!("../../schemas/standard/instance_normalization.yaml"),
+    include_str!("../../schemas/standard/instance_normalization_v22.yaml"),
     include_str!("../../schemas/standard/hardmax.yaml"),
     include_str!("../../schemas/standard/is_inf.yaml"),
     include_str!("../../schemas/standard/is_nan.yaml"),
@@ -748,6 +758,7 @@ type_constraints:
             "ScatterElements",
             "ConstantOfShape",
             "MaxPool",
+            "MaxUnpool",
             "AveragePool",
             "GlobalAveragePool",
             "GlobalMaxPool",
@@ -761,10 +772,33 @@ type_constraints:
     }
 
     #[test]
+    fn lp_pool_schema_widens_only_at_opset_22() {
+        let registry = SchemaRegistry::builtins();
+        let v18 = registry.lookup("LpPool", "", 21).unwrap();
+        let v22 = registry.lookup("LpPool", "", 22).unwrap();
+        assert_eq!(v18.since_version, 18);
+        assert_eq!(v22.since_version, 22);
+        assert_eq!(v18.attributes, v22.attributes);
+        assert_eq!(
+            v18.type_constraints[0].allowed,
+            [DataType::Float16, DataType::Float32, DataType::Float64]
+        );
+        assert_eq!(
+            v22.type_constraints[0].allowed,
+            [
+                DataType::BFloat16,
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64
+            ]
+        );
+    }
+
+    #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 118);
-        assert_eq!(registry.iter().count(), 146);
+        assert_eq!(registry.schemas.len(), 122);
+        assert_eq!(registry.iter().count(), 156);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
@@ -857,11 +891,28 @@ type_constraints:
                     .contains(&DataType::BFloat16)
             );
         }
-        assert_eq!(registry.lookup("EyeLike", "", 21).unwrap().since_version, 9);
-        assert_eq!(
-            registry.lookup("EyeLike", "", 22).unwrap().since_version,
-            22
-        );
+        for (opset, since_version) in [(21, 9), (22, 22)] {
+            let schema = registry.lookup("EyeLike", "", opset).unwrap();
+            assert_eq!(schema.since_version, since_version);
+            for edge in ["T1", "T2"] {
+                let allowed = &schema
+                    .type_constraints
+                    .iter()
+                    .find(|constraint| constraint.type_param == edge)
+                    .unwrap()
+                    .allowed;
+                let expected: Vec<_> = onnx_runtime_ir::eye_like::DTYPES
+                    .iter()
+                    .copied()
+                    .filter(|&dtype| dtype != DataType::BFloat16 || opset >= 22)
+                    .collect();
+                assert_eq!(allowed.len(), expected.len(), "EyeLike-{opset} {edge}");
+                assert!(
+                    expected.iter().all(|dtype| allowed.contains(dtype)),
+                    "EyeLike-{opset} {edge}"
+                );
+            }
+        }
         assert_eq!(
             registry
                 .lookup("GroupNormalization", "", 20)
@@ -875,6 +926,41 @@ type_constraints:
                 .unwrap()
                 .since_version,
             21
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 21)
+                .unwrap()
+                .since_version,
+            6
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 22)
+                .unwrap()
+                .since_version,
+            22
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 21)
+                .unwrap()
+                .type_constraints[0]
+                .allowed,
+            [DataType::Float16, DataType::Float32, DataType::Float64]
+        );
+        assert_eq!(
+            registry
+                .lookup("InstanceNormalization", "", 22)
+                .unwrap()
+                .type_constraints[0]
+                .allowed,
+            [
+                DataType::BFloat16,
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64
+            ]
         );
     }
 
@@ -1040,13 +1126,64 @@ type_constraints:
     }
 
     #[test]
+    fn global_pool_v22_schemas_match_upstream() {
+        // ONNX 622adf94d4e720142950aa8178f7357d52e63db0, onnx/defs/nn/{defs,old}.cc:
+        // v22 adds BF16 to the preceding float16/float32/float64 constraints.
+        let registry = SchemaRegistry::builtins();
+        for opset in [2, 21] {
+            let schema = registry.lookup("GlobalLpPool", "", opset).unwrap();
+            assert_eq!(schema.since_version, 2, "opset {opset}");
+            assert_eq!(
+                schema.type_constraints[0].allowed,
+                [DataType::Float16, DataType::Float32, DataType::Float64],
+                "opset {opset}"
+            );
+        }
+        for name in ["GlobalAveragePool", "GlobalMaxPool", "GlobalLpPool"] {
+            let schema = registry.lookup(name, "", 22).unwrap();
+            assert_eq!(schema.since_version, 22, "{name}");
+            let [input] = schema.inputs.as_slice() else {
+                panic!("{name} v22 must have one input");
+            };
+            let [output] = schema.outputs.as_slice() else {
+                panic!("{name} v22 must have one output");
+            };
+            assert_eq!(input.type_str, "T", "{name}");
+            assert_eq!(output.type_str, "T", "{name}");
+            let [constraint] = schema.type_constraints.as_slice() else {
+                panic!("{name} v22 must have one type constraint");
+            };
+            assert_eq!(constraint.type_param, "T", "{name}");
+            assert_eq!(
+                constraint.allowed,
+                [
+                    DataType::BFloat16,
+                    DataType::Float16,
+                    DataType::Float32,
+                    DataType::Float64,
+                ],
+                "{name}"
+            );
+            if name == "GlobalLpPool" {
+                let [p] = schema.attributes.as_slice() else {
+                    panic!("{name} v22 must have one attribute");
+                };
+                assert_eq!(p.name, "p");
+                assert_eq!(p.attr_type, AttributeType::Int);
+                assert!(!p.required);
+                assert_eq!(p.default, Some(AttributeDefault::Int(2)));
+            } else {
+                assert!(schema.attributes.is_empty(), "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn round_seven_schemas_match_official_signatures() {
         let registry = SchemaRegistry::builtins();
         for (name, since_version, inputs, outputs) in [
             ("MaxPool", 22, 1, 2),
             ("AveragePool", 22, 1, 1),
-            ("GlobalAveragePool", 22, 1, 1),
-            ("GlobalMaxPool", 22, 1, 1),
             ("Resize", 19, 4, 1),
             ("QuantizeLinear", 21, 3, 1),
             ("DequantizeLinear", 21, 3, 1),
@@ -1056,6 +1193,33 @@ type_constraints:
             assert_eq!(schema.since_version, since_version, "{name}");
             assert_eq!(schema.inputs.len(), inputs, "{name}");
             assert_eq!(schema.outputs.len(), outputs, "{name}");
+        }
+
+        assert!(registry.lookup("MaxUnpool", "", 8).is_none());
+        for (opset, since_version) in [(9, 9), (10, 9), (11, 11), (21, 11), (22, 22), (25, 22)] {
+            let schema = registry.lookup("MaxUnpool", "", opset).unwrap();
+            assert_eq!(
+                schema.since_version, since_version,
+                "MaxUnpool at opset {opset}"
+            );
+            assert_eq!(schema.inputs.len(), 3);
+            assert_eq!(schema.outputs.len(), 1);
+            assert!(!schema.inputs[0].optional && !schema.inputs[1].optional);
+            assert_eq!(schema.inputs[2].name, "output_shape");
+            assert!(schema.inputs[2].optional);
+
+            let mut value_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+            if since_version == 22 {
+                value_types.push(DataType::BFloat16);
+            }
+            let values = &schema.type_constraints[0];
+            let indices = &schema.type_constraints[1];
+            assert_eq!(values.allowed, value_types);
+            assert_eq!(indices.allowed, [DataType::Int64]);
+            assert_eq!(schema.inputs[0].type_str, values.type_param);
+            assert_eq!(schema.outputs[0].type_str, values.type_param);
+            assert_eq!(schema.inputs[1].type_str, indices.type_param);
+            assert_eq!(schema.inputs[2].type_str, indices.type_param);
         }
 
         let max_pool = registry.lookup("MaxPool", "", 25).unwrap();
@@ -1069,6 +1233,18 @@ type_constraints:
                 .find(|attribute| attribute.name == "kernel_shape")
                 .unwrap()
                 .required
+        );
+        let max_pool_12 = registry.lookup("MaxPool", "", 21).unwrap();
+        assert_eq!(max_pool_12.since_version, 12);
+        assert_eq!(
+            max_pool_12.type_constraints[0].allowed,
+            [
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Int8,
+                DataType::Uint8,
+            ]
         );
 
         let average_pool_19 = registry.lookup("AveragePool", "", 19).unwrap();
