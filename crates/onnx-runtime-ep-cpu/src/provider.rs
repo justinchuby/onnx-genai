@@ -524,6 +524,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) =
+            onnx_runtime_ep_api::det::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.is_default_domain()
             && op.op_type == "MaxUnpool"
             && let Err(reason) =
