@@ -2164,6 +2164,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(tensor_scatter::TensorScatterFactory),
     );
+    // OneHot-28 reuses this factory through version-floor lookup.
     rec.register(
         OpKey::new("OneHot", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,

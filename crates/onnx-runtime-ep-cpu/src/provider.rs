@@ -587,6 +587,13 @@ impl ExecutionProvider for CpuExecutionProvider {
                 "InstanceNormalization input dtype BFloat16 requires ONNX opset 22 or later; export this node at opset 22+, or use Float16, Float32, or Float64 at opset {opset}"
             );
         }
+        if op.op_type == "OneHot"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ep_api::one_hot::validate_values_dtype(opset, input_dtypes)
+        {
+            deny!("OneHot: {reason}");
+        }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
             && onnx_runtime_ir::is_default_domain(&op.domain)

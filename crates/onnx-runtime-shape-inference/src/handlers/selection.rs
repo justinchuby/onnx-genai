@@ -284,6 +284,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "NonMaxSuppression", 10, non_max_suppression);
     reg.register("", "OneHot", 9, one_hot);
     reg.register("", "OneHot", 11, one_hot);
+    reg.register("", "OneHot", 28, one_hot);
     reg.register("", "Compress", 9, compress);
     reg.register("", "Compress", 11, compress);
     reg.register("", "Unique", 11, unique);

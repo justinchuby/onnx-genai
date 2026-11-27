@@ -1337,6 +1337,7 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    // OneHot-28 reuses the v11 factory through version-floor lookup.
     for (opset, wrap_negative) in [(9, false), (11, true)] {
         reg.register(
             OpKey::new("OneHot", "", opset),
