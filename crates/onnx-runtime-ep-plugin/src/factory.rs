@@ -1509,6 +1509,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn standalone_reverse_sequence_is_excluded_before_ort_partitioning() {
+        use crate::ep::{KernelRegistryEntry, SHIPPED_ORT_EXCLUSIONS, query_plugin_capabilities};
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, NodeId, static_shape};
+
+        let mut factory = build_factory(
+            CString::new("scope_test").unwrap(),
+            Box::new(|| Box::new(CpuExecutionProvider::new())),
+        );
+        factory.kernel_registry_entries = [
+            ("", "ReverseSequence", 10),
+            ("ai.onnx", "ReverseSequence", 28),
+            ("", "Identity", 1),
+            ("example", "ReverseSequence", 1),
+        ]
+        .map(|(domain, op_type, since_version)| KernelRegistryEntry {
+            domain,
+            op_type,
+            since_version,
+            end_version: i32::MAX,
+            supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
+        })
+        .to_vec();
+        // SAFETY: this live factory has not been handed to ORT.
+        let factory_ptr = std::ptr::from_mut(factory.as_mut()).cast();
+        unsafe { exclude_operators(factory_ptr, SHIPPED_ORT_EXCLUSIONS) };
+        assert_eq!(
+            factory
+                .kernel_registry_entries
+                .iter()
+                .map(|entry| (entry.domain, entry.op_type))
+                .collect::<Vec<_>>(),
+            [("", "Identity"), ("example", "ReverseSequence")],
+        );
+
+        let mut ep = CpuExecutionProvider::new();
+        ep.initialize(&EpConfig::default()).unwrap();
+        for opset in [10, 28] {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), opset);
+            let x = graph.create_named_value("x", DataType::Float32, static_shape([3, 2]));
+            let lengths = graph.create_named_value("lengths", DataType::Int64, static_shape([2]));
+            let reversed =
+                graph.create_named_value("reversed", DataType::Float32, static_shape([3, 2]));
+            let output =
+                graph.create_named_value("output", DataType::Float32, static_shape([3, 2]));
+            graph.add_input(x);
+            graph.add_input(lengths);
+            graph.add_output(output);
+            let reverse = graph.insert_node(Node::new(
+                NodeId(0),
+                "ReverseSequence",
+                vec![Some(x), Some(lengths)],
+                vec![reversed],
+            ));
+            let identity = graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(reversed)],
+                vec![output],
+            ));
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+
+            let standalone = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+            assert_eq!(standalone.len(), 1);
+            assert_eq!(standalone[0].node_ids, [reverse, identity]);
+            let plugin =
+                query_plugin_capabilities(&view, &ep, factory.operator_exclusions, |_, _| true)
+                    .unwrap();
+            assert_eq!(plugin.len(), 1);
+            assert_eq!(plugin[0].node_ids, [identity]);
+        }
+    }
+
     /// Counts `shutdown()` and `Drop` so a test can tell the explicit teardown
     /// path apart from the Drop-only fallback, and can catch a double shutdown.
     struct CountingEp {

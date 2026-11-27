@@ -21,6 +21,14 @@ pub(crate) fn unsupported_reason_at_opset(
         "Dropout" => {
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
         }
+        "ReverseSequence" => {
+            return onnx_runtime_ep_api::reverse_sequence::unsupported_reason(
+                node,
+                opset,
+                input_shapes,
+                input_dtypes,
+            );
+        }
         "AveragePool" => {
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
                 .err()

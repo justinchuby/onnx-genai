@@ -47,6 +47,7 @@ pub mod packed_routed;
 pub mod provider;
 pub mod random;
 pub mod registry;
+pub mod reverse_sequence;
 pub mod rnn;
 pub mod standard_activation;
 pub mod standard_math;

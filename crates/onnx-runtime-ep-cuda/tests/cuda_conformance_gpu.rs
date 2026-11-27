@@ -3040,6 +3040,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // Batch 6 (issue #67): model-shaping/indexing structural operators.
     p.push(sweep("GatherND", gather_nd_cases()));
     p.push(sweep("SpaceToDepth", space_to_depth_cases()));
+    p.push(dedicated(
+        "ReverseSequence",
+        "cuda_conformance_gpu.rs",
+        "Direct CUDA execution against independent byte-exact expectations",
+    ));
     p.push(sweep("EyeLike", eye_like_cases()));
 
     // Batch 7 (issue #67): general padding/cropping and sequence construction.
@@ -3816,6 +3821,103 @@ fn tensor_scatter_batch_offsets_match_cpu() {
     let ep = require_cuda();
     for case in tensor_scatter_cases() {
         run_case(&ep, &case);
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn reverse_sequence_cuda_exact_bytes() {
+    let ep = require_cuda();
+    let bits = [
+        0x7f81u16, 0x7fc3, 0x8000, 0x0000, 0x0001, 0x8001, 0xff80, 0x7f80,
+    ];
+    let bf16 = DataType::BFloat16;
+    let i64 = DataType::Int64;
+    let lengths = input(i64, &[2], &[2i64, 0]);
+    for opset in [10, 28] {
+        let time_major = run_cuda(
+            &ep,
+            "ReverseSequence",
+            "",
+            opset,
+            &[input(bf16, &[2, 2, 2], &bits), lengths.clone()],
+            &[(bf16, vec![2, 2, 2])],
+            &[],
+        );
+        assert_eq!(
+            time_major,
+            vec![common::raw(&[
+                0x0001u16, 0x8001, 0x8000, 0x0000, 0x7f81, 0x7fc3, 0xff80, 0x7f80,
+            ])],
+            "opset {opset}"
+        );
+    }
+
+    let complex = DataType::Complex128;
+    let batch_major = run_cuda(
+        &ep,
+        "ReverseSequence",
+        "",
+        10,
+        &[
+            input(
+                complex,
+                &[2, 3],
+                &[[1u64, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12]],
+            ),
+            lengths,
+        ],
+        &[(complex, vec![2, 3])],
+        &[
+            ("batch_axis", Attribute::Int(0)),
+            ("time_axis", Attribute::Int(1)),
+        ],
+    );
+    assert_eq!(
+        batch_major,
+        vec![common::raw(&[
+            [3u64, 4],
+            [1, 2],
+            [5, 6],
+            [7, 8],
+            [9, 10],
+            [11, 12],
+        ])]
+    );
+
+    let u8 = DataType::Uint8;
+    for (shape, lengths) in [(vec![3, 0], vec![]), (vec![0, 2], vec![0i64, 0])] {
+        let outputs = run_cuda(
+            &ep,
+            "ReverseSequence",
+            "",
+            28,
+            &[
+                input(u8, &shape, &[] as &[u8]),
+                input(i64, &[lengths.len()], &lengths),
+            ],
+            &[(u8, shape.clone())],
+            &[],
+        );
+        assert_eq!(outputs, vec![Vec::<u8>::new()]);
+    }
+    for (shape, bad_length) in [([2, 2], -1i64), ([0, 2], 1), ([2, 2], i64::MAX)] {
+        let data = vec![0u8; shape.iter().product()];
+        let error = common::try_run_cuda(
+            &ep,
+            "ReverseSequence",
+            "",
+            28,
+            &[input(u8, &shape, &data), input(i64, &[2], &[0, bad_length])],
+            &[(u8, shape.to_vec())],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("[1] = {bad_length} is outside 0..={}", shape[0]))
+        );
     }
 }
 
