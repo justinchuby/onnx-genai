@@ -255,12 +255,12 @@ def test_unsupported_numpy_dtype_is_typeerror():
 
 
 def test_unsupported_op_is_actionable():
-    # `Det` is a valid ONNX op the CPU EP does not implement in this iteration.
-    model = _single_op_model("Det", TensorProto.FLOAT, [2, 2])
+    op = "MeanVarianceNormalization"
+    model = _single_op_model(op, TensorProto.FLOAT, [1, 2, 2, 2])
     with pytest.raises(ValueError) as ei:
         sess = nxrt.InferenceSession(model)
-        sess.run(None, {"X": np.zeros((2, 2), dtype=np.float32)})
-    assert "Det" in str(ei.value)
+        sess.run(None, {"X": np.zeros((1, 2, 2, 2), dtype=np.float32)})
+    assert op in str(ei.value)
 
 
 def test_requested_missing_output_lists_outputs():

@@ -1,10 +1,11 @@
 domain: ""
 name: Softplus
-since_version: 22
+since_version: 1
+until_version: 21
 doc: Element-wise softplus activation.
 inputs:
   - { name: X, type_str: T }
 outputs:
   - { name: Y, type_str: T }
 type_constraints:
-  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }
+  - { type_param: T, allowed: [float16, float32, float64] }

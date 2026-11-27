@@ -1,0 +1,10 @@
+{
+  "archive": "raw-results.tar.gz",
+  "baseline_binary_sha256": "c23c8b81c8f33f8aa66b30b7a7ecdf93896201061d481ab1da6495f45a0dc448",
+  "bytes": 341731,
+  "candidate_binary_sha256": "aadd2232d11e58e059a791e21a0cd08ec07a3360bde76564c1ea88efae1698b4",
+  "files": 234,
+  "measured_controller_commit": "a240986f9",
+  "measured_probe_commit": "3a483b4e8",
+  "sha256": "e9db7414fb30f6d3ec607a0aa0833fe8e5b78fa3956be747d81f590b3a856ae0"
+}

@@ -14,7 +14,7 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_bytes, to_dense_i64, write_dense_bytes};
+use super::{check_arity, movement_ops::copy_shape_only, to_dense_i64};
 
 /// Unsqueeze kernel carrying the legacy `axes` attribute (`None` when axes
 /// arrive as the opset-13 input).
@@ -65,8 +65,7 @@ impl Kernel for UnsqueezeKernel {
                 axes_len
             )));
         }
-        let data = to_dense_bytes(&inputs[0])?;
-        write_dense_bytes(&mut outputs[0], &data)
+        copy_shape_only("Unsqueeze", &inputs[0], &mut outputs[0])
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {

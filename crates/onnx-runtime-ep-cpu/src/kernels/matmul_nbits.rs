@@ -4317,13 +4317,21 @@ impl MatMulNBitsKernel {
         result: &mut [f32],
     ) -> Result<()> {
         let rows = NBitsDenseRows::new(self, packed, scales, zero_points, group_indices)?;
-        let output = super::decoded_projection::linear_decoded_grouped::<1, _>(
+        // Keep independent staging: allocation/decoder/dispatch failures must
+        // not partially publish into a direct Float32 tensor output.
+        let mut output = super::decoded_projection::zeroed_f32(
+            "MatMulNBits",
+            "decoded output staging",
+            result.len(),
+        )?;
+        super::decoded_projection::linear_decoded_grouped_into::<1, _>(
             "MatMulNBits",
             activations,
             m,
             self.k,
             self.n,
             None,
+            &mut output,
             || {
                 |feature, output: &mut [f32]| {
                     rows.decode_row(feature, output);
@@ -28855,10 +28863,12 @@ mod tests {
     #[test]
     fn a_deferred_wide_fan_out_runs_on_the_decode_pool() {
         let (n, k) = (6144usize, 4096usize);
-        assert!(output_chunk_len(n, k) < n);
         let mut result = vec![0.0f32; n];
         {
             let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH - 1);
+            // Partition against the deferred executor, not an ambient pool
+            // which may intentionally have only one worker.
+            assert!(output_chunk_len(n, k) < n);
             parallel_output_rows(&mut result, k, |start, outputs| {
                 for (offset, output) in outputs.iter_mut().enumerate() {
                     *output = (start + offset) as f32;

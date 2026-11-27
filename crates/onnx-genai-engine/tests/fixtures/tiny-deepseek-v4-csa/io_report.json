@@ -3,7 +3,7 @@
   "csa_nodes": [
     {
       "name": "model/layers.0/self_attn/CompressedSparseAttention_node_114",
-      "domain": "pkg.nxrt",
+      "domain": "pkg.nxrt._private",
       "inputs": [
         "v_model.layers.0.self_attn.Reshape_94",
         "v_model.layers.0.self_attn.Reshape_99",
@@ -52,7 +52,7 @@
     },
     {
       "name": "model/layers.1/self_attn/CompressedSparseAttention_node_346",
-      "domain": "pkg.nxrt",
+      "domain": "pkg.nxrt._private",
       "inputs": [
         "v_model.layers.1.self_attn.Reshape_335",
         "v_model.layers.1.self_attn.Reshape_340",

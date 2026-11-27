@@ -261,3 +261,6 @@ mod feature_default_guard {
         );
     }
 }
+
+mod buffer_memory;
+pub use buffer_memory::CpuBufferMemory;

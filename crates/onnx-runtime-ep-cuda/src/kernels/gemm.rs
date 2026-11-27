@@ -35,6 +35,7 @@ use onnx_runtime_ir::{DataType, Node};
 
 use super::elementwise::BroadcastMetadataCache;
 use crate::blas::{self, GemmDtype, GemmEx, StridedBatchedGemmParams};
+use crate::device_metadata::publish_metadata_candidate;
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -459,26 +460,34 @@ impl GemmKernel {
         let func = self
             .runtime
             .nvrtc_function(BIAS_MODULE, BIAS_SRC, "gemm_bias_nd_f32")?;
-        let mut cache = self.bias_metadata.lock().map_err(|_| {
-            EpError::KernelFailed(
-                "cuda_ep Gemm: bias metadata lock was poisoned; recreate the execution session"
-                    .into(),
-            )
-        })?;
-        let (c, metadata, rank) = if let Some(c) = bias {
+        let (c, metadata, rank, candidate) = if let Some(c) = bias {
             let rank = i32::try_from(shape.len()).map_err(|_| {
                 EpError::KernelFailed(format!(
                     "cuda_ep Gemm: output rank {} exceeds i32; reduce tensor rank",
                     shape.len()
                 ))
             })?;
+            let mut candidate = self
+                .bias_metadata
+                .lock()
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                    "cuda_ep Gemm: bias metadata state is poisoned; recreate the execution session"
+                        .into(),
+                )
+                })?
+                .clone();
+            let metadata = candidate.prepare(c.shape, &[], shape)?;
             (
                 cuptr(c.data_ptr::<u8>().cast()),
-                cache.prepare(c.shape, &[], shape)?,
+                metadata,
                 rank,
+                Some(candidate),
             )
         } else {
-            (0, 0, 0)
+            // Empty products without an active bias do not read descriptors.
+            // In particular, beta=0 must not depend on cached bias state.
+            (0, 0, 0, None)
         };
         let total = elements as u64;
         let empty_product = 0.0 * self.alpha;
@@ -502,11 +511,14 @@ impl GemmKernel {
             .arg(&self.beta)
             .arg(&empty_product)
             .arg(&add_product);
-        // SAFETY: All pointers cover their validated shapes. The cache keeps
-        // the metadata live on the owning stream across this asynchronous read.
-        unsafe { builder.launch(cfg) }
-            .map(|_| ())
-            .map_err(|e| driver_err("launch gemm_bias_nd_f32", e))
+        // SAFETY: All pointers cover their validated shapes. The private
+        // candidate retains immutable metadata through asynchronous submission;
+        // native retirement preserves pending readers if submission fails.
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch gemm_bias_nd_f32", e))?;
+        if let Some(candidate) = candidate {
+            publish_metadata_candidate(&self.bias_metadata, candidate, "Gemm bias")?;
+        }
+        Ok(())
     }
 }
 
@@ -539,7 +551,7 @@ impl Kernel for GemmKernel {
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "per-call workspace allocation/free is not capturable",
+            "Gemm has no warmed capture contract for cuBLASLt and bias metadata; execute eagerly",
         )
     }
 }
@@ -610,5 +622,243 @@ mod tests {
     fn bias_strides_rejects_non_broadcastable() {
         let e = bias_strides(&[3, 4], 2, 4).unwrap_err();
         assert!(format!("{e}").contains("does not broadcast"), "{e}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    fn nd_bias_metadata_rewarm_is_transactional_and_inactive_bias_bypasses_cache() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider};
+        use onnx_runtime_ir::compute_contiguous_strides;
+
+        let ep =
+            crate::CudaExecutionProvider::new_default().expect("CUDA device must be available");
+        let runtime = ep.runtime();
+        runtime.set_defer_eager_sync(true);
+        let bias = ep.allocate(12, 256).unwrap();
+        let output = ep.allocate(32, 256).unwrap();
+        let values = [2_f32, 4., 8.];
+        // SAFETY: the live bias allocation covers these three f32 values.
+        unsafe {
+            runtime
+                .htod(
+                    std::slice::from_raw_parts(
+                        values.as_ptr().cast(),
+                        std::mem::size_of_val(&values),
+                    ),
+                    cuptr(bias.as_ptr()),
+                )
+                .unwrap();
+        }
+        let mut kernel = GemmKernel {
+            runtime: runtime.clone(),
+            alpha: 1.,
+            beta: 1.,
+            trans_a: false,
+            trans_b: false,
+            nd: true,
+            bias_metadata: Mutex::new(BroadcastMetadataCache::new(runtime.clone())),
+        };
+        // K=0 isolates descriptor preparation and the real Gemm empty-product
+        // epilogue without cuBLAS workspace/admission obscuring its counters.
+        let execute = |kernel: &GemmKernel, c_shape: Option<&[usize]>, empty: bool| {
+            let a_shape = if empty { [0, 2, 0] } else { [2, 2, 0] };
+            let b_shape = [0, 2];
+            let y_shape = if empty { [0, 2, 2] } else { [2, 2, 2] };
+            let a_strides = compute_contiguous_strides(&a_shape)
+                .expect("fixture shape has representable contiguous strides");
+            let b_strides = compute_contiguous_strides(&b_shape)
+                .expect("fixture shape has representable contiguous strides");
+            let y_strides = compute_contiguous_strides(&y_shape)
+                .expect("fixture shape has representable contiguous strides");
+            // A and B contain no elements and are never read. Their pointer
+            // borrows live backing rather than inventing a device address.
+            let mut inputs = vec![
+                TensorView::new(
+                    DevicePtr(output.as_ptr()),
+                    DataType::Float32,
+                    &a_shape,
+                    &a_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(output.as_ptr()),
+                    DataType::Float32,
+                    &b_shape,
+                    &b_strides,
+                    ep.device_id(),
+                ),
+            ];
+            let c_strides = c_shape.map(|shape| {
+                compute_contiguous_strides(shape)
+                    .expect("fixture shape has representable contiguous strides")
+            });
+            if let Some(shape) = c_shape {
+                inputs.push(TensorView::new(
+                    DevicePtr(bias.as_ptr()),
+                    DataType::Float32,
+                    shape,
+                    c_strides.as_ref().unwrap(),
+                    ep.device_id(),
+                ));
+            }
+            kernel.execute(
+                &inputs,
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_ptr().cast_mut()),
+                    DataType::Float32,
+                    &y_shape,
+                    &y_strides,
+                    ep.device_id(),
+                )],
+            )
+        };
+        let read = || {
+            let mut bytes = [0_u8; 32];
+            // SAFETY: the live output covers eight f32 values; dtoh drains its producer.
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap();
+            }
+            bytes
+                .chunks_exact(4)
+                .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let counts = || {
+            (
+                runtime.allocation_counts(),
+                runtime.transfer_counts(),
+                runtime.forced_synchronization_count(),
+            )
+        };
+        let a = [2_usize, 1, 1];
+        let b = [1_usize, 2, 1];
+        execute(&kernel, Some(&a), false).unwrap();
+        assert_eq!(read(), [2., 2., 2., 2., 4., 4., 4., 4.]);
+        let identity_a = kernel
+            .bias_metadata
+            .lock()
+            .unwrap()
+            .device_graph_resource()
+            .unwrap()
+            .identity();
+        let baseline = counts();
+        for _ in 0..8 {
+            execute(&kernel, Some(&a), false).unwrap();
+        }
+        assert_eq!(
+            counts(),
+            baseline,
+            "warm N-D bias must reuse its immutable descriptor"
+        );
+
+        let baseline = counts();
+        let error = execute(&kernel, Some(&[3]), false).unwrap_err().to_string();
+        assert!(error.contains("does not broadcast"), "{error}");
+        assert_eq!(
+            counts(),
+            baseline,
+            "invalid bias must fail before device mutation"
+        );
+        #[cfg(feature = "gpu-tests")]
+        {
+            runtime.fail_warm_transaction_at_for_test(1);
+            let error = execute(&kernel, Some(&b), false).unwrap_err().to_string();
+            assert!(
+                error.contains("injected staged warm-cache failure"),
+                "{error}"
+            );
+            assert_eq!(
+                kernel
+                    .bias_metadata
+                    .lock()
+                    .unwrap()
+                    .device_graph_resource()
+                    .unwrap()
+                    .identity(),
+                identity_a
+            );
+        }
+        ep.wait_for_deferred_releases().unwrap();
+        let baseline = counts();
+        execute(&kernel, Some(&a), false).unwrap();
+        assert_eq!(
+            counts(),
+            baseline,
+            "failed replacement must preserve warm A"
+        );
+        assert_eq!(read(), [2., 2., 2., 2., 4., 4., 4., 4.]);
+        execute(&kernel, Some(&b), false).unwrap();
+        assert_ne!(
+            kernel
+                .bias_metadata
+                .lock()
+                .unwrap()
+                .device_graph_resource()
+                .unwrap()
+                .identity(),
+            identity_a
+        );
+        assert_eq!(read(), [2., 2., 4., 4., 2., 2., 4., 4.]);
+        ep.wait_for_deferred_releases().unwrap();
+        let baseline = counts();
+        for _ in 0..8 {
+            execute(&kernel, Some(&b), false).unwrap();
+        }
+        assert_eq!(
+            counts(),
+            baseline,
+            "warm B must not upload or admit another descriptor"
+        );
+        let decline = kernel.capture_support();
+        assert!(!kernel.cuda_graph_compatible());
+        assert!(format!("{decline:?}").contains("execute eagerly"));
+        let error = runtime
+            .begin_graph_capture(&[&kernel])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rejected before begin_capture"), "{error}");
+        assert!(!runtime.is_capturing().unwrap());
+
+        // Poisoned inactive metadata must not make a no-bias/zero-beta Gemm
+        // depend on a descriptor it will never read.
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = kernel.bias_metadata.lock().unwrap();
+                panic!("fixture: poison bias metadata state");
+            }))
+            .is_err()
+        );
+        execute(&kernel, None, false).unwrap();
+        assert_eq!(read(), [0.; 8]);
+        kernel.beta = 0.;
+        execute(&kernel, Some(&a), false).unwrap();
+        assert_eq!(read(), [0.; 8]);
+        let baseline = counts();
+        execute(&kernel, None, true).unwrap();
+        assert_eq!(
+            counts(),
+            baseline,
+            "empty output must not touch metadata or device work"
+        );
+        kernel.beta = 1.;
+        let baseline = counts();
+        let error = execute(&kernel, Some(&a), false).unwrap_err().to_string();
+        assert!(
+            error.contains("bias metadata state is poisoned")
+                && error.contains("recreate the execution session"),
+            "{error}"
+        );
+        assert_eq!(
+            counts(),
+            baseline,
+            "active poisoned metadata must fail before preparation"
+        );
+        drop(kernel);
+        ep.wait_for_deferred_releases().unwrap();
+        ep.deallocate(bias).unwrap();
+        ep.deallocate(output).unwrap();
     }
 }

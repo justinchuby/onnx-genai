@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use onnx_runtime_ir::pattern::{MatchSession, Pattern};
-use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef};
+use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, ValueId};
 
 use crate::error::Result;
 use crate::pass::{OptimizationPass, PassContext};
@@ -154,16 +154,21 @@ impl FusionPattern {
 
     /// Find the first eligible occurrence by logical anchor ID.
     /// Invalid graphs, matcher errors and exhausted budgets propagate.
-    pub fn find_match(&self, graph: &Graph) -> Result<Option<PatternMatch>> {
+    pub fn find_match(&self, graph: &Graph, ctx: &PassContext) -> Result<Option<PatternMatch>> {
         Ok(self
-            .prepare_matches(graph)?
+            .prepare_matches(graph, ctx)?
             .pop_first()
             .map(|(_, matched)| matched))
     }
 
     #[cfg(test)]
-    fn try_match_at(&self, graph: &Graph, start: NodeId) -> Result<Option<PatternMatch>> {
-        Ok(self.prepare_matches(graph)?.remove(&start))
+    fn try_match_at(
+        &self,
+        graph: &Graph,
+        start: NodeId,
+        ctx: &PassContext,
+    ) -> Result<Option<PatternMatch>> {
+        Ok(self.prepare_matches(graph, ctx)?.remove(&start))
     }
 
     fn affected_candidate_starts(&self, graph: &Graph, matched: &PatternMatch) -> Vec<NodeId> {
@@ -195,11 +200,11 @@ impl FusionPattern {
         affected.into_iter().collect()
     }
 
-    fn match_is_fusable(&self, graph: &Graph, matched: &PatternMatch) -> bool {
+    fn match_is_fusable(&self, graph: &Graph, matched: &PatternMatch, ctx: &PassContext) -> bool {
         match self.kind {
-            RewriteKind::LayerNorm => self.layernorm_spec(graph, matched).is_some(),
-            RewriteKind::Attention => self.attention_spec(graph, matched).is_some(),
-            RewriteKind::Gelu => self.gelu_spec(graph, matched).is_some(),
+            RewriteKind::LayerNorm => self.layernorm_spec(graph, matched, ctx).is_some(),
+            RewriteKind::Attention => self.attention_spec(graph, matched, ctx).is_some(),
+            RewriteKind::Gelu => self.gelu_spec(graph, matched, ctx).is_some(),
             RewriteKind::Structural => {
                 !matches!(self.replacement.as_str(), "FusedMatMulBias" | "FusedGemm")
                     || self.matmul_bias_broadcast_ok(graph, matched)
@@ -230,14 +235,21 @@ impl FusionPattern {
     }
 
     /// Apply an eligible match without intervening graph mutation.
-    pub fn apply_fusion(&self, graph: &mut Graph, matched: &PatternMatch) -> Result<()> {
-        self.apply_fusion_returning_id(graph, matched).map(|_| ())
+    pub fn apply_fusion(
+        &self,
+        graph: &mut Graph,
+        matched: &PatternMatch,
+        ctx: &PassContext,
+    ) -> Result<()> {
+        self.apply_fusion_returning_id(graph, matched, ctx)
+            .map(|_| ())
     }
 
     fn apply_fusion_returning_id(
         &self,
         graph: &mut Graph,
         matched: &PatternMatch,
+        ctx: &PassContext,
     ) -> Result<NodeId> {
         let output = matched.output;
         let spec = match self.kind {
@@ -245,9 +257,9 @@ impl FusionPattern {
                 matched.external_inputs.iter().map(|&v| Some(v)).collect(),
                 HashMap::new(),
             )),
-            RewriteKind::LayerNorm => self.layernorm_spec(graph, matched),
-            RewriteKind::Attention => self.attention_spec(graph, matched),
-            RewriteKind::Gelu => self.gelu_spec(graph, matched),
+            RewriteKind::LayerNorm => self.layernorm_spec(graph, matched, ctx),
+            RewriteKind::Attention => self.attention_spec(graph, matched, ctx),
+            RewriteKind::Gelu => self.gelu_spec(graph, matched, ctx),
         };
         let (inputs, attributes) = spec.ok_or_else(|| {
             crate::error::OptimizerError::Fusion(format!(
@@ -280,7 +292,12 @@ impl FusionPattern {
         Ok(graph.insert_node(fused))
     }
 
-    fn layernorm_spec(&self, graph: &Graph, matched: &PatternMatch) -> Option<FusedNodeSpec> {
+    fn layernorm_spec(
+        &self,
+        graph: &Graph,
+        matched: &PatternMatch,
+        ctx: &PassContext,
+    ) -> Option<FusedNodeSpec> {
         let nodes = &matched.nodes;
         if nodes.len() != 9 && nodes.len() != 10 {
             return None;
@@ -315,32 +332,42 @@ impl FusionPattern {
         let eps = add_eps.input_values().find(|&v| v != var)?;
         let diff = sub.outputs.first().copied().flatten()?;
         let exponent = graph.node(nodes[2]).inputs.get(1).copied().flatten()?;
-        if read_scalar_const_f32(graph, exponent, diff) != Some(2.0) {
+        if read_scalar_const_f32(graph, exponent, diff, ctx) != Some(2.0) {
             return None;
         }
-        let epsilon = read_scalar_const_f32(graph, eps, var)?;
+        let epsilon = read_scalar_const_f32(graph, eps, var, ctx)?;
         // LayerNormalization reduces a suffix, whereas ReduceMean can reduce
-        // arbitrary axes. Its affine tensors must span that same suffix.
+        // arbitrary axes. Affine tensors must provably broadcast into X without expanding it.
         let input_shape = graph.value(x).tensor_shape()?;
-        let axis = reduce_suffix_axis(graph, mean, input_shape.len())?;
-        if reduce_suffix_axis(graph, variance, input_shape.len())? != axis {
+        let axis = reduce_suffix_axis(graph, mean, input_shape.len(), ctx)?;
+        if reduce_suffix_axis(graph, variance, input_shape.len(), ctx)? != axis {
             return None;
         }
         let start = usize::try_from(i64::try_from(input_shape.len()).ok()? + axis).ok()?;
-        let normalized_shape = &input_shape[start..];
-        let matches_affine = |value| {
-            graph.value(value).tensor_shape().is_some_and(|shape| {
-                // Leading singleton dimensions do not change the flattened
-                // coefficients, but must not expand the operand's rank.
-                shape.len() <= input_shape.len()
-                    && shape
-                        .iter()
-                        .skip_while(|dim| dim.as_static() == Some(1))
-                        .eq(normalized_shape
-                            .iter()
-                            .skip_while(|dim| dim.as_static() == Some(1)))
-            })
-        };
+        // The CPU normalization contract rejects zero width. Do not replace a
+        // decomposed graph unless this suffix is known to remain nonempty.
+        if !input_shape[start..].iter().all(|dim| match dim {
+            onnx_runtime_ir::Dim::Static(n) => *n > 0,
+            onnx_runtime_ir::Dim::Symbolic(id) => graph
+                .symbol_constraints
+                .get(id)
+                .and_then(|c| c.min)
+                .is_some_and(|min| min > 0),
+        }) {
+            return None;
+        }
+        let matches_affine =
+            |value| {
+                graph.value(value).tensor_shape().is_some_and(|shape| {
+                    // A rewrite needs proof, not runtime compatibility of unknown
+                    // dimensions. Identical symbols or a literal singleton prove
+                    // that this operand cannot expand X; unrelated symbols do not.
+                    shape.len() <= input_shape.len()
+                        && shape.iter().rev().zip(input_shape.iter().rev()).all(
+                            |(source, target)| source.as_static() == Some(1) || source == target,
+                        )
+                })
+            };
         if !matches_affine(scale) || !matches_affine(bias) {
             return None;
         }
@@ -351,7 +378,12 @@ impl FusionPattern {
         Some((vec![Some(x), Some(scale), Some(bias)], attributes))
     }
 
-    fn attention_spec(&self, graph: &Graph, matched: &PatternMatch) -> Option<FusedNodeSpec> {
+    fn attention_spec(
+        &self,
+        graph: &Graph,
+        matched: &PatternMatch,
+        ctx: &PassContext,
+    ) -> Option<FusedNodeSpec> {
         let nodes = &matched.nodes;
         let softmax = graph.node(*nodes.first()?);
         let rank = graph.value(softmax.inputs[0]?).shape.len();
@@ -364,7 +396,7 @@ impl FusionPattern {
             return None;
         }
         let scores = graph.node(nodes[1]).outputs[0]?;
-        let scale = matching::score_multiplier(graph, scores, graph.node(nodes[2]))?;
+        let scale = matching::score_multiplier(graph, scores, graph.node(nodes[2]), ctx)?;
         let masked = matched.external_inputs.len() == 4;
         let absorbed = nodes.len() == 4 + usize::from(masked) + 1;
         if absorbed && !matching::transpose_eligible(graph, graph.node(*nodes.last()?), nodes[1]) {
@@ -378,27 +410,32 @@ impl FusionPattern {
         Some((inputs, attributes))
     }
 
-    fn gelu_spec(&self, graph: &Graph, matched: &PatternMatch) -> Option<FusedNodeSpec> {
+    fn gelu_spec(
+        &self,
+        graph: &Graph,
+        matched: &PatternMatch,
+        ctx: &PassContext,
+    ) -> Option<FusedNodeSpec> {
         let nodes = &matched.nodes;
         let x = *matched.external_inputs.first()?;
         let inner = graph.node(nodes[1]);
         let add = graph.node(nodes[2]);
         let half = graph.node(nodes[4]);
-        if !matching::scaled_is(graph, inner, x, SQRT_2, FRAC_1_SQRT_2)
-            || !matching::scaled_is(graph, half, x, 2.0, 0.5)
+        if !matching::scaled_is(graph, inner, x, SQRT_2, FRAC_1_SQRT_2, ctx)
+            || !matching::scaled_is(graph, half, x, 2.0, 0.5, ctx)
         {
             return None;
         }
         let erf_out = graph.node(nodes[0]).outputs[0]?;
         let one = add.input_values().find(|&v| v != erf_out)?;
-        if !approx(read_scalar_const_f32(graph, one, erf_out)?, 1.0) {
+        if !approx(read_scalar_const_f32(graph, one, erf_out, ctx)?, 1.0) {
             return None;
         }
         Some((vec![Some(x)], HashMap::new()))
     }
 }
 
-fn reduce_suffix_axis(graph: &Graph, node: &Node, rank: usize) -> Option<i64> {
+fn reduce_suffix_axis(graph: &Graph, node: &Node, rank: usize, ctx: &PassContext) -> Option<i64> {
     match node.attr("keepdims") {
         None | Some(Attribute::Int(1)) => {}
         _ => return None,
@@ -406,7 +443,7 @@ fn reduce_suffix_axis(graph: &Graph, node: &Node, rank: usize) -> Option<i64> {
     let mut axes = if let Some(attribute) = node.attr("axes") {
         attribute.as_ints()?.to_vec()
     } else {
-        read_i64_vector(graph, node.inputs.get(1).copied().flatten()?)?
+        read_i64_vector(graph, node.inputs.get(1).copied().flatten()?, ctx)?
     };
     if axes.is_empty() {
         return None;
@@ -429,58 +466,64 @@ fn reduce_suffix_axis(graph: &Graph, node: &Node, rank: usize) -> Option<i64> {
     Some(-count)
 }
 
-fn read_i64_vector(graph: &Graph, value: ValueId) -> Option<Vec<i64>> {
+fn read_i64_vector(graph: &Graph, value: ValueId, ctx: &PassContext) -> Option<Vec<i64>> {
     if graph.inputs.contains(&value) {
         return None;
     }
-    if let Some(WeightRef::Inline(tensor)) = graph.initializers.get(&value) {
-        return i64_axes_from_tensor(tensor);
+    if let Some(weight) = graph.initializers.get(&value) {
+        return i64_axes_from_bytes(
+            weight.dtype(),
+            weight.dims(),
+            ctx.initializer_bytes(weight)?,
+        );
     }
     let node = graph.node(graph.value(value).producer?);
     if node.op_type != "Constant" || !onnx_runtime_ir::is_default_domain(&node.domain) {
         return None;
     }
     if let Some(Attribute::Tensor(tensor)) = node.attr("value") {
-        return i64_axes_from_tensor(tensor);
+        return i64_axes_from_bytes(tensor.dtype, &tensor.dims, &tensor.data);
     }
     node.attr("value_ints")
         .and_then(Attribute::as_ints)
         .map(<[i64]>::to_vec)
 }
 
-fn i64_axes_from_tensor(tensor: &TensorData) -> Option<Vec<i64>> {
-    if tensor.dtype != DataType::Int64 || !tensor.data.len().is_multiple_of(8) {
+fn i64_axes_from_bytes(dtype: DataType, dims: &[usize], data: &[u8]) -> Option<Vec<i64>> {
+    if dtype != DataType::Int64 || !data.len().is_multiple_of(8) {
         return None;
     }
-    let numel = tensor.data.len() / 8;
-    if tensor.dims.len() != 1 || tensor.dims[0] != numel {
+    let numel = data.len() / 8;
+    if dims.len() != 1 || dims[0] != numel {
         return None;
     }
-    tensor
-        .data
-        .chunks_exact(8)
+    data.chunks_exact(8)
         .map(|chunk| Some(i64::from_le_bytes(chunk.try_into().ok()?)))
         .collect()
 }
 
 /// Read one immutable f32 coefficient whose broadcast cannot expand the
 /// operand's rank. Unknown-rank operands require an actual rank-zero scalar.
-fn read_scalar_const_f32(graph: &Graph, value: ValueId, operand: ValueId) -> Option<f32> {
+fn read_scalar_const_f32(
+    graph: &Graph,
+    value: ValueId,
+    operand: ValueId,
+    ctx: &PassContext,
+) -> Option<f32> {
     if !graph.is_constant_initializer(value) {
         return None;
     }
-    let WeightRef::Inline(tensor) = graph.initializers.get(&value)? else {
-        return None;
-    };
-    if tensor.dtype != DataType::Float32
-        || tensor.checked_numel() != Some(1)
-        || tensor.data.len() != size_of::<f32>()
-        || (!tensor.dims.is_empty()
-            && tensor.dims.len() > graph.value(operand).tensor_shape()?.len())
+    let weight = graph.initializers.get(&value)?;
+    let data = ctx.initializer_bytes(weight)?;
+    if weight.dtype() != DataType::Float32
+        || onnx_runtime_ir::checked_numel(weight.dims()) != Some(1)
+        || data.len() != size_of::<f32>()
+        || (!weight.dims().is_empty()
+            && weight.dims().len() > graph.value(operand).tensor_shape()?.len())
     {
         return None;
     }
-    Some(f32::from_le_bytes(tensor.data.as_slice().try_into().ok()?))
+    Some(f32::from_le_bytes(data.try_into().ok()?))
 }
 
 fn is_last2_swap_perm(perm: &[i64]) -> bool {
@@ -540,13 +583,14 @@ impl OpFusion {
     fn run_resumable(
         &self,
         graph: &mut Graph,
+        ctx: &PassContext,
         mut observe_fusion: impl FnMut(&str, ScanCandidateSource, NodeId, &[NodeId], &[NodeId], NodeId),
     ) -> Result<()> {
         for pattern in &self.patterns {
             let candidates: Vec<u32> = graph.nodes.keys().map(|id| id.0).collect();
             let mut cursor = 0;
             let mut revisits = BTreeSet::new();
-            let mut prepared = pattern.prepare_matches(graph)?;
+            let mut prepared = pattern.prepare_matches(graph, ctx)?;
             let mut regions_by_node = index_region_nodes(&prepared);
             let mut invalidated = HashSet::new();
             loop {
@@ -574,7 +618,7 @@ impl OpFusion {
                 };
                 let start = NodeId(raw_id);
                 if invalidated.remove(&start) {
-                    prepared = pattern.prepare_matches(graph)?;
+                    prepared = pattern.prepare_matches(graph, ctx)?;
                     regions_by_node = index_region_nodes(&prepared);
                     invalidated.clear();
                 }
@@ -591,7 +635,7 @@ impl OpFusion {
                     }
                 }
                 let affected = pattern.affected_candidate_starts(graph, &matched);
-                let fused_id = pattern.apply_fusion_returning_id(graph, &matched)?;
+                let fused_id = pattern.apply_fusion_returning_id(graph, &matched, ctx)?;
                 observe_fusion(
                     pattern.pattern_name(),
                     source,
@@ -624,9 +668,10 @@ impl OpFusion {
     fn run_with_fusion_observer(
         &self,
         graph: &mut Graph,
+        ctx: &PassContext,
         observer: impl FnMut(&str, ScanCandidateSource, NodeId, &[NodeId], &[NodeId], NodeId),
     ) -> Result<()> {
-        self.run_resumable(graph, observer)
+        self.run_resumable(graph, ctx, observer)
     }
 }
 
@@ -634,8 +679,8 @@ impl OptimizationPass for OpFusion {
     fn name(&self) -> &str {
         "OpFusion"
     }
-    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> Result<()> {
-        self.run_resumable(graph, |_, _, _, _, _, _| {})
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> Result<()> {
+        self.run_resumable(graph, ctx, |_, _, _, _, _, _| {})
     }
 }
 

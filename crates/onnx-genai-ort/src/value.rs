@@ -2530,7 +2530,7 @@ mod argmax_tests {
 ///
 /// ```text
 /// $ort = "ort-gpu\onnxruntime-win-x64-gpu_cuda12-1.28.0"
-/// $env:ORT_ROOT = (Resolve-Path $ort)
+/// $env:ONNX_GENAI_ORT_LIB_DIR = (Resolve-Path "$ort\lib")
 /// $env:PATH = "$((Resolve-Path "$ort\lib"));$env:PATH"
 /// cargo test -p onnx-genai-ort --features cuda --lib -- --ignored --nocapture cuda_device_write
 /// ```

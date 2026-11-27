@@ -152,10 +152,20 @@ pub fn raw<T: Copy>(values: &[T]) -> Vec<u8> {
 
 /// Build a [`Tensor`] from typed scalar values.
 pub fn input<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
+    let bytes = raw(values);
+    let expected = dtype.storage_bytes(shape.iter().product());
+    assert_eq!(
+        bytes.len(),
+        expected,
+        "input fixture for {dtype:?} with shape {shape:?} must provide exactly {expected} storage bytes, got {} bytes from {} values of {}",
+        bytes.len(),
+        values.len(),
+        std::any::type_name::<T>(),
+    );
     Tensor {
         dtype,
         shape: shape.to_vec(),
-        bytes: raw(values),
+        bytes,
         absent: false,
     }
 }
@@ -384,7 +394,10 @@ pub fn try_run_cuda_with_origin_offset(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -415,7 +428,10 @@ pub fn try_run_cuda_with_origin_offset(
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_views = outputs
         .iter()
@@ -538,7 +554,10 @@ pub fn try_run_cpu(
         .unwrap();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -558,7 +577,10 @@ pub fn try_run_cpu(
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_bytes = outputs
         .iter()

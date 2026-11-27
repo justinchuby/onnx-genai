@@ -50,12 +50,75 @@ pub enum LoaderError {
     },
 
     #[error(
+        "illegal ai.onnx::Constant at node {node}: tensor attribute `value` has dtype {dtype:?} \
+         at opset {opset}, but it requires opset {minimum} or newer; re-export at a supported \
+         opset or change the value tensor's dtype"
+    )]
+    ConstantValueOpset {
+        node: String,
+        dtype: onnx_runtime_ir::DataType,
+        opset: u64,
+        minimum: u64,
+    },
+
+    #[error(
         "illegal ONNX Einsum at node {node}: {detail}. RULES #1: Einsum syntax, schema version, \
          homogeneous dtype, rank, diagonal, and broadcast constraints must be valid at model \
          load. Expected: fix the equation/input metadata or export with the applicable ai.onnx \
          opset (Einsum-12 for opsets 12..27; Einsum-28 for opset 28+)"
     )]
     InvalidEinsum { node: String, detail: String },
+
+    #[error("illegal ONNX model at node {node}: {detail}")]
+    InvalidTopK { node: String, detail: String },
+
+    #[error(
+        "illegal ONNX {op} at node {node}: input {input} has dtype {dtype:?}, which is not \
+         admitted at opset {opset}; export with opset {since} or newer, or use an input dtype \
+         supported at opset {opset}"
+    )]
+    ShapeSizeDtypeBeforeOpset {
+        op: String,
+        node: String,
+        input: String,
+        dtype: onnx_runtime_ir::DataType,
+        opset: u64,
+        since: u64,
+    },
+
+    #[error(
+        "illegal ONNX {op} at node {node}: {slot} dtype {dtype:?} is not valid at opset \
+         {opset}; use opset {since} or newer"
+    )]
+    InvalidShapeOnlyDtype {
+        node: String,
+        op: String,
+        slot: &'static str,
+        dtype: onnx_runtime_ir::DataType,
+        opset: u64,
+        since: u64,
+    },
+
+    #[error(
+        "illegal ONNX SplitToSequence at node {node}: {detail}. RULES #1: the input tensor dtype \
+         must match the schema selected by the imported ai.onnx opset. Expected: use an ai.onnx \
+         opset whose SplitToSequence schema admits the input dtype, or cast the input to a dtype \
+         admitted by the selected schema"
+    )]
+    InvalidSplitToSequence { node: String, detail: String },
+
+    #[error(
+        "illegal ONNX Compress at node {node}: {port} dtype {dtype:?} is not admitted by \
+         Compress-{schema} (effective ai.onnx opset {opset}). Cast the data and output to a \
+         dtype supported by this schema, or export with ai.onnx opset 28+ for BFloat16"
+    )]
+    InvalidCompressDtype {
+        node: String,
+        port: &'static str,
+        dtype: onnx_runtime_ir::DataType,
+        schema: u64,
+        opset: u64,
+    },
 
     #[error(
         "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \

@@ -2,7 +2,7 @@
 # dependencies and are discovered without loading their Python packages.
 # Standard wheel: abi3-py310, built on CPython 3.12.
 [build-system]
-requires = ["maturin>=1.7,<2"]
+requires = ["maturin>=1.14.1,<2"]
 build-backend = "maturin"
 
 [project]
@@ -40,6 +40,8 @@ onnx-genai = "onnx_genai_server:main"
 repository = "https://github.com/justinchuby/onnx-genai"
 
 [tool.maturin]
+# Embed the maintained MPL reader's exact build-source snapshot, not a second source tree.
+include = [{ path = "onnx-genai-symphonia-mkv-*/**/*", from = "out-dir", to = "onnx_genai_server/_third_party", crate_name = "onnx-genai-symphonia-mkv" }]
 # Mixed layout: the Python launcher package lives in python/onnx_genai_server and
 # the compiled CLI is installed as its private `_onnx_genai_server` submodule.
 python-source = "python"

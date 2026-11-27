@@ -524,7 +524,7 @@ fn insert_op(
     graph.insert_node(node);
 }
 
-fn tiny_decoder(last_token_logits: bool) -> InferenceSession {
+pub(super) fn tiny_decoder(last_token_logits: bool) -> InferenceSession {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 11);
     let batch = graph.intern_symbol("batch");
@@ -1512,7 +1512,7 @@ fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
     assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
-fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
+pub(super) fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
     DecoderAbi {
         sequence_source: Some(sequence_source),
         kv_ownership: Some(KvOwnership::Owned),
@@ -1538,7 +1538,7 @@ fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
     }
 }
 
-fn tiny_decoder_io() -> DecoderAbi {
+pub(super) fn tiny_decoder_io() -> DecoderAbi {
     DecoderAbi {
         sequence_source: Some(SequenceInputKind::TokenIds),
         kv_ownership: Some(KvOwnership::Owned),
@@ -1575,7 +1575,7 @@ fn native_decoder_requires_explicit_ambiguous_io() {
     assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
-fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
+pub(super) fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 11);
     let batch = graph.intern_symbol("batch");
@@ -2280,8 +2280,8 @@ fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Re
 
     const PROMPT: [TokenId; 3] = [5, 7, 9];
     let advance =
-        |session: &mut NativeDecodeSession, tokens: &[TokenId]| -> anyhow::Result<Vec<Vec<f32>>> {
-            let mut logits = Vec::new();
+        |session: &mut NativeDecodeSession, tokens: &[TokenId]| -> anyhow::Result<LogitsBatch> {
+            let mut logits = LogitsBatch::empty();
             for &token in tokens {
                 logits = session.decode(&[token], session.current_len())?;
             }
@@ -2630,8 +2630,8 @@ fn native_cuda_compressed_state_group_restore_is_atomic_first_middle_last() -> a
     fn advance(
         session: &mut NativeDecodeSession,
         tokens: &[TokenId],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let mut logits = Vec::new();
+    ) -> anyhow::Result<LogitsBatch> {
+        let mut logits = LogitsBatch::empty();
         for &token in tokens {
             logits = session.decode(&[token], session.current_len())?;
         }
@@ -2924,7 +2924,10 @@ fn native_target_step_preserves_token_driven_binding() {
     );
 
     let logits = session.decode(&[3, 5], 0).expect("token target step");
-    assert_eq!(logits, vec![vec![3.0], vec![5.0]]);
+    assert_eq!(
+        logits,
+        LogitsBatch::from_host_rows(vec![vec![3.0], vec![5.0]])
+    );
 }
 
 #[test]
@@ -2950,7 +2953,10 @@ fn native_target_step_binds_declared_inputs_embeds_instead_of_tokens() {
     let logits = session
         .decode_with_step_inputs(&[101, 102], 0, &[("embedded_sequence".into(), embeddings)])
         .expect("embedding target step");
-    assert_eq!(logits, vec![vec![1.25], vec![2.5]]);
+    assert_eq!(
+        logits,
+        LogitsBatch::from_host_rows(vec![vec![1.25], vec![2.5]])
+    );
 }
 
 #[test]
@@ -2983,7 +2989,10 @@ fn native_target_step_resolves_routed_component_output_by_declared_port() {
             ],
         )
         .expect("routed target step");
-    assert_eq!(logits, vec![vec![11.0], vec![22.0]]);
+    assert_eq!(
+        logits,
+        LogitsBatch::from_host_rows(vec![vec![11.0], vec![22.0]])
+    );
 }
 
 #[test]
@@ -3718,11 +3727,11 @@ fn native_decode_accepts_last_token_only_logits_and_advances_kv() {
     .expect("load decoder");
 
     let logits = session.decode(&[1, 2, 3], 0).expect("prefill");
-    assert_eq!(logits, vec![vec![10.0, 20.0]]);
+    assert_eq!(logits, LogitsBatch::from_host_rows(vec![vec![10.0, 20.0]]));
     assert_eq!(session.current_len(), 3);
 
     let logits = session.decode(&[4], 3).expect("decode");
-    assert_eq!(logits, vec![vec![10.0, 20.0]]);
+    assert_eq!(logits, LogitsBatch::from_host_rows(vec![vec![10.0, 20.0]]));
     assert_eq!(session.current_len(), 4);
 }
 
@@ -4203,7 +4212,7 @@ fn tiny_decoder_matches_across_inplace_env_toggle() {
     let _guard = env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let run = |value: &str| -> Vec<Vec<f32>> {
+    let run = |value: &str| -> LogitsBatch {
         // SAFETY: serialized by `env_lock`; restored below.
         unsafe { std::env::set_var("ONNX_GENAI_CPU_INPLACE_KV", value) };
         let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
@@ -4215,9 +4224,7 @@ fn tiny_decoder_matches_across_inplace_env_toggle() {
         let prefill = session.decode(&[1, 2, 3], 0).expect("prefill");
         let step = session.decode(&[4], 3).expect("decode step");
         unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };
-        let mut rows = prefill;
-        rows.extend(step);
-        rows
+        LogitsBatch::from_rows(prefill.into_iter().chain(step).collect())
     };
     let on = run("1");
     let off = run("0");
@@ -4611,7 +4618,12 @@ fn low_rank_carries_never_enter_token_prefix_slicing() -> anyhow::Result<()> {
             ]);
 
             for target in [1usize, 2, 3] {
-                let staged = backend::stage_host_prefix_rewind(&past, &skip_names, target)?;
+                let staged = backend::stage_host_prefix_rewind(
+                    &past,
+                    &skip_names,
+                    target,
+                    &onnx_runtime_session::HostTensorAllocator::standalone(),
+                )?;
                 assert_eq!(staged.len(), 1, "rank {carry_shape:?}, target {target}");
                 assert_eq!(staged[0].0, "dense_kv");
                 assert_eq!(staged[0].1.shape, vec![1, 1, target, 1]);
@@ -4631,7 +4643,12 @@ fn low_rank_carries_never_enter_token_prefix_slicing() -> anyhow::Result<()> {
                 "past_carry".to_string(),
                 Tensor::from_f32(&carry_shape, &vec![999.0; carry_values.len()])?,
             );
-            let staged = backend::stage_host_prefix_rewind(&past, &skip_names, 2)?;
+            let staged = backend::stage_host_prefix_rewind(
+                &past,
+                &skip_names,
+                2,
+                &onnx_runtime_session::HostTensorAllocator::standalone(),
+            )?;
             for (name, tensor) in staged {
                 past.insert(name, tensor);
             }
@@ -4996,7 +5013,7 @@ fn cpu_kv_snapshot_restores_live_rows_after_overwrite_and_growth() -> anyhow::Re
         bytes,
         "snapshot only owns live rows, not capacity"
     );
-    let snapshot = state.snapshot()?;
+    let snapshot = state.snapshot(&session.host_tensor_allocator()?)?;
     for index in 0..2 {
         state.binding_for_test(index).write_bytes(
             0,
@@ -5052,7 +5069,7 @@ fn cpu_kv_snapshot_preflights_every_binding_before_writing() -> anyhow::Result<(
         capacity,
         live,
     )
-    .snapshot()?;
+    .snapshot(&session.host_tensor_allocator()?)?;
     let mut different = pairs;
     different[1] = ("present.other".to_string(), "past.other".to_string());
     let bindings = different

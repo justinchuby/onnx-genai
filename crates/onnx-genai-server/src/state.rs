@@ -386,6 +386,7 @@ fn parse_native_cuda_device(_index: Option<u32>) -> Result<NativeDecodeDevice, S
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) registry: ModelRegistry,
+    pub(crate) model_manager: Option<crate::model_management::ModelManager>,
     pub(crate) replays: crate::replay::ReplayRegistry,
     pub(crate) sessions: SessionRegistry,
     pub(crate) completion_controls: crate::completion_control::CompletionControls,
@@ -427,18 +428,44 @@ fn hex(bytes: &[u8]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub sse_ping_interval: crate::SsePingInterval,
+    pub api_keys: crate::ApiKeys,
+    pub cors: crate::CorsPolicy,
     /// Node-level identifier reported by `GET /v1/status` for the cluster router
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    pub max_transcription_input_tokens: std::num::NonZeroUsize,
+    pub max_transcription_prompt_bytes: std::num::NonZeroUsize,
+    pub max_transcription_template_operations: std::num::NonZeroU64,
+    pub max_transcription_frames: std::num::NonZeroUsize,
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio decode.
+    pub max_decoded_audio_bytes: std::num::NonZeroUsize,
+    pub max_transcription_text_bytes: std::num::NonZeroUsize,
+    pub realtime: crate::realtime::RealtimeLimits,
     /// Enable the upstream POST /props acknowledgement; no mutation schema exists upstream.
     pub endpoint_props: bool,
+    /// Enable owned Hub package downloads and deletion in this directory.
+    pub model_cache_dir: Option<std::path::PathBuf>,
+    pub model_cache_max_bytes: std::num::NonZeroU64,
+    pub model_cache_max_files: std::num::NonZeroUsize,
+    pub model_cache_max_models: std::num::NonZeroUsize,
+    pub model_downloads: std::num::NonZeroUsize,
+
     /// Maximum completion prompts admitted by one native or OpenAI request.
     pub max_completion_prompts: std::num::NonZeroUsize,
+    pub max_infill_files: std::num::NonZeroUsize,
+    pub max_infill_filename_bytes: std::num::NonZeroUsize,
+    pub max_infill_context_bytes: std::num::NonZeroUsize,
+    pub max_infill_template_operations: std::num::NonZeroU64,
     /// Per query/document pair input budget for non-generative scoring.
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
     pub max_rerank_documents: std::num::NonZeroUsize,
+    /// Unique encoded image bytes retained by one reranking request.
+    pub max_rerank_media_bytes: std::num::NonZeroUsize,
+    /// Unique encoded image bytes retained by one SystemOne request.
+    pub max_decision_media_bytes: std::num::NonZeroUsize,
     /// Maximum tokens per decision prompt variant.
     pub max_decision_input_tokens: std::num::NonZeroUsize,
     /// Maximum rendered prompt bytes before decision tokenization.
@@ -502,15 +529,51 @@ impl Default for ServerConfig {
     fn default() -> Self {
         let decision = onnx_genai_engine::decision::DecisionLimits::default();
         Self {
+            sse_ping_interval: crate::SsePingInterval::default(),
+            api_keys: crate::ApiKeys::default(),
+            cors: crate::CorsPolicy::default(),
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            realtime: crate::realtime::RealtimeLimits::default(),
             endpoint_props: false,
+            model_cache_dir: None,
+            model_cache_max_bytes: std::num::NonZeroU64::new(64 * 1024 * 1024 * 1024).unwrap(),
+            model_cache_max_files: std::num::NonZeroUsize::new(4096).unwrap(),
+            model_cache_max_models: std::num::NonZeroUsize::new(128).unwrap(),
+            model_downloads: std::num::NonZeroUsize::new(2).unwrap(),
             max_completion_prompts: std::num::NonZeroUsize::new(128)
                 .expect("positive native prompt budget"),
+            max_infill_files: std::num::NonZeroUsize::new(128).expect("positive infill file limit"),
+            max_infill_filename_bytes: std::num::NonZeroUsize::new(4096)
+                .expect("positive infill filename limit"),
+            max_infill_context_bytes: std::num::NonZeroUsize::new(8 * 1024 * 1024)
+                .expect("positive infill context limit"),
+            max_infill_template_operations: std::num::NonZeroU64::new(100_000)
+                .expect("positive infill operation limit"),
             max_rerank_input_tokens: std::num::NonZeroUsize::new(8192)
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)
                 .expect("positive default reranking document budget"),
+            max_rerank_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_decision_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_transcription_input_tokens:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .max_input_tokens,
+            max_transcription_prompt_bytes:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_output_bytes,
+            max_transcription_template_operations:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_operations,
+            max_decoded_audio_bytes:
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY
+                    .max_decoded_bytes,
+            max_transcription_frames:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames,
+            max_transcription_text_bytes:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes,
             max_decision_input_tokens: decision.max_input_tokens,
             max_decision_prompt_bytes: decision.template.max_output_bytes,
             max_decision_template_operations: decision.template.max_operations,
@@ -544,6 +607,14 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(mut self) -> anyhow::Result<Self> {
+        self.engine_config.audio_decode_limits = onnx_genai_preprocess::audio::AudioDecodeLimits {
+            max_decoded_bytes: self.max_decoded_audio_bytes,
+        };
+        anyhow::ensure!(
+            self.model_downloads.get() <= tokio::sync::Semaphore::MAX_PERMITS,
+            "--model-downloads exceeds the supported concurrency bound {}; choose a smaller positive value",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
         if self.slot_save_path.is_some()
             && self.engine_config.native_state_files
                 == onnx_genai_engine::NativeStateFilePolicy::Disabled
@@ -567,6 +638,11 @@ impl ServerConfig {
         );
         if self.node_id.trim().is_empty() {
             anyhow::bail!("node_id must not be empty");
+        }
+        if self.realtime.source_bytes.get() < 2 || self.realtime.write_timeout.is_zero() {
+            anyhow::bail!(
+                "realtime limits require source_bytes >= 2 and a positive write_timeout; allow at least one PCM16 sample and a bounded websocket writer"
+            );
         }
         if self.max_output_tokens == 0 {
             anyhow::bail!("max_output_tokens must be greater than zero");
@@ -600,43 +676,14 @@ impl AppState {
         model_id: Option<String>,
         config: ServerConfig,
     ) -> anyhow::Result<Self> {
-        let config = config.validate()?;
-        let slot_storage = config
-            .slot_save_path
-            .as_ref()
-            .map(|path| {
-                crate::slot_storage::SlotStorage::open(
-                    path,
-                    crate::slot_storage::SlotStorageLimits {
-                        file_bytes: config.slot_save_max_file_bytes.get(),
-                        total_bytes: config.slot_save_max_total_bytes.get(),
-                        files: config.slot_save_max_files.get(),
-                    },
-                )
-                .map(Arc::new)
-            })
-            .transpose()?;
-        let model_id = model_id.unwrap_or_else(|| infer_model_id(model_dir));
         let spec = ModelSpec {
-            id: model_id,
+            package_variant: None,
+            id: model_id.unwrap_or_else(|| infer_model_id(model_dir)),
             path: model_dir.to_path_buf(),
             eager: true,
             warmup: false,
         };
-        let registry = ModelRegistry::from_specs(std::slice::from_ref(&spec), config.clone())?;
-        Ok(Self {
-            registry,
-            slot_storage,
-            replays: crate::replay::ReplayRegistry::new(
-                config.max_replay_streams,
-                config.replay_buffer_bytes,
-            ),
-            sessions: SessionRegistry::new(config.max_sessions),
-            completion_controls: crate::completion_control::CompletionControls::new(
-                config.max_queue_depth,
-            ),
-            config,
-        })
+        Self::load_from_specs(vec![spec], config)
     }
 
     /// Load multiple models from a list of `ModelSpec`s and build a multi-entry registry.
@@ -646,10 +693,14 @@ impl AppState {
     /// on first request.  The first spec becomes the default model.
     ///
     /// Fails fast if any eager spec fails to load.
-    pub fn load_from_specs(specs: Vec<ModelSpec>, config: ServerConfig) -> anyhow::Result<Self> {
-        if specs.is_empty() {
-            anyhow::bail!("at least one model spec is required");
-        }
+    pub fn load_from_specs(
+        mut specs: Vec<ModelSpec>,
+        config: ServerConfig,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !specs.is_empty() || config.model_cache_dir.is_some(),
+            "at least one model spec or --model-cache-dir is required; configure a model or start a managed download catalog"
+        );
         let config = config.validate()?;
         let slot_storage = config
             .slot_save_path
@@ -666,9 +717,41 @@ impl AppState {
                 .map(Arc::new)
             })
             .transpose()?;
-        let registry = ModelRegistry::from_specs(&specs, config.clone())?;
+        let mut cached = Vec::new();
+        let mut pending = Vec::new();
+        let cache = if let Some(path) = &config.model_cache_dir {
+            let (cache, published, transfers) = crate::model_cache::ModelCache::open(
+                path,
+                crate::model_cache::CacheLimits {
+                    bytes: config.model_cache_max_bytes.get(),
+                    files: config.model_cache_max_files.get(),
+                    models: config.model_cache_max_models.get(),
+                },
+            )?;
+            for spec in &mut specs {
+                spec.path = cache.resolve_configured_path(&spec.path)?;
+            }
+            cached = published;
+            pending = transfers;
+            Some(cache)
+        } else {
+            None
+        };
+        let registry = ModelRegistry::from_sources(&specs, cached, config.clone())?;
+        let model_manager = cache
+            .map(|cache| {
+                crate::model_management::ModelManager::new(
+                    cache,
+                    registry.clone(),
+                    pending,
+                    config.model_downloads.get(),
+                )
+            })
+            .transpose()?;
+
         Ok(Self {
             registry,
+            model_manager,
             slot_storage,
             replays: crate::replay::ReplayRegistry::new(
                 config.max_replay_streams,
@@ -719,41 +802,56 @@ struct LoadedPromptContracts {
     response_template: Option<Arc<response_template::ResponseTemplate>>,
 }
 
-fn load_prompt_contracts(model_dir: &Path) -> anyhow::Result<LoadedPromptContracts> {
-    let path = model_dir.join("tokenizer_config.json");
-    let config = match std::fs::read_to_string(&path) {
-        Ok(text) => Some(
-            serde_json::from_str::<serde_json::Value>(&text).with_context(|| {
-                format!(
-                    "invalid tokenizer configuration {}; repair this JSON file",
-                    path.display()
-                )
-            })?,
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "read tokenizer configuration {}; repair the path and read permissions",
-                    path.display()
-                )
-            });
+fn load_prompt_contracts(roots: &[&Path]) -> anyhow::Result<LoadedPromptContracts> {
+    let mut configs = Vec::new();
+    for &root in roots {
+        if configs.iter().any(|(previous, _)| *previous == root) {
+            continue;
         }
-    };
-    let chat_template = ChatTemplate::from_model_assets(model_dir, config.as_ref())
-        .with_context(|| format!("load chat templates in {}", model_dir.display()))?;
-    let response_template = config
-        .as_ref()
-        .and_then(|value| value.get("response_template"))
-        .filter(|value| !value.is_null())
-        .map(response_template::ResponseTemplate::compile)
-        .transpose()
-        .with_context(|| {
-            format!(
-                "compile response_template in {}; repair its declared boundaries",
-                path.display()
-            )
-        })?;
+        let path = root.join("tokenizer_config.json");
+        let config = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(
+                serde_json::from_str::<serde_json::Value>(&text).with_context(|| {
+                    format!(
+                        "invalid tokenizer configuration {}; repair this JSON file",
+                        path.display()
+                    )
+                })?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "read tokenizer configuration {}; repair the path and read permissions",
+                        path.display()
+                    )
+                });
+            }
+        };
+        configs.push((root, config));
+    }
+    let mut chat_template = None;
+    let mut response_template = None;
+    for (root, config) in &configs {
+        if chat_template.is_none() {
+            chat_template = ChatTemplate::from_model_assets(root, config.as_ref())
+                .with_context(|| format!("load chat templates in {}", root.display()))?;
+        }
+        if response_template.is_none() {
+            response_template = config
+                .as_ref()
+                .and_then(|value| value.get("response_template"))
+                .filter(|value| !value.is_null())
+                .map(response_template::ResponseTemplate::compile)
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "compile response_template in {}; repair its declared boundaries",
+                        root.display()
+                    )
+                })?;
+        }
+    }
     Ok(LoadedPromptContracts {
         chat_template,
         response_template,
@@ -846,26 +944,51 @@ pub(crate) fn build_handle_with_authorities(
     config: &ServerConfig,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
+    let mut selected_config = config.clone();
+    if spec.package_variant.is_some() {
+        selected_config.engine_config.package_variant = spec.package_variant.clone();
+    }
+    let config = &selected_config;
+    let selection = onnx_genai_ort::ModelPackageSelection {
+        variant: config.engine_config.package_variant.clone(),
+        ..Default::default()
+    };
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
-    let prompt_contracts = load_prompt_contracts(model_dir)?;
+    let package = if onnx_genai_ort::is_model_package_directory(model_dir) {
+        Some(
+            ModelDirectory::load_with_package_selection(model_dir, &selection)
+                .context("resolve model-package variant before loading its serving contracts")?,
+        )
+    } else {
+        None
+    };
+    let asset_root = package
+        .as_ref()
+        .map_or(model_dir, |directory| directory.root.as_path());
+    let tokenizer_root = package
+        .as_ref()
+        .and_then(|directory| directory.tokenizer_path.parent())
+        .unwrap_or(asset_root);
+    let prompt_contracts = load_prompt_contracts(&[asset_root, tokenizer_root])?;
     // Every package declares a workflow, including a single decoder — so
     // "declares a workflow" no longer distinguishes a composed pipeline. Layer
     // 1 of the shared classification answers "does this package need multimodal
     // input specs". The engine's executor choice reads layer 2 of the *same*
     // classification — layer 1 plus the decode contract — so it can never
     // route a package this call classifies as composed.
-    if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
-        .filter(|directory| {
-            !directory
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.pipeline.as_ref())
-                .is_some_and(|pipeline| {
-                    onnx_genai_metadata::is_single_decoder_workflow(&pipeline.workflow)
-                })
-        })
+    if let Some(directory) =
+        PipelineModelDirectory::load_if_declared_with_selection(model_dir, &selection)
+            .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
+            .filter(|directory| {
+                !directory
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.pipeline.as_ref())
+                    .is_some_and(|pipeline| {
+                        onnx_genai_metadata::is_single_decoder_workflow(&pipeline.workflow)
+                    })
+            })
     {
         onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
         // The directory already parsed this package's metadata; re-reading it
@@ -885,8 +1008,11 @@ pub(crate) fn build_handle_with_authorities(
             authorities,
         );
     }
-    let model_directory = ModelDirectory::load(model_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?;
+    let model_directory = match package {
+        Some(directory) => directory,
+        None => ModelDirectory::load_with_package_selection(model_dir, &selection)
+            .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?,
+    };
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
     let (tool_protocol, tool_protocol_metadata_path) =
         load_tool_protocol(model_directory.metadata_path.as_deref())?;
@@ -1254,7 +1380,7 @@ mod prompt_contract_tests {
     #[test]
     fn absent_contracts_remain_absent_and_literal_channels_are_loaded() {
         let dir = tempfile::tempdir().unwrap();
-        let contracts = load_prompt_contracts(dir.path()).unwrap();
+        let contracts = load_prompt_contracts(&[dir.path()]).unwrap();
         assert!(contracts.chat_template.is_none());
         assert!(contracts.response_template.is_none());
         std::fs::write(
@@ -1270,7 +1396,7 @@ mod prompt_contract_tests {
             .to_string(),
         )
         .unwrap();
-        let contracts = load_prompt_contracts(dir.path()).unwrap();
+        let contracts = load_prompt_contracts(&[dir.path()]).unwrap();
         assert!(contracts.chat_template.is_some());
         assert!(contracts.response_template.is_some());
     }
@@ -1279,10 +1405,10 @@ mod prompt_contract_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokenizer_config.json");
         std::fs::write(&path, "{").unwrap();
-        let error = load_prompt_contracts(dir.path()).err().unwrap();
+        let error = load_prompt_contracts(&[dir.path()]).err().unwrap();
         assert!(format!("{error:#}").contains("tokenizer_config.json"));
         std::fs::write(&path, r#"{"response_template":{"fields":{}}}"#).unwrap();
-        let error = load_prompt_contracts(dir.path()).err().unwrap();
+        let error = load_prompt_contracts(&[dir.path()]).err().unwrap();
         assert!(format!("{error:#}").contains("response_template"));
     }
 }

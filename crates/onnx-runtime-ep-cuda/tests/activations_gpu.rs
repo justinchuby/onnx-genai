@@ -14,6 +14,11 @@
 )]
 //! GPU-vs-CPU checks for the CUDA Wave-4 activation kernels.
 
+mod common;
+
+use common::{
+    assert_close as assert_typed_close, decode_floats, float_input, require_cuda, run_cuda,
+};
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -40,7 +45,8 @@ fn run(
     let rt = ep.runtime();
     let dev: DeviceId = ep.device_id();
     let shape = [x.len()];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let x_buf = ep.allocate(std::mem::size_of_val(x), 256).unwrap();
     let mut y_buf = ep.allocate(std::mem::size_of_val(x), 256).unwrap();
     // SAFETY: x_buf was allocated for exactly this byte slice.
@@ -126,6 +132,7 @@ fn wave4_activations_match_cpu_references() {
                 "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
             );
         }
+
         Err(_) => {
             eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
             panic!(
@@ -174,6 +181,64 @@ fn wave4_activations_match_cpu_references() {
             }
         }),
     );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn opset_22_activations_match_independent_bf16_goldens() {
+    let ep = require_cuda();
+    let dtype = DataType::BFloat16;
+    let values: [f32; 5] = [-2.0, -0.5, 0.0, 0.5, 2.0];
+    let cases = [
+        (
+            "Elu",
+            vec![("alpha", Attribute::Float(1.0))],
+            values
+                .map(|x| if x >= 0.0 { x } else { x.exp_m1() })
+                .to_vec(),
+        ),
+        (
+            "HardSigmoid",
+            vec![
+                ("alpha", Attribute::Float(0.2)),
+                ("beta", Attribute::Float(0.5)),
+            ],
+            values.map(|x| (0.2 * x + 0.5).clamp(0.0, 1.0)).to_vec(),
+        ),
+        (
+            "Selu",
+            vec![],
+            values
+                .map(|x| 1.050701 * if x >= 0.0 { x } else { 1.6732632 * x.exp_m1() })
+                .to_vec(),
+        ),
+        (
+            "Softplus",
+            vec![],
+            values.map(|x| (1.0 + x.exp()).ln()).to_vec(),
+        ),
+        (
+            "Softsign",
+            vec![],
+            values.map(|x| x / (1.0 + x.abs())).to_vec(),
+        ),
+    ];
+
+    for (op, attrs, expected) in cases {
+        let inputs = [float_input(dtype, &[values.len()], &values)];
+        let outputs = [(dtype, vec![values.len()])];
+        let actual = run_cuda(&ep, op, "", 22, &inputs, &outputs, &attrs);
+        assert_typed_close(
+            op,
+            dtype,
+            &decode_floats(&actual[0], dtype),
+            &expected,
+            0.02,
+        );
+    }
 }
 
 #[cfg_attr(

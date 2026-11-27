@@ -132,7 +132,10 @@ fn run(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -157,7 +160,10 @@ fn run(
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_views = outputs
         .iter()
@@ -255,7 +261,10 @@ fn with_warmed_capture(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -280,7 +289,10 @@ fn with_warmed_capture(
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let workspace = std::cell::RefCell::new(None);
     let execute =
@@ -458,7 +470,10 @@ fn run_cpu(
         .unwrap();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -475,7 +490,10 @@ fn run_cpu(
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_bytes = outputs
         .iter()
@@ -521,13 +539,6 @@ fn f16s(bytes: &[u8]) -> Vec<f16> {
         .collect()
 }
 
-fn bf16s(bytes: &[u8]) -> Vec<bf16> {
-    bytes
-        .chunks_exact(2)
-        .map(|v| bf16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())))
-        .collect()
-}
-
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -544,7 +555,7 @@ fn topk_non_final_axes_match_cpu_layout_and_are_deterministic() {
                     &[3, 4],
                     &[5_f32, 1., 7., 2., 5., 4., 6., 9., 3., 4., 8., 9.],
                 ),
-                tensor(DataType::Int64, &[], &[2_i64]),
+                tensor(DataType::Int64, &[1], &[2_i64]),
             ],
             &[
                 (DataType::Float32, vec![2, 4]),
@@ -568,7 +579,7 @@ fn topk_non_final_axes_match_cpu_layout_and_are_deterministic() {
                     &[2, 3, 2],
                     &[1_f32, 9., 5., 9., 5., 2., 7., 4., 6., 8., 7., 8.],
                 ),
-                tensor(DataType::Int64, &[], &[2_i64]),
+                tensor(DataType::Int64, &[1], &[2_i64]),
             ],
             &[
                 (DataType::Float32, vec![2, 2, 2]),
@@ -594,7 +605,7 @@ fn topk_largest_ties_k_input() {
         10,
         &[
             tensor(DataType::Float32, &[4], &[4_f32, 5., 5., 2.]),
-            tensor(DataType::Int64, &[], &[2_i64]),
+            tensor(DataType::Int64, &[1], &[2_i64]),
         ],
         &[(DataType::Float32, vec![2]), (DataType::Int64, vec![2])],
         &[],
@@ -617,7 +628,7 @@ fn topk_deepseek_router_k6_of_64_is_deterministic() {
         10,
         &[
             tensor(DataType::Float32, &[1, 64], &values),
-            tensor(DataType::Int64, &[], &[6_i64]),
+            tensor(DataType::Int64, &[1], &[6_i64]),
         ],
         &[
             (DataType::Float32, vec![1, 6]),
@@ -634,14 +645,14 @@ fn topk_deepseek_router_k6_of_64_is_deterministic() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn topk_fp16_and_bf16_router_values_match_cpu_order() {
+fn topk_fp16_router_values_match_cpu_order() {
     let input = [4.0_f32, 7.0, 7.0, -2.0, 6.0];
     let expected_indices = vec![1, 2, 4];
 
     let fp16_input = input.map(f16::from_f32);
     let fp16_inputs = [
         tensor(DataType::Float16, &[1, 5], &fp16_input),
-        tensor(DataType::Int64, &[], &[3_i64]),
+        tensor(DataType::Int64, &[1], &[3_i64]),
     ];
     let fp16_outputs = [
         (DataType::Float16, vec![1, 3]),
@@ -658,30 +669,43 @@ fn topk_fp16_and_bf16_router_values_match_cpu_order() {
         vec![f16::from_f32(7.0), f16::from_f32(7.0), f16::from_f32(6.0)]
     );
     assert_eq!(i64s(&fp16_out[1]), expected_indices);
+}
 
-    let bf16_input = input.map(bf16::from_f32);
-    let bf16_inputs = [
-        tensor(DataType::BFloat16, &[1, 5], &bf16_input),
-        tensor(DataType::Int64, &[], &[3_i64]),
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn topk_24_bfloat16_values_and_indices() {
+    let ep = common::require_cuda();
+    let inputs = [
+        common::float_input(
+            DataType::BFloat16,
+            &[6],
+            &[4.5, 4.5, 0.25, -2.5, -2.5, -2.5],
+        ),
+        common::input(DataType::Int64, &[1], &[2_i64]),
     ];
-    let bf16_outputs = [
-        (DataType::BFloat16, vec![1, 3]),
-        (DataType::Int64, vec![1, 3]),
-    ];
-    let bf16_out = run("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs);
-    assert_eq!(
-        bf16_out,
-        run_cpu("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs)
-    );
-    assert_eq!(
-        bf16s(&bf16_out[0]),
-        vec![
-            bf16::from_f32(7.0),
-            bf16::from_f32(7.0),
-            bf16::from_f32(6.0)
-        ]
-    );
-    assert_eq!(i64s(&bf16_out[1]), expected_indices);
+    let outputs = [(DataType::BFloat16, vec![2]), (DataType::Int64, vec![2])];
+    for (largest, expected_values, expected_indices) in
+        [(1, [4.5, 4.5], [0, 1]), (0, [-2.5, -2.5], [3, 4])]
+    {
+        let out = common::run_cuda(
+            &ep,
+            "TopK",
+            "",
+            24,
+            &inputs,
+            &outputs,
+            &[("largest", Attribute::Int(largest))],
+        );
+        assert_eq!(
+            out[0],
+            common::encode_floats(&expected_values, DataType::BFloat16),
+            "largest={largest}"
+        );
+        assert_eq!(i64s(&out[1]), expected_indices, "largest={largest}");
+    }
 }
 
 /// Router-scale fp16 parity: the Qwen3.6-35B-A3B (`dense_fallback` MoE) gate is a
@@ -703,7 +727,7 @@ fn topk_fp16_router_scale_and_non_final_axis_match_cpu() {
         .collect::<Vec<_>>();
     let inputs = [
         tensor(DataType::Float16, &[rows, width], &data),
-        tensor(DataType::Int64, &[], &[8_i64]),
+        tensor(DataType::Int64, &[1], &[8_i64]),
     ];
     let outputs = [
         (DataType::Float16, vec![rows, 8]),
@@ -744,7 +768,7 @@ fn topk_fp16_router_scale_and_non_final_axis_match_cpu() {
         10,
         &[
             tensor(DataType::Float32, &[5, 4], &f32_data),
-            tensor(DataType::Int64, &[], &[2_i64]),
+            tensor(DataType::Int64, &[1], &[2_i64]),
         ],
         &[
             (DataType::Float32, vec![2, 4]),
@@ -757,7 +781,7 @@ fn topk_fp16_router_scale_and_non_final_axis_match_cpu() {
         10,
         &[
             tensor(DataType::Float16, &[5, 4], &f16_data),
-            tensor(DataType::Int64, &[], &[2_i64]),
+            tensor(DataType::Int64, &[1], &[2_i64]),
         ],
         &[
             (DataType::Float16, vec![2, 4]),
@@ -806,7 +830,7 @@ fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
     let attrs = [("axis", Attribute::Int(-1))];
     let f32_inputs = [
         tensor(DataType::Float32, &[1, width], &f32_data),
-        tensor(DataType::Int64, &[], &[k]),
+        tensor(DataType::Int64, &[1], &[k]),
     ];
     let f32_outputs = [
         (DataType::Float32, vec![1, k as usize]),
@@ -830,7 +854,7 @@ fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
         .collect::<Vec<_>>();
     let f16_inputs = [
         tensor(DataType::Float16, &[1, width], &f16_data),
-        tensor(DataType::Int64, &[], &[k]),
+        tensor(DataType::Int64, &[1], &[k]),
     ];
     let f16_outputs = [
         (DataType::Float16, vec![1, k as usize]),
@@ -848,15 +872,15 @@ fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
         .collect::<Vec<_>>();
     let bf16_inputs = [
         tensor(DataType::BFloat16, &[1, width], &bf16_data),
-        tensor(DataType::Int64, &[], &[k]),
+        tensor(DataType::Int64, &[1], &[k]),
     ];
     let bf16_outputs = [
         (DataType::BFloat16, vec![1, k as usize]),
         (DataType::Int64, vec![1, k as usize]),
     ];
     assert_eq!(
-        run("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs),
-        run_cpu("TopK", 10, &bf16_inputs, &bf16_outputs, &attrs),
+        run("TopK", 24, &bf16_inputs, &bf16_outputs, &attrs),
+        run_cpu("TopK", 24, &bf16_inputs, &bf16_outputs, &attrs),
         "bf16 block-path decode TopK must be byte-identical to the CPU oracle"
     );
 }
@@ -871,41 +895,50 @@ fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn cuda_ep_claims_fp16_topk_router_nodes() {
+fn native_topk_admission_and_cuda_claims() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
-    let claims = |dtype: DataType| {
+    let admit = |opset, dtype: DataType| {
         let (graph, node_id) = graph(
             "TopK",
-            10,
+            opset,
             &[
-                tensor(dtype, &[1, 256], &vec![0_u16; 256]),
-                tensor(DataType::Int64, &[], &[8_i64]),
+                Tensor {
+                    dtype,
+                    shape: vec![1, 256],
+                    bytes: vec![0; dtype.storage_bytes(256)],
+                },
+                tensor(DataType::Int64, &[1], &[8_i64]),
             ],
             &[(dtype, vec![1, 8]), (DataType::Int64, vec![1, 8])],
             &[("axis", Attribute::Int(-1))],
         );
-        let model = Model::new(&graph);
-        let shapes = [
-            static_shape([1_usize, 256]),
-            static_shape(std::iter::empty::<usize>()),
-        ];
-        matches!(
-            ep.supports_op(
-                model.graph.node(node_id),
-                10,
-                &shapes,
-                &[dtype, DataType::Int64],
-                &[],
-            ),
-            KernelMatch::Supported { .. }
-        )
+        onnx_runtime_loader::validate_model(&graph)?;
+        let shapes = [static_shape([1_usize, 256]), static_shape([1_usize])];
+        let claim = ep.supports_op(
+            graph.node(node_id),
+            opset,
+            &shapes,
+            &[dtype, DataType::Int64],
+            &[],
+        );
+        assert!(
+            claim.is_supported(),
+            "opset={opset}, {dtype:?}: {:?}",
+            claim.reason()
+        );
+        Ok::<(), onnx_runtime_loader::LoaderError>(())
     };
-    assert!(claims(DataType::Float16), "CUDA EP must claim fp16 TopK");
-    assert!(claims(DataType::BFloat16), "CUDA EP must claim bf16 TopK");
-    assert!(
-        claims(DataType::Float32),
-        "CUDA EP must still claim f32 TopK"
-    );
+    for opset in [10, 23] {
+        let reason = admit(opset, DataType::BFloat16).unwrap_err().to_string();
+        assert!(
+            reason.contains("BFloat16") && reason.contains("opset 24"),
+            "{reason}"
+        );
+        for dtype in [DataType::Float16, DataType::Float32] {
+            admit(opset, dtype).unwrap();
+        }
+    }
+    admit(24, DataType::BFloat16).unwrap();
 }
 
 #[cfg_attr(
@@ -922,7 +955,7 @@ fn warmed_moe_routing_ops_capture_without_allocations() {
         10,
         &[
             tensor(DataType::Float32, &[1, 64], &router),
-            tensor(DataType::Int64, &[], &[6_i64]),
+            tensor(DataType::Int64, &[1], &[6_i64]),
         ],
         &[
             (DataType::Float32, vec![1, 6]),
@@ -962,10 +995,10 @@ fn warmed_moe_routing_ops_capture_without_allocations() {
 fn topk_smallest_and_sorted_false_match_cpu_order() {
     let out = run(
         "TopK",
-        10,
+        11,
         &[
             tensor(DataType::Float32, &[5], &[3_f32, 1., 1., 4., 2.]),
-            tensor(DataType::Int64, &[], &[3_i64]),
+            tensor(DataType::Int64, &[1], &[3_i64]),
         ],
         &[(DataType::Float32, vec![3]), (DataType::Int64, vec![3])],
         &[
@@ -1518,7 +1551,10 @@ fn scatter_elements_warmed_fp16_int32_path_is_capture_safe() {
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -1535,7 +1571,8 @@ fn scatter_elements_warmed_fp16_int32_path_is_capture_safe() {
         })
         .collect::<Vec<_>>();
     let mut output = ep.allocate(3 * std::mem::size_of::<f16>(), 256).unwrap();
-    let output_strides = compute_contiguous_strides(&[3]);
+    let output_strides = compute_contiguous_strides(&[3])
+        .expect("fixture shape has representable contiguous strides");
     let execute = |output: &mut DeviceBuffer| {
         let output_view = TensorMut::new(
             DevicePtrMut(output.as_mut_ptr()),

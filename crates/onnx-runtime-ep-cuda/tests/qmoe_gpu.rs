@@ -343,9 +343,10 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect();
     let views: Vec<_> = inputs
@@ -364,7 +365,8 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
         })
         .collect();
     let mut output = vec![0u8; case.rows * case.hidden * 4];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     common::execute_cpu_kernel(
         &ep,
         kernel.as_ref(),
@@ -493,9 +495,10 @@ fn run_gpu_impl(
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect();
     let views: Vec<_> = inputs
@@ -518,7 +521,8 @@ fn run_gpu_impl(
         .collect();
     let output_bytes = case.rows * case.hidden * dtype.byte_size();
     let mut output_buffer = ep.allocate(output_bytes, 256)?;
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut workspace = None;
     common::execute_kernel(
         ep,
@@ -2164,7 +2168,10 @@ fn setup_gemv_bench(
         .map(|input| {
             input
                 .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+                .map(|input| {
+                    compute_contiguous_strides(&input.shape)
+                        .expect("fixture shape has representable contiguous strides")
+                })
                 .unwrap_or_default()
         })
         .collect();
@@ -2186,7 +2193,8 @@ fn setup_gemv_bench(
     let output_bytes = case.rows * case.hidden * dtype.byte_size();
     let mut output_buffer = ep.allocate(output_bytes, 256)?;
     let output_ptr = DevicePtrMut(output_buffer.as_mut_ptr());
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let mut setup = GemvBenchSetup {
         workspace: None,
@@ -3028,9 +3036,10 @@ fn enqueue_with_existing_kernel(
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect();
     let views: Vec<_> = inputs
@@ -3054,7 +3063,8 @@ fn enqueue_with_existing_kernel(
     let output_shape = [case.rows, case.hidden];
     let output_bytes = case.rows * case.hidden * dtype.byte_size();
     let mut output_buffer = ep.allocate(output_bytes, 256)?;
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut workspace = None;
     common::execute_kernel(
         ep,
@@ -3947,16 +3957,18 @@ mod route_telemetry {
         let strides: Vec<_> = inputs
             .iter()
             .map(|input| {
-                input
-                    .as_ref()
-                    .map(|input| compute_contiguous_strides(&input.shape))
+                input.as_ref().map(|input| {
+                    compute_contiguous_strides(&input.shape)
+                        .expect("fixture shape has representable contiguous strides")
+                })
             })
             .collect();
         let views = views(inputs, &buffers, &strides, ep.device_id());
         let output_shape = [case.rows, case.hidden];
         let output_bytes = case.rows * case.hidden * 4;
         let mut output_buffer = ep.allocate(output_bytes, 256)?;
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut workspace = None;
         common::execute_kernel(
             ep,
@@ -4170,15 +4182,17 @@ mod route_telemetry {
         let strides: Vec<_> = inputs
             .iter()
             .map(|input| {
-                input
-                    .as_ref()
-                    .map(|input| compute_contiguous_strides(&input.shape))
+                input.as_ref().map(|input| {
+                    compute_contiguous_strides(&input.shape)
+                        .expect("fixture shape has representable contiguous strides")
+                })
             })
             .collect();
         let output_shape = [case.rows, case.hidden];
         let output_bytes = case.rows * case.hidden * 4;
         let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
 
         let mut workspace = None;
         let caller_view = {
@@ -4333,15 +4347,17 @@ mod route_telemetry {
         let strides: Vec<_> = inputs
             .iter()
             .map(|input| {
-                input
-                    .as_ref()
-                    .map(|input| compute_contiguous_strides(&input.shape))
+                input.as_ref().map(|input| {
+                    compute_contiguous_strides(&input.shape)
+                        .expect("fixture shape has representable contiguous strides")
+                })
             })
             .collect();
         let output_shape = [case.rows, case.hidden];
         let output_bytes = case.rows * case.hidden * 4;
         let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
 
         let mut workspace = None;
         let caller_view = {
@@ -4719,14 +4735,16 @@ mod route_telemetry {
             let strides: Vec<_> = inputs
                 .iter()
                 .map(|input| {
-                    input
-                        .as_ref()
-                        .map(|input| compute_contiguous_strides(&input.shape))
+                    input.as_ref().map(|input| {
+                        compute_contiguous_strides(&input.shape)
+                            .expect("fixture shape has representable contiguous strides")
+                    })
                 })
                 .collect();
             let output_bytes = case.rows * case.hidden * out_elem_bytes;
             let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
-            let output_strides = compute_contiguous_strides(&output_shape);
+            let output_strides = compute_contiguous_strides(&output_shape)
+                .expect("fixture shape has representable contiguous strides");
 
             let mut workspace = None;
             let caller_view = {

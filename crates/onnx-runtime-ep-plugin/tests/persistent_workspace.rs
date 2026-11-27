@@ -25,6 +25,11 @@ use std::{
 };
 
 thread_local! { static LAST_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+thread_local! {
+    static ABI_INPUT_DIMS: std::cell::RefCell<Option<Vec<i64>>> = const { std::cell::RefCell::new(None) };
+    static ABI_DATA_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 unsafe extern "C" fn status(
     _: ort::OrtErrorCode,
     msg: *const std::ffi::c_char,
@@ -40,7 +45,7 @@ unsafe extern "C" fn input_count(
     _: *const ort::OrtKernelContext,
     out: *mut usize,
 ) -> ort::OrtStatusPtr {
-    unsafe { *out = 0 };
+    unsafe { *out = ABI_INPUT_DIMS.with(|d| usize::from(d.borrow().is_some())) };
     ptr::null_mut()
 }
 unsafe extern "C" fn input(
@@ -48,15 +53,39 @@ unsafe extern "C" fn input(
     _: usize,
     out: *mut *const ort::OrtValue,
 ) -> ort::OrtStatusPtr {
-    unsafe { *out = ptr::null() };
+    unsafe {
+        *out = ABI_INPUT_DIMS.with(|d| {
+            if d.borrow().is_some() {
+                ptr::dangling()
+            } else {
+                ptr::null()
+            }
+        })
+    };
     ptr::null_mut()
 }
 unsafe extern "C" fn shape(
     _: *const ort::OrtValue,
-    _: *mut ort::ONNXTensorElementDataType,
-    _: *mut *const i64,
-    _: *mut usize,
+    dtype: *mut ort::ONNXTensorElementDataType,
+    dims: *mut *const i64,
+    count: *mut usize,
 ) -> ort::OrtStatusPtr {
+    let supplied = ABI_INPUT_DIMS.with(|d| {
+        let d = d.borrow();
+        if let Some(shape) = d.as_ref() {
+            unsafe {
+                *dtype = 1;
+                *dims = shape.as_ptr();
+                *count = shape.len();
+            }
+            true
+        } else {
+            false
+        }
+    });
+    if supplied {
+        return ptr::null_mut();
+    }
     unsafe {
         status(
             ort::ORT_FAIL,
@@ -66,8 +95,16 @@ unsafe extern "C" fn shape(
 }
 unsafe extern "C" fn data(
     _: *const ort::OrtValue,
-    _: *mut *const std::ffi::c_void,
+    out: *mut *const std::ffi::c_void,
 ) -> ort::OrtStatusPtr {
+    ABI_DATA_CALLS.with(|n| n.set(n.get() + 1));
+    if ABI_INPUT_DIMS.with(|d| d.borrow().is_some()) {
+        static VALUE: f32 = 0.;
+        unsafe {
+            *out = (&VALUE as *const f32).cast();
+        }
+        return ptr::null_mut();
+    }
     unsafe {
         status(
             ort::ORT_FAIL,
@@ -905,4 +942,58 @@ fn bound_workspace_ort_final_admission_failure_never_launches_and_retires_prefix
     drop(pool);
     assert_eq!(manager.process_used(Tier::Host), 0);
     assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn invalid_input_suffix_returns_status_before_kernel_and_new_state_recovers() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ABI_INPUT_DIMS.with(|d| *d.borrow_mut() = None);
+            ABI_DATA_CALLS.with(|n| n.set(0));
+        }
+    }
+    let _reset = Reset;
+    let books = Arc::new(RecordingGovernor::new_host(256));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = CpuMemoryResources::new(
+        DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13)).unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let mut fixture = Fixture::new(resources, true, None);
+    let state = fixture.state();
+    ABI_INPUT_DIMS.with(|d| *d.borrow_mut() = Some(vec![0, i64::MAX, i64::MAX]));
+    ABI_DATA_CALLS.with(|n| n.set(0));
+    assert!(!fixture.compute(state).is_null());
+    LAST_ERROR.with(|e| {
+        let e = e.borrow();
+        assert!(
+            e.contains("input 0") && e.contains("axis 0") && e.contains("suffix product"),
+            "{e}"
+        );
+    });
+    assert_eq!(ABI_DATA_CALLS.with(std::cell::Cell::get), 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert!(manager.snapshot().unwrap().allocations.is_empty());
+    ABI_INPUT_DIMS.with(|d| *d.borrow_mut() = None);
+    assert!(
+        !fixture.compute(state).is_null(),
+        "failed state remains retired"
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.release(state);
+    let replacement = fixture.state();
+    assert!(fixture.compute(replacement).is_null());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.release(replacement);
+    drop(fixture);
+    pool.trim_idle(u64::MAX).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(manager.process_used(Tier::Host), 0);
 }

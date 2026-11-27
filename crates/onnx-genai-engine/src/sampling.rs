@@ -138,21 +138,25 @@ pub fn sample_categorical(logits: &[f32], rng_value: f32) -> u32 {
         return 0;
     }
 
-    let mut finite_logits = Vec::new();
+    // Revisit the immutable row instead of materializing a vocabulary-sized
+    // candidate vector. Each pass keeps the original token and f32 sum order.
+    let finite_logits = || {
+        logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, logit)| !logit.is_nan() && *logit != f32::NEG_INFINITY)
+    };
     let mut max_logit = f32::NEG_INFINITY;
-    for (index, &logit) in logits.iter().enumerate() {
-        if !logit.is_nan() && logit != f32::NEG_INFINITY {
-            max_logit = max_logit.max(logit);
-            finite_logits.push((index, logit));
-        }
+    for (_, logit) in finite_logits() {
+        max_logit = max_logit.max(logit);
     }
     if !max_logit.is_finite() {
         return sample_greedy(logits);
     }
 
-    let exp_sum: f32 = finite_logits
-        .iter()
-        .map(|&(_, logit)| logit)
+    let exp_sum: f32 = finite_logits()
+        .map(|(_, logit)| logit)
         .map(|logit| (logit - max_logit).exp())
         .sum();
     if !exp_sum.is_finite() || exp_sum <= 0.0 {
@@ -161,7 +165,7 @@ pub fn sample_categorical(logits: &[f32], rng_value: f32) -> u32 {
 
     let target = rng_value.clamp(0.0, 1.0);
     let mut cumulative = 0.0;
-    for (i, logit) in finite_logits {
+    for (i, logit) in finite_logits() {
         cumulative += (logit - max_logit).exp() / exp_sum;
         if target < cumulative {
             return i as u32;
@@ -263,5 +267,91 @@ mod tests {
             after_greedy.value_for(&sampled),
             untouched.value_for(&sampled)
         );
+    }
+}
+
+#[cfg(test)]
+mod allocation_free_tests {
+    use super::*;
+    fn materialized_reference(logits: &[f32], rng: f32) -> u32 {
+        if logits.is_empty() {
+            return 0;
+        }
+        let finite: Vec<_> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, value)| !value.is_nan() && *value != f32::NEG_INFINITY)
+            .collect();
+        let maximum = finite
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !maximum.is_finite() {
+            return sample_greedy(logits);
+        }
+        let total: f32 = finite
+            .iter()
+            .map(|(_, value)| (*value - maximum).exp())
+            .sum();
+        if !total.is_finite() || total <= 0. {
+            return sample_greedy(logits);
+        }
+        let target = rng.clamp(0., 1.);
+        let mut cumulative = 0.;
+        for (index, value) in finite {
+            cumulative += (value - maximum).exp() / total;
+            if target < cumulative {
+                return index as u32;
+            }
+        }
+        (logits.len() - 1) as u32
+    }
+    #[test]
+    fn categorical_borrowed_passes_match_original_materialized_order_and_ieee_edges() {
+        let cases: &[&[f32]] = &[
+            &[],
+            &[f32::NAN, f32::NEG_INFINITY],
+            &[f32::INFINITY, 1., f32::INFINITY],
+            &[-0., 0., 0.],
+            &[f32::NAN, 2., f32::NEG_INFINITY, -3., -100.],
+            &[80., 79., 75., 50., -40., 0.],
+            &[1e-30, -1e-30, 1e-10, -1e-10],
+        ];
+        for logits in cases {
+            for value in [
+                f32::NAN,
+                -1.,
+                0.,
+                f32::MIN_POSITIVE,
+                0.25,
+                0.5,
+                0.75,
+                0.99999994,
+                1.,
+                2.,
+            ] {
+                assert_eq!(
+                    sample_categorical(logits, value),
+                    materialized_reference(logits, value),
+                    "{logits:?} RNG {value:?}"
+                );
+            }
+        }
+        let logits: Vec<_> = (0..257)
+            .map(|index| ((index * 37 % 101) as f32 - 50.) / 7.)
+            .collect();
+        let mut rng = SamplingRng::new(Some(37));
+        let options = GenerateOptions {
+            greedy: false,
+            ..Default::default()
+        };
+        for _ in 0..1024 {
+            let value = rng.value_for(&options);
+            assert_eq!(
+                sample_categorical(&logits, value),
+                materialized_reference(&logits, value)
+            );
+        }
     }
 }

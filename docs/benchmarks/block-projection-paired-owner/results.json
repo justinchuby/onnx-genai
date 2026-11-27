@@ -1,0 +1,88 @@
+{
+  "scope": "diagnostic warm wall blocks sharing code, input owners and one physical workspace; not end-to-end throughput",
+  "processes": [
+    {
+      "rep": 0,
+      "cpu_total_s": 11.072136,
+      "wall_total_s": 11.404665499983821
+    },
+    {
+      "rep": 1,
+      "cpu_total_s": 11.049397,
+      "wall_total_s": 11.053012792021036
+    },
+    {
+      "rep": 2,
+      "cpu_total_s": 10.83292,
+      "wall_total_s": 10.835224417038262
+    }
+  ],
+  "windows": 72,
+  "cells": [
+    {
+      "construction": 1,
+      "execution": 1,
+      "qualified": true,
+      "reasons": [],
+      "aa": {
+        "baseline": 0.9557180898663611,
+        "candidate": 1.008712765577459
+      },
+      "adjusted_double": {
+        "baseline": 1.9306392748082835,
+        "candidate": 1.9659721954680325
+      },
+      "empty_fractions": {
+        "baseline": 9.150047710963063e-08,
+        "candidate": 0.0
+      },
+      "work_wall_s": {
+        "baseline": 0.45901400000000003,
+        "candidate": 0.4538359795
+      },
+      "paired_wall_ratios": [
+        0.9724129419645776,
+        1.0407999596453004,
+        0.9839467387808425,
+        1.015535000800056,
+        0.947319066019778,
+        1.0006456825560794
+      ],
+      "candidate_over_baseline_wall": 0.992296210668461,
+      "per_arm_cpu": "not measured"
+    },
+    {
+      "construction": 4,
+      "execution": 1,
+      "qualified": true,
+      "reasons": [],
+      "aa": {
+        "baseline": 1.0059288654635294,
+        "candidate": 1.01114761469115
+      },
+      "adjusted_double": {
+        "baseline": 2.0525300280411476,
+        "candidate": 1.942127043531946
+      },
+      "empty_fractions": {
+        "baseline": 9.247048100061867e-08,
+        "candidate": 0.0
+      },
+      "work_wall_s": {
+        "baseline": 0.454199,
+        "candidate": 0.4560420205
+      },
+      "paired_wall_ratios": [
+        0.9812396723409553,
+        0.9987973900631306,
+        1.0262274437766143,
+        1.0102794117282716,
+        0.9976639246499978,
+        0.9797913362069625
+      ],
+      "candidate_over_baseline_wall": 0.9982306573565642,
+      "per_arm_cpu": "not measured"
+    }
+  ],
+  "all_outputs_bit_identical": true
+}

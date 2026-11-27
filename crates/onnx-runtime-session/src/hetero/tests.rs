@@ -1634,6 +1634,69 @@ fn strict_cuda_declines_text_before_partition_execution() {
 }
 
 #[test]
+fn equal_string_strict_cuda_declines_and_hetero_transfers_only_bool() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 19);
+    let lhs = graph.create_named_value("lhs", DataType::String, static_shape([2, 1]));
+    let rhs = graph.create_named_value("rhs", DataType::String, static_shape([3]));
+    graph.add_input(lhs);
+    graph.add_input(rhs);
+    let equal = graph.create_named_value("matches", DataType::Bool, static_shape([2, 3]));
+    let eq_node = graph.insert_node(Node::new(
+        NodeId(0),
+        "Equal",
+        vec![Some(lhs), Some(rhs)],
+        vec![equal],
+    ));
+    let negated = graph.create_named_value("negated", DataType::Bool, static_shape([2, 3]));
+    let not_node = graph.insert_node(Node::new(
+        NodeId(0),
+        "Not",
+        vec![Some(equal)],
+        vec![negated],
+    ));
+    graph.add_output(negated);
+
+    // A CUDA-labelled capability oracle: plan only, no driver or GPU needed.
+    let mut cuda = AcceleratorEp::new(vec!["Equal", "Not"]);
+    cuda.device = DeviceId::new(DeviceType::Cuda, 0);
+    let cuda: Arc<dyn ExecutionProvider> = Arc::new(cuda);
+    let error = Executor::build_with_mode(
+        graph.clone(),
+        weights(),
+        Arc::clone(&cuda),
+        true,
+        false,
+        None,
+    )
+    .err()
+    .expect("strict CUDA must reject Equal with managed strings");
+    let crate::SessionError::HeterogeneousPlacementRequired { unsupported_nodes } = error else {
+        panic!("unexpected strict CUDA failure: {error}");
+    };
+    assert!(unsupported_nodes.contains("Equal"), "{unsupported_nodes}");
+    assert!(
+        unsupported_nodes.contains("no device representation"),
+        "{unsupported_nodes}"
+    );
+
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: cuda,
+        },
+        cpu_slot(1),
+    ];
+    let placed = plan(&graph, &providers).unwrap();
+    assert_eq!(placed.node_placement[&eq_node], EpId(1));
+    assert_eq!(placed.node_placement[&not_node], EpId(0));
+    assert_eq!(placed.transfers.len(), 1);
+    assert_eq!(placed.transfers[0].value, equal);
+    assert_eq!(placed.transfers[0].from_ep, EpId(1));
+    assert_eq!(placed.transfers[0].to_ep, EpId(0));
+}
+
+#[test]
 fn producerless_string_output_keeps_cuda_nodes_and_declines_strict_cuda() {
     let mut graph = build_chain(&["Neg"]);
     let text = graph.create_named_value("passthrough", DataType::String, static_shape([4]));
@@ -1819,7 +1882,7 @@ fn control_flow_and_sequence_fail_during_planning() {
 
     let sequence = build_chain(&["SequenceEmpty"]);
     let error = plan(&sequence, &providers).unwrap_err().to_string();
-    assert!(error.contains("sequence"), "{error}");
+    assert!(error.contains("structural container operator"), "{error}");
     assert!(error.contains("SequenceEmpty"), "{error}");
 }
 
@@ -1834,6 +1897,22 @@ fn view_producing_kernel_is_rejected_before_partition_execution() {
         .to_string();
     assert!(error.contains("Transpose"), "{error}");
     assert!(error.contains("aliased/view output"), "{error}");
+}
+
+#[test]
+fn transpose_packed_cpu_is_admitted_by_heterogeneous_preflight() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 25);
+    let x = graph.create_named_value("x", DataType::Uint2, static_shape([3, 5]));
+    let y = graph.create_named_value("y", DataType::Uint2, static_shape([5, 3]));
+    graph.add_input(x);
+    graph.insert_node(Node::new(NodeId(0), "Transpose", vec![Some(x)], vec![y]));
+    graph.add_output(y);
+    let providers = vec![cpu_slot(0)];
+    let packed = Tensor::from_raw(DataType::Uint2, vec![3, 5], &[0xac, 0xc1, 0x1a, 0xec]).unwrap();
+    let plan = plan(&graph, &providers).unwrap();
+    let outputs = execute(&plan, &graph, &weights(), &providers, &[("x", &packed)]).unwrap();
+    assert_eq!(outputs[0].as_bytes(), &[0xd0, 0xe0, 0xe8, 0x29]);
 }
 
 #[test]

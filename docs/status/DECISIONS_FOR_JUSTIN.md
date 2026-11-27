@@ -164,7 +164,7 @@ No kernel work should begin until the proposed v1 ABI is signed off.
 
 ### BQMoE-D8 — Freeze op version 1
 - **Why blocked:** implementation needs a stable private ABI/version target.
-- **Decision needed:** approve `pkg.nxrt::BlockQuantizedMoE` v1 now or keep the
+- **Decision needed:** approve `pkg.nxrt._private::BlockQuantizedMoE` v1 now or keep the
   proposal provisional.
 - **Impact:** unblocks shape inference, CPU oracle, CUDA path, and Mobius export.
 - **Recommended default:** freeze and ship v1 only for the currently verified
@@ -239,7 +239,7 @@ The dense additive-mask path is a valid oracle but not a production
 million-token implementation.
 
 ### IndexShare-D1 — Private op boundary
-- **Why blocked:** no `pkg.nxrt` GLM op name/version or ownership boundary is
+- **Why blocked:** no `pkg.nxrt._private` GLM op name/version or ownership boundary is
   frozen.
 - **Decision needed:** consume exporter-computed top-k indices, or own
   full/shared IndexShare selection plus index-key cache/state.

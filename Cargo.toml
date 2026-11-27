@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "vendor/llguidance",
     "xtask",
     "crates/onnx-genai",
     "crates/onnx-genai-preprocess",
+    "crates/onnx-genai-symphonia-mkv",
     "crates/onnx-genai-metadata",
     "crates/onnx-genai-genai-config",
     "crates/onnx-genai-comfyui-config",
@@ -196,9 +198,11 @@ uninlined_format_args = "warn"
 chunks_exact_to_as_chunks = "allow"
 
 [workspace.dependencies]
+onnx-genai-llguidance = { path = "vendor/llguidance", version = "=0.1.0-dev.6" }
 # Internal crates
 onnx-genai = { path = "crates/onnx-genai", version = "=0.1.0-dev.6" }
 onnx-genai-preprocess = { path = "crates/onnx-genai-preprocess", version = "=0.1.0-dev.6" }
+onnx-genai-symphonia-mkv = { path = "crates/onnx-genai-symphonia-mkv", version = "=0.1.0-dev.6" }
 onnx-genai-metadata = { path = "crates/onnx-genai-metadata", version = "=0.1.0-dev.6" }
 onnx-genai-genai-config = { path = "crates/onnx-genai-genai-config", version = "=0.1.0-dev.6" }
 onnx-genai-comfyui-config = { path = "crates/onnx-genai-comfyui-config", version = "=0.1.0-dev.6" }
@@ -285,6 +289,8 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3.4", features = ["termination"] }
 tower = { version = "0.5", features = ["util"] }
 hound = "3.5"
+symphonia = { version = "0.6.1", default-features = false, features = ["all-codecs", "all-meta", "caf", "isomp4", "ogg", "aiff", "wav"] }
+symphonia-opus = "=0.1.3"
 rustfft = "6.4"
 half = "2"
 prost = "0.13"

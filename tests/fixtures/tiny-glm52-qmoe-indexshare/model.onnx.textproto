@@ -2432,7 +2432,7 @@ graph {
       f: 0.20412415
       type: FLOAT
     }
-    domain: "pkg.nxrt"
+    domain: "pkg.nxrt._private"
     metadata_props {
       key: "namespace"
       value: ": GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.0: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention"
@@ -4047,7 +4047,7 @@ graph {
       f: 0.20412415
       type: FLOAT
     }
-    domain: "pkg.nxrt"
+    domain: "pkg.nxrt._private"
     metadata_props {
       key: "namespace"
       value: ": GlmMoeDsaCausalLMModel/model: GlmMoeDsaTextModel/layers.1: GlmMoeDsaDecoderLayer/self_attn: GlmMoeDsaAttention"
@@ -10656,7 +10656,7 @@ opset_import {
   version: 1
 }
 opset_import {
-  domain: "pkg.nxrt"
+  domain: "pkg.nxrt._private"
   version: 1
 }
 functions {

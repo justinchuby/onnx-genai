@@ -13,7 +13,7 @@
     clippy::clone_on_copy
 )]
 //! GPU parity tests for the issue #67 CUDA op-coverage batch: the
-//! trigonometric/hyperbolic unary-math family (`Tan`, `Sinh`, `Cosh`, `Asin`,
+//! trigonometric/hyperbolic unary-math family (`Sin`, `Cos`, `Tan`, `Sinh`, `Cosh`, `Asin`,
 //! `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh`), the metadata/movement ops
 //! `Identity`, `Flatten`, `Size`, and the triangular mask `Trilu`.
 //!
@@ -204,7 +204,10 @@ fn run_cuda(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -229,7 +232,10 @@ fn run_cuda(
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_views = outputs
         .iter()
@@ -302,7 +308,10 @@ fn run_cpu(
         .unwrap();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -319,7 +328,10 @@ fn run_cpu(
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_bytes = outputs
         .iter()
@@ -377,6 +389,8 @@ fn trig_hyperbolic_unary_matches_cpu() {
     let ep = require_cuda();
     // (op, domain-safe inputs).
     let cases: &[(&str, &[f32])] = &[
+        ("Sin", &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        ("Cos", &[-3.0, -1.0, 0.0, 1.0, 3.0]),
         ("Tan", &[-1.2, -0.4, 0.0, 0.5, 1.1]),
         ("Sinh", &[-2.0, -0.7, 0.0, 0.9, 2.5]),
         ("Cosh", &[-2.0, -0.7, 0.0, 0.9, 2.5]),
@@ -388,7 +402,18 @@ fn trig_hyperbolic_unary_matches_cpu() {
         ("Atanh", &[-0.9, -0.4, 0.0, 0.5, 0.85]),
     ];
     for &(op, values) in cases {
+        let node = Node::new(NodeId(0), op, vec![], vec![]);
+        let shapes = [static_shape([values.len()])];
+        let rejected = ep.supports_op(&node, 21, &shapes, &[DataType::BFloat16], &[]);
+        let reason = format!("{op} does not accept BF16 (BFloat16) at opset 21");
+        assert!(
+            rejected.reason().is_some_and(|s| s.contains(&reason)),
+            "{op}: expected an opset-specific CUDA rejection, got {:?}",
+            rejected.reason()
+        );
+        assert_cuda_trig_execution_rejects_bf16(&ep, &node, &reason);
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let opset = if dtype == DataType::BFloat16 { 22 } else { 17 };
             let shape = vec![values.len()];
             let inputs = [Tensor {
                 dtype,
@@ -396,8 +421,8 @@ fn trig_hyperbolic_unary_matches_cpu() {
                 bytes: encode_floats(values, dtype),
             }];
             let outputs = [(dtype, shape.clone())];
-            let cuda = run_cuda(&ep, op, 17, &inputs, &outputs, &[]);
-            let cpu = run_cpu(op, 17, &inputs, &outputs, &[]);
+            let cuda = run_cuda(&ep, op, opset, &inputs, &outputs, &[]);
+            let cpu = run_cpu(op, opset, &inputs, &outputs, &[]);
             let cuda_f = decode_floats(&cuda[0], dtype);
             let cpu_f = decode_floats(&cpu[0], dtype);
             // f32 device intrinsics vs host libm agree to a few ulp; the half
@@ -412,6 +437,38 @@ fn trig_hyperbolic_unary_matches_cpu() {
         }
         eprintln!("{op}: CUDA matches CPU EP across f32/f16/bf16");
     }
+}
+
+fn assert_cuda_trig_execution_rejects_bf16(ep: &CudaExecutionProvider, node: &Node, reason: &str) {
+    let shape = [1];
+    let stride = [1];
+    let dtype = DataType::BFloat16;
+    let input = ep.allocate(2, 256).unwrap();
+    let mut output = ep.allocate(2, 256).unwrap();
+    // SAFETY: the CUDA buffer is live and holds one BF16 value.
+    unsafe { ep.runtime().htod(&[0, 0], cuptr(input.as_ptr())) }.unwrap();
+    let kernel = ep.get_kernel(node, &[shape.to_vec()], 21).unwrap();
+    let error = kernel
+        .execute(
+            &[TensorView::new(
+                DevicePtr(input.as_ptr()),
+                dtype,
+                &shape,
+                &stride,
+                ep.device_id(),
+            )],
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                dtype,
+                &shape,
+                &stride,
+                ep.device_id(),
+            )],
+        )
+        .unwrap_err();
+    ep.deallocate(input).unwrap();
+    ep.deallocate(output).unwrap();
+    assert!(error.to_string().contains(reason), "{error}");
 }
 
 /// `Identity` and `Flatten` are dtype-agnostic byte copies; assert exact byte
@@ -798,7 +855,7 @@ fn decode_i64(bytes: &[u8]) -> Vec<i64> {
 fn mod_matches_cpu() {
     let ep = require_cuda();
 
-    // Float Mod requires fmod=1 per ONNX.
+    // Legacy float Mod requires fmod=1.
     let fa: &[f32] = &[5.3, -5.3, 7.5, -7.5, 2.0, -2.0];
     let fb: &[f32] = &[2.0, 2.0, -2.5, -2.5, 3.0, 3.0];
     let inputs = [
@@ -853,6 +910,198 @@ fn mod_matches_cpu() {
         );
     }
     eprintln!("Mod: CUDA matches CPU EP (f32 fmod=1; i32/i64 truncated + floor)");
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn ort_mod_keeps_unbounded_legacy_metadata_and_routing() {
+    let ep = CudaExecutionProvider::new_for_ort_plugin()
+        .expect("legacy CUDA Mod test requires the CUDA driver and a physical device");
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
+    let mut entries = descriptors.iter().filter(|entry| entry.op_type == "Mod");
+    let entry = entries.next().unwrap();
+    assert!(entries.next().is_none());
+    let native_registry = onnx_runtime_ep_cuda::build_cuda_registry(ep.runtime().clone());
+    let native = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(&native_registry);
+    assert_eq!(
+        native
+            .iter()
+            .filter(|entry| entry.op_type == "Mod")
+            .map(|entry| (entry.since_version, entry.end_version))
+            .collect::<Vec<_>>(),
+        [(10, 27), (28, u64::MAX)]
+    );
+    assert_eq!(
+        (
+            entry.domain.as_str(),
+            entry.since_version,
+            entry.end_version
+        ),
+        ("", 10, u64::MAX)
+    );
+    use DataType::*;
+    assert_eq!(
+        entry.supported_dtypes,
+        &[
+            Float32, Float16, BFloat16, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64
+        ]
+    );
+
+    let inputs = [
+        input(Float32, &[1], &[-5.5_f32]),
+        input(Float32, &[1], &[3.0_f32]),
+    ];
+    let outputs = [(Float32, vec![1])];
+    let attrs = [("fmod", Attribute::Int(1))];
+    assert_eq!(
+        run_cuda(&ep, "Mod", 29, &inputs, &outputs, &attrs)[0],
+        raw(&[-2.5_f32])
+    );
+
+    let (graph, node) = build_graph("Mod", 29, &inputs, &outputs, &[]);
+    let shapes = [static_shape([1]), static_shape([1])];
+    let claim = ep.supports_op(graph.node(node), 29, &shapes, &[Float32; 2], &[]);
+    assert_eq!(claim.reason(), Some("Mod: Float32 Mod requires fmod=1"));
+
+    let (graph, node) = build_graph("Mod", 29, &inputs, &outputs, &attrs);
+    let claim = ep.supports_op(graph.node(node), 29, &shapes, &[Float16; 2], &[]);
+    assert!(!claim.is_supported(), "legacy CUDA Mod does not claim fp16");
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn mod_28_matches_onnx_values() {
+    let ep = require_cuda();
+    let node = Node::new(
+        NodeId(0),
+        "Mod",
+        vec![
+            Some(onnx_runtime_ir::ValueId(0)),
+            Some(onnx_runtime_ir::ValueId(1)),
+        ],
+        vec![onnx_runtime_ir::ValueId(2)],
+    );
+    let shapes = [static_shape([1]), static_shape([1])];
+    let dtypes = [DataType::Float32; 2];
+    for provider in [&ep as &dyn ExecutionProvider, &CpuExecutionProvider::new()] {
+        let legacy = provider.supports_op(&node, 27, &shapes, &dtypes, &[]);
+        assert!(legacy.reason().unwrap().contains("fmod=0"));
+        assert!(
+            provider
+                .supports_op(&node, 28, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+    }
+
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        let inputs = [
+            Tensor {
+                dtype,
+                shape: vec![4, 1],
+                bytes: encode_floats(&[-5.5, 0.0, 6.0, f32::INFINITY], dtype),
+            },
+            Tensor {
+                dtype,
+                shape: vec![3],
+                bytes: encode_floats(&[3.0, -3.0, f32::INFINITY], dtype),
+            },
+        ];
+        let outputs = [(dtype, vec![4, 3])];
+        let nan = f32::NAN;
+        for (fmod, expected) in [
+            (
+                0,
+                [
+                    0.5,
+                    -2.5,
+                    f32::INFINITY,
+                    0.0,
+                    -0.0,
+                    0.0,
+                    0.0,
+                    -0.0,
+                    6.0,
+                    nan,
+                    nan,
+                    nan,
+                ],
+            ),
+            (
+                1,
+                [
+                    -2.5, -2.5, -5.5, 0.0, 0.0, 0.0, 0.0, 0.0, 6.0, nan, nan, nan,
+                ],
+            ),
+        ] {
+            let attrs = [("fmod", Attribute::Int(fmod))];
+            let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &attrs);
+            let cpu = run_cpu("Mod", 28, &inputs, &outputs, &attrs);
+            for result in [cuda, cpu] {
+                let values = decode_floats(&result[0], dtype);
+                for (i, (got, want)) in values.into_iter().zip(expected).enumerate() {
+                    if want.is_nan() {
+                        assert!(got.is_nan(), "{dtype:?} fmod={fmod} lane {i}: {got}");
+                    } else {
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "{dtype:?} fmod={fmod} lane {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Pinned ONNX test_mod_int64_fmod, plus CPU/CUDA zero-divisor and MIN/-1.
+    let a = [-4, 7, 5, 4, -7, 8, i64::MIN, 9];
+    let b = [2_i64, -3, 8, -2, 3, 5, -1, 0];
+    let inputs = [
+        input(DataType::Int64, &[8], &a),
+        input(DataType::Int64, &[8], &b),
+    ];
+    let outputs = [(DataType::Int64, vec![8])];
+    for (fmod, expected) in [
+        (0, [0, -2, 5, 0, 2, 3, 0, 0]),
+        (1, [0, 1, 5, 0, -1, 3, 0, 0]),
+    ] {
+        let attrs = [("fmod", Attribute::Int(fmod))];
+        let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &attrs);
+        let cpu = run_cpu("Mod", 28, &inputs, &outputs, &attrs);
+        assert_eq!(decode_i64(&cuda[0]), expected);
+        assert_eq!(decode_i64(&cpu[0]), expected);
+    }
+
+    let a = [u64::MAX, 7, 5];
+    let b = [1_u64 << 63, 3, 8];
+    let inputs = [
+        input(DataType::Uint64, &[3], &a),
+        input(DataType::Uint64, &[3], &b),
+    ];
+    let outputs = [(DataType::Uint64, vec![3])];
+    let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &[]);
+    let cpu = run_cpu("Mod", 28, &inputs, &outputs, &[]);
+    let expected = raw(&[(1_u64 << 63) - 1, 1, 5]);
+    assert_eq!(cuda[0], expected);
+    assert_eq!(cpu[0], expected);
+
+    // This quotient overflows f64; fmod still returns the exact remainder.
+    let inputs = [
+        input(DataType::Float64, &[1], &[-f64::MAX]),
+        input(DataType::Float64, &[], &[f64::MIN_POSITIVE]),
+    ];
+    let outputs = [(DataType::Float64, vec![1])];
+    let cuda = run_cuda(&ep, "Mod", 28, &inputs, &outputs, &[]);
+    let cpu = run_cpu("Mod", 28, &inputs, &outputs, &[]);
+    let expected = raw(&[0.0_f64]);
+    assert_eq!(cuda[0], expected);
+    assert_eq!(cpu[0], expected);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1043,6 +1292,66 @@ fn prelu_matches_cpu() {
         assert_close("PRelu(scalar)", dtype, &cuda_f, &cpu_f, tolerance);
     }
     eprintln!("PRelu: CUDA matches CPU EP across f32/f16/bf16 and scalar/per-channel/full slopes");
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+fn native_det_cuda_no_cpu_fallback() {
+    use DataType::*;
+    // This helper checks CUDA's claim and invokes its kernel on CUDA-owned
+    // buffers. It never constructs a CPU EP or runs a mixed-provider session.
+    let ep = common::require_cuda();
+    let run = |opset, input: common::Tensor, shape: &[usize]| {
+        let dtype = input.dtype;
+        common::run_cuda(
+            &ep,
+            "Det",
+            "",
+            opset,
+            &[input],
+            &[(dtype, shape.to_vec())],
+            &[],
+        )
+        .pop()
+        .unwrap()
+    };
+    let floats = |opset, dtype, shape: &[usize], values: &[f32], out: &[usize]| {
+        common::decode_floats(
+            &run(opset, common::float_input(dtype, shape, values), out),
+            dtype,
+        )
+    };
+
+    assert_eq!(floats(11, Float32, &[2, 2], &[0., 1., 2., 3.], &[]), [-2.]);
+    let fixture = [1., 2., 3., 4., 1., 2., 2., 1., 1., 3., 3., 1.];
+    let y = floats(22, Float32, &[3, 2, 2], &fixture, &[3]);
+    for (got, want) in y.into_iter().zip([-2., -3., -8.]) {
+        assert!((got - want).abs() <= 1e-6);
+    }
+    let pair = [0., 2., 3., 0., 1., 2., 1., 2.];
+    for (opset, dtype) in [(21, Float16), (22, BFloat16)] {
+        assert_eq!(
+            floats(opset, dtype, &[1, 2, 2, 2], &pair, &[1, 2]),
+            [-6., 0.]
+        );
+    }
+    // Cross the scratch slot cap to exercise grid-stride reuse.
+    let repeated = pair.repeat(70);
+    assert_eq!(
+        floats(22, Float32, &[140, 2, 2], &repeated, &[140]),
+        [-6., 0.].repeat(70)
+    );
+    assert_eq!(floats(22, Float32, &[2, 0, 0], &[], &[2]), [1., 1.]);
+    assert!(floats(22, Float32, &[0, 3, 3], &[], &[0]).is_empty());
+    assert_eq!(floats(22, Float32, &[2, 1, 1], &[-5., 7.], &[2]), [-5., 7.]);
+
+    let mut diag = [0.; 16];
+    for (i, v) in [1e200f64, 1e200, 1e-200, 1e-200].into_iter().enumerate() {
+        diag[i * 5] = v;
+    }
+    let bytes = run(11, common::input(Float64, &[4, 4], &diag), &[]);
+    let result = f64::from_ne_bytes(bytes.try_into().unwrap());
+    assert!((result - 1.0).abs() < 1e-14, "{result}");
 }
 
 /// Scalar metadata has zero words; empty output needs no workspace or upload.

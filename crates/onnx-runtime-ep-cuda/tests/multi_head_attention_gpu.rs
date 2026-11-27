@@ -425,7 +425,7 @@ fn key_padding_mask_forms_match_cpu() {
 /// (`-10000`) to every logit; the constant cancels under softmax, so the row
 /// resolves to `softmax(raw scores)`. At f32 the CUDA EP reproduces the CPU
 /// oracle bit-for-tolerance. This is deliberately **f32-only**: the shared
-/// Phase-2a softmax writes each masked logit (`raw − 10000`) back to the
+/// unfused softmax writes each masked logit (`raw − 10000`) back to the
 /// low-precision score buffer, and at f16/bf16 every value rounds to exactly
 /// `-10000` (the mantissa step near 10000 is 8), collapsing the row to a uniform
 /// distribution — a measured precision artifact of the shared core, not a logic
@@ -537,9 +537,11 @@ fn mha_prepared_workspace_reuses_backing_and_preserves_present_output_holes() {
     let ep = require_cuda();
     let shape = [1usize, 2, 4];
     let input_shapes = vec![shape.to_vec(); 3];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let cache_shape = [1usize, 1, 2, 4];
-    let cache_strides = compute_contiguous_strides(&cache_shape);
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut qk = ep.allocate(32, 256).unwrap();
     let mut value = ep.allocate(32, 256).unwrap();
     let mut output = ep.allocate(32, 256).unwrap();

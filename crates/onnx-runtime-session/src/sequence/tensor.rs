@@ -42,32 +42,29 @@ impl SeqTensor {
 
     /// Build a host tensor from raw element bytes and share it as a sequence item.
     pub fn from_raw(dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> SequenceResult<Self> {
+        Self::from_raw_in(
+            &crate::HostTensorAllocator::standalone(),
+            dtype,
+            shape,
+            bytes,
+        )
+    }
+
+    /// Construct through an explicit host allocation owner, including model budgets.
+    pub fn from_raw_in(
+        allocator: &crate::HostTensorAllocator,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+    ) -> SequenceResult<Self> {
         validate_tensor_bytes("SequenceTensor", bytes, dtype, &shape)?;
-        let mut storage = SharedTensorBuffer::allocate_cpu(bytes.len()).map_err(|source| {
+        let tensor = allocator.from_raw(dtype, shape, bytes).map_err(|source| {
             SequenceError::TensorCreation {
                 op: "SequenceTensor",
                 source,
             }
         })?;
-        let allocator = Arc::clone(storage.allocator());
-        allocator
-            .copy_from_host(
-                bytes,
-                Arc::get_mut(&mut storage)
-                    .expect("fresh sequence storage is uniquely owned")
-                    .buffer_mut(),
-            )
-            .map_err(|source| SequenceError::TensorCreation {
-                op: "SequenceTensor",
-                source: source.into(),
-            })?;
-        Ok(Self {
-            storage,
-            dtype,
-            shape,
-            layout: TensorLayout::contiguous(),
-            byte_offset: 0,
-        })
+        Self::new(tensor)
     }
 
     pub(crate) fn from_shared(
@@ -77,7 +74,13 @@ impl SeqTensor {
         layout: TensorLayout,
         byte_offset: usize,
     ) -> SequenceResult<Self> {
-        let strides = layout.resolved_strides(&shape);
+        let strides =
+            layout
+                .resolved_strides(&shape)
+                .map_err(|source| SequenceError::TensorCreation {
+                    op: "SequenceTensor",
+                    source: source.into(),
+                })?;
         validate_view_bounds(
             "SequenceTensor",
             &shape,
@@ -131,6 +134,38 @@ impl SeqTensor {
         self.storage.buffer().len()
     }
 
+    /// Copy a host view directly into already-admitted initialized backing.
+    pub(crate) fn copy_host_contiguous_into(&self, destination: &mut [u8]) -> crate::Result<()> {
+        if !self.device().is_host_accessible() {
+            return Err(crate::SessionError::Internal("direct sequence host copy requires host-accessible backing; use an explicit admitted device download".into()));
+        }
+        let expected = self
+            .dtype
+            .checked_storage_bytes(checked_product(
+                "SequenceTensor",
+                "element count",
+                &self.shape,
+            )?)
+            .ok_or_else(|| overflow("SequenceTensor", "byte count", &self.shape))?;
+        if destination.len() != expected {
+            return Err(SequenceError::ByteLengthMismatch {
+                op: "SequenceTensor",
+                dtype: self.dtype,
+                shape: self.shape.clone(),
+                expected,
+                actual: destination.len(),
+            }
+            .into());
+        }
+        let mut stats = ConcatCopyStats::default();
+        self.write_contiguous_range(0, expected, 0, &mut [], &mut |offset, source| {
+            let end = offset.checked_add(source.len()).ok_or_else(|| crate::SessionError::Internal("sequence destination byte range overflow; use addressable tensor geometry".into()))?;
+            let target = destination.get_mut(offset..end).ok_or_else(|| crate::SessionError::Internal("sequence copy exceeds admitted destination backing; match the declared logical tensor shape".into()))?;
+            target.copy_from_slice(source);
+            Ok(())
+        }, &mut stats)
+    }
+
     /// Materialize this logical tensor as contiguous host bytes.
     pub fn contiguous_bytes(&self) -> SequenceResult<Vec<u8>> {
         const OP: &str = "SequenceTensor";
@@ -155,7 +190,13 @@ impl SeqTensor {
                 })?;
             &copied
         };
-        let strides = self.layout.resolved_strides(&self.shape);
+        let strides = self
+            .layout
+            .resolved_strides(&self.shape)
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            })?;
         if onnx_runtime_ir::is_contiguous(&self.shape, &strides) {
             let bytes = self
                 .dtype
@@ -250,7 +291,13 @@ impl SeqTensor {
             stats.source_materializations += 1;
             destination
         };
-        let strides = self.layout.resolved_strides(&self.shape);
+        let strides = self
+            .layout
+            .resolved_strides(&self.shape)
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            })?;
         validate_view_bounds(
             OP,
             &self.shape,
@@ -282,7 +329,12 @@ impl SeqTensor {
             return Ok(());
         }
 
-        let logical_strides = compute_contiguous_strides(&self.shape);
+        let logical_strides = compute_contiguous_strides(&self.shape).map_err(|source| {
+            SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            }
+        })?;
         let start_element = logical_offset / esize;
         let elements = bytes / esize;
         for element_offset in 0..elements {
@@ -353,7 +405,13 @@ impl SeqTensor {
                 reason: "the storage is not host-accessible",
             });
         }
-        let strides = self.layout.resolved_strides(&self.shape);
+        let strides = self
+            .layout
+            .resolved_strides(&self.shape)
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            })?;
         if !onnx_runtime_ir::is_contiguous(&self.shape, &strides) {
             return Err(SequenceError::ByteBorrowUnavailable {
                 shape: self.shape.clone(),
@@ -530,7 +588,7 @@ pub(super) fn validate_tensor_bytes(
     Ok(())
 }
 
-pub(super) fn validate_view_bounds(
+pub(crate) fn validate_view_bounds(
     op: &'static str,
     shape: &[usize],
     strides: &[i64],
@@ -614,7 +672,11 @@ fn gather_strided(
     if numel == 0 {
         return Ok(output);
     }
-    let logical_strides = compute_contiguous_strides(shape);
+    let logical_strides =
+        compute_contiguous_strides(shape).map_err(|source| SequenceError::TensorCreation {
+            op: "SequenceTensor",
+            source: source.into(),
+        })?;
     for linear in 0..numel {
         let mut remainder = linear;
         let mut source_element = 0i128;

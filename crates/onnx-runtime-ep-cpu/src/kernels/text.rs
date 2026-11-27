@@ -1,11 +1,11 @@
-//! Native host-string kernels for the ONNX opset-20 text operators.
+//! Native host-string kernels for ONNX operators.
 
 use std::ffi::{c_char, c_void};
 use std::ptr::NonNull;
 
 use onnx_runtime_ep_api::{
-    EpError, HostKernelData, HostKernelOutput, HostStringInput, Kernel, KernelFactory, Result,
-    TensorMut, TensorView,
+    EpError, HostKernelData, HostKernelInput, HostKernelOutput, HostStringInput, Kernel,
+    KernelFactory, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
@@ -16,7 +16,7 @@ fn error(message: impl Into<String>) -> EpError {
 fn raw_abi_error(op: &str) -> EpError {
     error(format!(
         "{op}: this kernel accepts managed host strings only; dispatch it through \
-         Kernel::execute_host_strings instead of the raw tensor ABI"
+         Kernel::execute_managed_host instead of the raw tensor ABI"
     ))
 }
 
@@ -37,17 +37,30 @@ fn checked_numel(op: &str, input: usize, shape: &[usize], values: &[String]) -> 
     Ok(numel)
 }
 
-fn require_inputs<'a>(op: &str, inputs: &'a [HostStringInput<'a>], arity: usize) -> Result<()> {
-    if inputs.len() != arity {
-        return Err(error(format!(
-            "{op}: expected {arity} host string input(s), got {}",
+fn require_inputs<'a, const N: usize>(
+    op: &str,
+    inputs: &[HostKernelInput<'a>],
+) -> Result<[HostStringInput<'a>; N]> {
+    let inputs: &[_; N] = inputs.try_into().map_err(|_| {
+        error(format!(
+            "{op}: expected {N} host string input(s), got {}",
             inputs.len()
-        )));
-    }
+        ))
+    })?;
+    let mut strings = [HostStringInput {
+        shape: &[],
+        values: &[],
+    }; N];
     for (index, input) in inputs.iter().enumerate() {
+        let HostKernelInput::Strings(input) = input else {
+            return Err(error(format!(
+                "{op}: input {index} must be a managed tensor(string)"
+            )));
+        };
         checked_numel(op, index, input.shape, input.values)?;
+        strings[index] = *input;
     }
-    Ok(())
+    Ok(strings)
 }
 
 fn broadcast_shape(op: &str, lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>> {
@@ -100,6 +113,55 @@ fn broadcast_strides(input: &[usize], output: &[usize]) -> Vec<usize> {
 pub struct StringConcatKernel;
 pub struct StringConcatFactory;
 
+pub(super) fn broadcast_string_pairs<T>(
+    op: &str,
+    inputs: &[HostKernelInput<'_>],
+    mut apply: impl FnMut(&str, &str) -> T,
+) -> Result<(Vec<usize>, Vec<T>)> {
+    let inputs = require_inputs::<2>(op, inputs)?;
+    let shape = broadcast_shape(op, inputs[0].shape, inputs[1].shape)?;
+    // No strides or input elements are needed for an empty broadcast.
+    if shape.contains(&0) {
+        return Ok((shape, Vec::new()));
+    }
+    let count = shape.iter().try_fold(1usize, |n, &dim| {
+        n.checked_mul(dim)
+            .ok_or_else(|| error(format!("{op}: broadcast output element count overflowed")))
+    })?;
+    let lhs_strides = broadcast_strides(inputs[0].shape, &shape);
+    let rhs_strides = broadcast_strides(inputs[1].shape, &shape);
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|cause| {
+        error(format!(
+            "{op}: cannot allocate output of shape {shape:?}: {cause}"
+        ))
+    })?;
+    let mut index = vec![0usize; shape.len()];
+    let (mut lhs_offset, mut rhs_offset) = (0usize, 0usize);
+
+    for produced in 0..count {
+        values.push(apply(
+            &inputs[0].values[lhs_offset],
+            &inputs[1].values[rhs_offset],
+        ));
+        if produced + 1 == count {
+            break;
+        }
+        for axis in (0..shape.len()).rev() {
+            index[axis] += 1;
+            if index[axis] < shape[axis] {
+                lhs_offset += lhs_strides[axis];
+                rhs_offset += rhs_strides[axis];
+                break;
+            }
+            index[axis] = 0;
+            lhs_offset -= lhs_strides[axis] * (shape[axis] - 1);
+            rhs_offset -= rhs_strides[axis] * (shape[axis] - 1);
+        }
+    }
+    Ok((shape, values))
+}
+
 impl KernelFactory for StringConcatFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(StringConcatKernel))
@@ -107,45 +169,16 @@ impl KernelFactory for StringConcatFactory {
 }
 
 impl Kernel for StringConcatKernel {
-    fn execute_host_strings(
+    fn execute_managed_host(
         &self,
-        inputs: &[HostStringInput<'_>],
+        inputs: &[HostKernelInput<'_>],
     ) -> Result<Vec<HostKernelOutput>> {
-        require_inputs("StringConcat", inputs, 2)?;
-        let shape = broadcast_shape("StringConcat", inputs[0].shape, inputs[1].shape)?;
-        let count = shape.iter().try_fold(1usize, |n, &dim| {
-            n.checked_mul(dim)
-                .ok_or_else(|| error("StringConcat: broadcast output element count overflowed"))
-        })?;
-        let lhs_strides = broadcast_strides(inputs[0].shape, &shape);
-        let rhs_strides = broadcast_strides(inputs[1].shape, &shape);
-        let mut values = Vec::with_capacity(count);
-        let mut index = vec![0usize; shape.len()];
-        let (mut lhs_offset, mut rhs_offset) = (0usize, 0usize);
-
-        for produced in 0..count {
-            let lhs = &inputs[0].values[lhs_offset];
-            let rhs = &inputs[1].values[rhs_offset];
+        let (shape, values) = broadcast_string_pairs("StringConcat", inputs, |lhs, rhs| {
             let mut value = String::with_capacity(lhs.len() + rhs.len());
             value.push_str(lhs);
             value.push_str(rhs);
-            values.push(value);
-
-            if produced + 1 == count {
-                break;
-            }
-            for axis in (0..shape.len()).rev() {
-                index[axis] += 1;
-                lhs_offset += lhs_strides[axis];
-                rhs_offset += rhs_strides[axis];
-                if index[axis] < shape[axis] {
-                    break;
-                }
-                index[axis] = 0;
-                lhs_offset -= lhs_strides[axis] * shape[axis];
-                rhs_offset -= rhs_strides[axis] * shape[axis];
-            }
-        }
+            value
+        })?;
         Ok(vec![HostKernelOutput {
             shape,
             data: HostKernelData::Strings(values),
@@ -178,11 +211,11 @@ impl KernelFactory for RegexFullMatchFactory {
 }
 
 impl Kernel for RegexFullMatchKernel {
-    fn execute_host_strings(
+    fn execute_managed_host(
         &self,
-        inputs: &[HostStringInput<'_>],
+        inputs: &[HostKernelInput<'_>],
     ) -> Result<Vec<HostKernelOutput>> {
-        require_inputs("RegexFullMatch", inputs, 1)?;
+        let inputs = require_inputs::<1>("RegexFullMatch", inputs)?;
         let bytes = inputs[0]
             .values
             .iter()
@@ -318,11 +351,11 @@ impl KernelFactory for StringSplitFactory {
 }
 
 impl Kernel for StringSplitKernel {
-    fn execute_host_strings(
+    fn execute_managed_host(
         &self,
-        inputs: &[HostStringInput<'_>],
+        inputs: &[HostKernelInput<'_>],
     ) -> Result<Vec<HostKernelOutput>> {
-        require_inputs("StringSplit", inputs, 1)?;
+        let inputs = require_inputs::<1>("StringSplit", inputs)?;
         let mut counts = Vec::with_capacity(inputs[0].values.len());
         let mut width = 0usize;
         for value in inputs[0].values {
@@ -452,8 +485,8 @@ mod tests {
     use super::*;
     use onnx_runtime_ir::NodeId;
 
-    fn strings<'a>(shape: &'a [usize], values: &'a [String]) -> HostStringInput<'a> {
-        HostStringInput { shape, values }
+    fn strings<'a>(shape: &'a [usize], values: &'a [String]) -> HostKernelInput<'a> {
+        HostKernelInput::Strings(HostStringInput { shape, values })
     }
 
     fn string_data(output: &HostKernelOutput) -> &[String] {
@@ -483,7 +516,7 @@ mod tests {
         let lhs = ["cat", "dog", "蛇"].map(str::to_owned);
         let rhs = ["s", "!"].map(str::to_owned);
         let outputs = StringConcatKernel
-            .execute_host_strings(&[strings(&[3, 1], &lhs), strings(&[1, 2], &rhs)])
+            .execute_managed_host(&[strings(&[3, 1], &lhs), strings(&[1, 2], &rhs)])
             .unwrap();
         assert_eq!(outputs[0].shape, [3, 2]);
         assert_eq!(
@@ -497,7 +530,7 @@ mod tests {
         let lhs = ["cat".to_owned()];
         let rhs = ["s".to_owned()];
         let outputs = StringConcatKernel
-            .execute_host_strings(&[strings(&[], &lhs), strings(&[], &rhs)])
+            .execute_managed_host(&[strings(&[], &lhs), strings(&[], &rhs)])
             .unwrap();
         assert!(outputs[0].shape.is_empty());
         assert_eq!(string_data(&outputs[0]), ["cats"]);
@@ -505,7 +538,7 @@ mod tests {
         let empty: [String; 0] = [];
         let singleton = ["suffix".to_owned()];
         let outputs = StringConcatKernel
-            .execute_host_strings(&[strings(&[2, 0, 3], &empty), strings(&[1, 1, 3], &singleton)])
+            .execute_managed_host(&[strings(&[2, 0, 3], &empty), strings(&[1, 1, 3], &singleton)])
             .err()
             .expect("shape/value mismatch must fail");
         assert!(
@@ -515,7 +548,7 @@ mod tests {
 
         let rhs = ["a", "b", "c"].map(str::to_owned);
         let outputs = StringConcatKernel
-            .execute_host_strings(&[strings(&[2, 0, 3], &empty), strings(&[1, 1, 3], &rhs)])
+            .execute_managed_host(&[strings(&[2, 0, 3], &empty), strings(&[1, 1, 3], &rhs)])
             .unwrap();
         assert_eq!(outputs[0].shape, [2, 0, 3]);
         assert!(string_data(&outputs[0]).is_empty());
@@ -531,7 +564,7 @@ mod tests {
         let kernel = RegexFullMatchFactory.create(&node, &[]).unwrap();
         let values = ["www.google.com", "www.bbc.co.uk", "www.中.com", "x\0y"].map(str::to_owned);
         let outputs = kernel
-            .execute_host_strings(&[strings(&[4], &values)])
+            .execute_managed_host(&[strings(&[4], &values)])
             .unwrap();
         match &outputs[0].data {
             HostKernelData::Raw { dtype, bytes } => {
@@ -552,7 +585,7 @@ mod tests {
         let kernel = RegexFullMatchFactory.create(&node, &[]).unwrap();
         let values = ["ab", "é", "7"].map(str::to_owned);
         let outputs = kernel
-            .execute_host_strings(&[strings(&[3], &values)])
+            .execute_managed_host(&[strings(&[3], &values)])
             .unwrap();
         match &outputs[0].data {
             HostKernelData::Raw { bytes, .. } => assert_eq!(bytes, &[1, 1, 0]),
@@ -568,7 +601,7 @@ mod tests {
         let kernel = RegexFullMatchFactory.create(&node, &[]).unwrap();
         let values = [" ", "\t", "\n", "\u{000c}", "\u{000b}"].map(str::to_owned);
         let outputs = kernel
-            .execute_host_strings(&[strings(&[5], &values)])
+            .execute_managed_host(&[strings(&[5], &values)])
             .unwrap();
         match &outputs[0].data {
             HostKernelData::Raw { bytes, .. } => assert_eq!(bytes, &[1, 1, 1, 1, 0]),
@@ -585,7 +618,7 @@ mod tests {
         let bytes_kernel = RegexFullMatchFactory.create(&bytes_node, &[]).unwrap();
         let values = ["é", "a", "\0x"].map(str::to_owned);
         let outputs = bytes_kernel
-            .execute_host_strings(&[strings(&[3], &values)])
+            .execute_managed_host(&[strings(&[3], &values)])
             .unwrap();
         match &outputs[0].data {
             HostKernelData::Raw { bytes, .. } => assert_eq!(bytes, &[1, 0, 1]),
@@ -599,7 +632,7 @@ mod tests {
         let quote_kernel = RegexFullMatchFactory.create(&quote_node, &[]).unwrap();
         let values = ["a+b[0]", "ab0"].map(str::to_owned);
         let outputs = quote_kernel
-            .execute_host_strings(&[strings(&[2], &values)])
+            .execute_managed_host(&[strings(&[2], &values)])
             .unwrap();
         match &outputs[0].data {
             HostKernelData::Raw { bytes, .. } => assert_eq!(bytes, &[1, 0]),
@@ -625,7 +658,7 @@ mod tests {
         let values =
             ["hello world", "def.net", "o n n x", "the quick brown fox"].map(str::to_owned);
         let outputs = kernel
-            .execute_host_strings(&[strings(&[2, 2], &values)])
+            .execute_managed_host(&[strings(&[2, 2], &values)])
             .unwrap();
         assert_eq!(outputs[0].shape, [2, 2, 3]);
         assert_eq!(
@@ -663,14 +696,14 @@ mod tests {
         let whitespace = make_split(None, Some(0));
         let values = ["\u{001c}\u{2003}alpha  beta ", " \t"].map(str::to_owned);
         let outputs = whitespace
-            .execute_host_strings(&[strings(&[2], &values)])
+            .execute_managed_host(&[strings(&[2], &values)])
             .unwrap();
         assert_eq!(outputs[0].shape, [2, 1]);
         assert_eq!(string_data(&outputs[0]), ["alpha  beta ", ""]);
 
         let nul = make_split(Some("\0"), None);
         let values = ["a\0b\0", "\0x"].map(str::to_owned);
-        let outputs = nul.execute_host_strings(&[strings(&[2], &values)]).unwrap();
+        let outputs = nul.execute_managed_host(&[strings(&[2], &values)]).unwrap();
         assert_eq!(outputs[0].shape, [2, 3]);
         assert_eq!(string_data(&outputs[0]), ["a", "b", "", "", "x", ""]);
     }
@@ -678,7 +711,7 @@ mod tests {
     #[test]
     fn string_split_empty_tensor_has_runtime_zero_width() {
         let outputs = make_split(Some("."), None)
-            .execute_host_strings(&[strings(&[0], &[])])
+            .execute_managed_host(&[strings(&[0], &[])])
             .unwrap();
         assert_eq!(outputs[0].shape, [0, 0]);
         assert!(string_data(&outputs[0]).is_empty());

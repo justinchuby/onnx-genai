@@ -1,8 +1,9 @@
 use super::*;
 
 /// The `[shape, strides, byte_offset]` storage-bounds gate (Holden's
-/// precondition). Uses [`view_in_bounds`] for fixed-width dtypes and a
-/// signed bit-range check for sub-byte packed dtypes.
+/// precondition). Uses [`view_in_bounds`] for fixed-width dtypes and bit-range
+/// arithmetic for sub-byte dtypes (which have no integral per-element byte
+/// size).
 pub(super) fn view_bounds(
     shape: &[usize],
     strides: &[i64],
@@ -12,98 +13,78 @@ pub(super) fn view_bounds(
 ) -> Result<()> {
     let esize = dtype.byte_size();
     if dtype.is_sub_byte() {
-        return packed_view_bounds(shape, strides, byte_offset, dtype, buffer_len);
-    }
-    if esize == 0 {
-        // Preserve the existing size check for variable-width dtypes.
-        let storage_bytes =
-            onnx_runtime_ir::checked_expected_bytes(dtype, shape).ok_or_else(|| {
-                SessionError::ShapeOverflow {
-                    value: "sub-byte tensor view".to_string(),
-                    dims: shape.to_vec(),
-                }
-            })?;
-        let need =
-            byte_offset
-                .checked_add(storage_bytes)
-                .ok_or_else(|| SessionError::ShapeOverflow {
-                    value: "sub-byte tensor view byte offset".to_string(),
-                    dims: shape.to_vec(),
-                })?;
-        if need > buffer_len {
+        if shape.len() != strides.len() {
             return Err(SessionError::from(
                 onnx_runtime_ep_api::EpError::InvalidTensorView {
                     reason: format!(
-                        "sub-byte view needs {need} bytes but backing allocation is {buffer_len}"
+                        "rank mismatch: shape {} dims, strides {}",
+                        shape.len(),
+                        strides.len()
+                    ),
+                },
+            ));
+        }
+        if shape.contains(&0) {
+            return Ok(());
+        }
+        let mut min_element = 0_i128;
+        let mut max_element = 0_i128;
+        for (&dim, &stride) in shape.iter().zip(strides) {
+            let extent = ((dim - 1) as i128).checked_mul(stride as i128);
+            let Some(extent) = extent else {
+                return Err(SessionError::ShapeOverflow {
+                    value: "sub-byte tensor view element range".to_string(),
+                    dims: shape.to_vec(),
+                });
+            };
+            let bound = if extent < 0 {
+                &mut min_element
+            } else {
+                &mut max_element
+            };
+            let Some(next) = bound.checked_add(extent) else {
+                return Err(SessionError::ShapeOverflow {
+                    value: "sub-byte tensor view element range".to_string(),
+                    dims: shape.to_vec(),
+                });
+            };
+            *bound = next;
+        }
+        let bits = dtype.bit_size() as i128;
+        let origin = (byte_offset as i128).checked_mul(8);
+        let lo = origin.and_then(|origin| {
+            min_element
+                .checked_mul(bits)
+                .and_then(|offset| origin.checked_add(offset))
+        });
+        let hi = origin.and_then(|origin| {
+            max_element
+                .checked_mul(bits)
+                .and_then(|offset| origin.checked_add(offset))
+                .and_then(|start| start.checked_add(bits))
+        });
+        let capacity = (buffer_len as i128).checked_mul(8);
+        let (Some(lo), Some(hi), Some(capacity)) = (lo, hi, capacity) else {
+            return Err(SessionError::ShapeOverflow {
+                value: "sub-byte tensor view bit range".to_string(),
+                dims: shape.to_vec(),
+            });
+        };
+        if lo < 0 || hi > capacity {
+            return Err(SessionError::from(
+                onnx_runtime_ep_api::EpError::InvalidTensorView {
+                    reason: format!(
+                        "sub-byte view addresses bits [{lo}, {hi}) outside backing allocation [0, {capacity})"
                     ),
                 },
             ));
         }
         return Ok(());
     }
+    if esize == 0 {
+        return Ok(());
+    }
     view_in_bounds(shape, strides, byte_offset, esize, buffer_len)?;
-    Ok(())
-}
-
-fn packed_view_bounds(
-    shape: &[usize],
-    strides: &[i64],
-    byte_offset: usize,
-    dtype: DataType,
-    buffer_len: usize,
-) -> Result<()> {
-    let invalid =
-        |reason| SessionError::from(onnx_runtime_ep_api::EpError::InvalidTensorView { reason });
-    if shape.len() != strides.len() {
-        return Err(invalid(format!(
-            "packed {dtype:?} view rank mismatch: shape has {} dims, strides has {} entries",
-            shape.len(),
-            strides.len()
-        )));
-    }
-    let overflow = || SessionError::ShapeOverflow {
-        value: "sub-byte tensor view".into(),
-        dims: shape.to_vec(),
-    };
-    let (lo, hi) = if shape.contains(&0) {
-        (byte_offset as i128, byte_offset)
-    } else {
-        onnx_runtime_ir::checked_expected_bytes(dtype, shape).ok_or_else(overflow)?;
-        let (min, max) = shape
-            .iter()
-            .zip(strides)
-            .try_fold((0i128, 0i128), |(min, max), (&dim, &stride)| {
-                let extent = (dim - 1) as i128 * i128::from(stride);
-                Some((
-                    min.checked_add(extent.min(0))?,
-                    max.checked_add(extent.max(0))?,
-                ))
-            })
-            .ok_or_else(overflow)?;
-        let bits = dtype.bit_size() as i128;
-        // The byte containing the last bit is inclusive, even for a code
-        // spanning two bytes. Negative offsets must round down.
-        let first = min.checked_mul(bits).ok_or_else(overflow)?.div_euclid(8);
-        let last = max
-            .checked_mul(bits)
-            .and_then(|n| n.checked_add(bits - 1))
-            .ok_or_else(overflow)?
-            .div_euclid(8);
-        let lo = (byte_offset as i128)
-            .checked_add(first)
-            .ok_or_else(overflow)?;
-        let hi = (byte_offset as i128)
-            .checked_add(last)
-            .and_then(|n| n.checked_add(1))
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(overflow)?;
-        (lo, hi)
-    };
-    if lo < 0 || hi > buffer_len {
-        return Err(invalid(format!(
-            "packed {dtype:?} view addresses bytes [{lo}, {hi}) outside its {buffer_len}-byte backing; check shape, strides and byte offset"
-        )));
-    }
     Ok(())
 }
 
@@ -144,6 +125,10 @@ pub(super) fn gather_view(
     byte_offset: usize,
     esize: usize,
 ) -> Vec<u8> {
+    // Empty geometry addresses no bytes, even after an overflowing prefix.
+    if shape.contains(&0) {
+        return Vec::new();
+    }
     let n: usize = shape.iter().product();
     let mut out = vec![0u8; n * esize];
     gather_view_into(&mut out, src, shape, strides, byte_offset, esize);
@@ -164,6 +149,10 @@ pub(super) fn gather_view_into(
     byte_offset: usize,
     esize: usize,
 ) {
+    if shape.contains(&0) {
+        debug_assert!(dst.is_empty());
+        return;
+    }
     let n: usize = shape.iter().product();
     debug_assert_eq!(dst.len(), n * esize);
     if n == 0 {
@@ -312,19 +301,10 @@ fn gather_collapsed(
 /// `iter().product()`, under-sizing the backing buffer. Returns
 /// [`SessionError::ShapeOverflow`] instead so the caller allocates nothing.
 pub(super) fn checked_numel(dims: &[usize], value: impl FnOnce() -> String) -> Result<usize> {
-    let mut acc = 1usize;
-    for &d in dims {
-        acc = match acc.checked_mul(d) {
-            Some(n) => n,
-            None => {
-                return Err(SessionError::ShapeOverflow {
-                    value: value(),
-                    dims: dims.to_vec(),
-                });
-            }
-        };
-    }
-    Ok(acc)
+    onnx_runtime_ir::checked_numel(dims).ok_or_else(|| SessionError::ShapeOverflow {
+        value: value(),
+        dims: dims.to_vec(),
+    })
 }
 
 /// Byte size of `numel` elements of `dtype` with overflow checking. Even when
@@ -500,7 +480,7 @@ pub(super) fn kernel_input_uses_physical_capacity(node: &Node, input_index: usiz
         && onnx_runtime_ep_api::attention_window::AttentionWindow::from_node(node, 25)
             .is_ok_and(|window| !window.is_active())
         || (
-            // `pkg.nxrt::IndexShare` mirrors the mask-driven Attention treatment.
+            // `pkg.nxrt._private::IndexShare` mirrors the mask-driven Attention treatment.
             // Its capacity form emits the 3-output present that ALIASES the
             // fixed-capacity past bindings in place (past_key=input 3, past_value=
             // input 4) instead of a growing `past ⧺ current`, and carries the valid
@@ -510,14 +490,14 @@ pub(super) fn kernel_input_uses_physical_capacity(node: &Node, input_index: usiz
             // capture shape-static. Gated on the 3-output present + present bias so
             // the growing-concat form (1 output, or bias-less) still reads the cache
             // extent as the valid length.
-            node.domain == "pkg.nxrt"
+            node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
                 && node.op_type == "IndexShare"
                 && matches!(input_index, 3 | 4)
                 && node.outputs.len() == 3
                 && node.inputs.get(6).is_some_and(Option::is_some)
         )
         || (
-            // `pkg.nxrt::KvCacheCapacityAppend` (the CUDA-only rewritten form of a
+            // `pkg.nxrt._private::KvCacheCapacityAppend` (the CUDA-only rewritten form of a
             // decomposed-attention KV-cache growth `Concat`, see
             // `is_kv_cache_growth_concat`) writes `current` into a fixed-capacity
             // `past` in place at the offset(s) carried by its third operand
@@ -647,11 +627,11 @@ pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: us
 /// replaces an eligible growth `Concat` with this op so the KV cache is
 /// updated as an in-place capacity write instead of a growing concatenation,
 /// which is what lets whole-step CUDA-graph capture stay shape-static across
-/// decode steps. Kept as a bare literal (matching how `pkg.nxrt::IndexShare`
+/// decode steps. Kept as a bare literal (matching how `pkg.nxrt._private::IndexShare`
 /// is already spelled independently in each crate that touches it) rather
 /// than a cross-crate constant, since the rewrite and the kernel that
 /// executes it live in different crates with no shared dependency edge.
-pub(super) const KV_CAPACITY_APPEND_DOMAIN: &str = "pkg.nxrt";
+pub(super) const KV_CAPACITY_APPEND_DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
 /// Op type of the native-only S3 capacity-write append; see
 /// [`KV_CAPACITY_APPEND_DOMAIN`].
 pub(super) const KV_CAPACITY_APPEND_OP: &str = "KvCacheCapacityAppend";
@@ -666,7 +646,7 @@ pub(super) const KV_CAPACITY_APPEND_OP: &str = "KvCacheCapacityAppend";
 /// input/output *role* alone — not by name, axis, or tensor shape — so it
 /// matches any decomposed self-attention export that grows its cache with a
 /// plain `Concat` rather than an in-op cache (`Attention` /
-/// `GroupQueryAttention` / `pkg.nxrt::IndexShare`), and continues to match
+/// `GroupQueryAttention` / `pkg.nxrt._private::IndexShare`), and continues to match
 /// after the CUDA-only rewrite swaps the node for its capacity-write form —
 /// otherwise the mask-cone walk's `Add`-rule provenance check
 /// ([`derives_from_kv_cache_growth`]) would stop recognizing its own
@@ -1279,6 +1259,19 @@ fn describe_node(node: &Node) -> String {
 #[cfg(test)]
 mod gather_tests {
     use super::*;
+
+    #[test]
+    fn packed_view_bounds_account_for_sparse_and_negative_strides() {
+        assert!(view_bounds(&[3], &[2], 0, DataType::Uint4, 3).is_ok());
+        assert!(view_bounds(&[3], &[2], 0, DataType::Uint4, 2).is_err());
+        assert!(view_bounds(&[3], &[-2], 2, DataType::Uint4, 3).is_ok());
+        assert!(view_bounds(&[3], &[-2], 1, DataType::Uint4, 3).is_err());
+    }
+
+    #[test]
+    fn packed_view_bounds_accept_empty_tensors_without_a_valid_origin() {
+        assert!(view_bounds(&[0, 5], &[5, 1], usize::MAX, DataType::Int2, 0).is_ok());
+    }
     use onnx_runtime_ir::static_shape;
 
     #[test]
@@ -1508,5 +1501,15 @@ mod gather_tests {
     fn an_empty_view_gathers_to_an_empty_buffer() {
         assert!(gather_view(&[], &[0, 4], &[4, 1], 0, 4).is_empty());
         assert!(gather_view(&[1, 2, 3, 4], &[3, 0], &[1, 1], 0, 4).is_empty());
+        for shape in [[0, usize::MAX, 2], [usize::MAX, 0, 2], [usize::MAX, 2, 0]] {
+            assert!(gather_view(&[], &shape, &[i64::MIN; 3], usize::MAX, 4).is_empty());
+            gather_view_into(&mut [], &[], &shape, &[i64::MIN; 3], usize::MAX, 4);
+        }
+        // Rank zero is one scalar, distinct from a shape with a zero axis.
+        let scalar = [1, 2, 3, 4];
+        assert_eq!(gather_view(&scalar, &[], &[], 0, 4), scalar);
+        let mut destination = [0; 4];
+        gather_view_into(&mut destination, &scalar, &[], &[], 0, 4);
+        assert_eq!(destination, scalar);
     }
 }

@@ -125,7 +125,8 @@ impl ReasoningRequest {
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. },
+            | GenerateConstraint::Lark { prefix, .. }
+            | GenerateConstraint::XmlToolCall { prefix, .. },
         ) = options.constraint.as_mut()
         {
             if matches!(context, BudgetContext::Chat { .. }) && !prefix.is_empty() {

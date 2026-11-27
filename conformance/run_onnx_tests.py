@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 MAGIC = b"NXRTCF01"
+TENSOR_DTYPES = {1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 16}
 CPU_OPS = [
     "MatMul",
     "Add",
@@ -54,14 +55,14 @@ ADDITIONAL_PASS_OPS = ["Abs", "Conv", "Sigmoid"]
 # every PR's conformance job red. That is the control working, not failing.
 # When it happens again, do not relax the expectation: move this to another op
 # the EP genuinely declines (the runner must exit 2 with `UNSUPPORTED_OP`, and
-# `onnx.reference` must still be able to evaluate it). `Det` is chosen because
-# it is a linear-algebra op well outside this EP's dispatch and activation
-# roadmap, so it should stay declined far longer than an elementwise op will.
-SYNTHETIC_UNSUPPORTED_OP = "SyntheticUnsupportedDet"
+# `onnx.reference` must still be able to evaluate it).
+SYNTHETIC_UNSUPPORTED_OP = "SyntheticUnsupportedMeanVarianceNormalization"
 EXPECTED_STATUS = {
     **{op: "PASS" for op in CPU_OPS + ADDITIONAL_PASS_OPS},
     SYNTHETIC_UNSUPPORTED_OP: "UNSUPPORTED",
 }
+CUDA_DECLINE_CONTROL = "GemmFloat64"
+CUDA_SMOKE_STATUS = {"ReluFloat32": "PASS", CUDA_DECLINE_CONTROL: "UNSUPPORTED"}
 
 
 @dataclass
@@ -94,6 +95,15 @@ def conformance_failures(
                     " control, so the control is stale. Point"
                     " SYNTHETIC_UNSUPPORTED_OP at an op the EP still declines"
                     " rather than relaxing this expectation."
+                )
+            elif (
+                op == CUDA_DECLINE_CONTROL
+                and expected == "UNSUPPORTED"
+                and result.status == "PASS"
+            ):
+                hint = (
+                    " -- CUDA accepted the negative control; verify placement"
+                    " and update the control if capability changed."
                 )
             failures.append(
                 f"{op}: expected {expected}, got {result.status}"
@@ -128,6 +138,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--work-dir", type=Path, default=Path("target/ep-conformance"))
     parser.add_argument("--json", type=Path, help="optional result JSON output")
+    parser.add_argument(
+        "--cuda", action="store_true",
+        help="run the native CUDA smoke profile with no CPU fallback",
+    )
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="run the focused smoke fixtures on the selected provider (default: CPU)",
+    )
     return parser.parse_args()
 
 
@@ -244,7 +262,7 @@ def manual_model(op: str) -> onnx.ModelProto:
         "ReduceMean": np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32),
         "Unsqueeze": np.array([[1.0, 2.0]], dtype=np.float32),
         "Conv": np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3),
-        SYNTHETIC_UNSUPPORTED_OP: np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        SYNTHETIC_UNSUPPORTED_OP: np.arange(8, dtype=np.float32).reshape(1, 2, 2, 2),
     }
     if op == "Constant":
         node = helper.make_node(
@@ -332,18 +350,56 @@ def manual_model(op: str) -> onnx.ModelProto:
         )
     elif op == SYNTHETIC_UNSUPPORTED_OP:
         x = numpy_helper.from_array(values[op], "X")
-        node = helper.make_node("Det", ["X"], ["Y"])
+        node = helper.make_node("MeanVarianceNormalization", ["X"], ["Y"])
         graph = helper.make_graph(
             [node],
             op,
             [],
-            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, values[op].shape)],
             [x],
         )
     else:
         raise KeyError(op)
     opset = 12 if op in {"ReduceMean", "Unsqueeze"} else 17
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)], ir_version=9)
+
+
+def smoke_model(case: str) -> onnx.ModelProto:
+    import numpy as np
+    from onnx import helper, numpy_helper
+
+    if case == "ReluFloat32":
+        from onnx import TensorProto
+
+        graph = helper.make_graph(
+            [helper.make_node("Relu", ["X"], ["Y"], name=case)],
+            case,
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [3])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [3])],
+        )
+    elif case == CUDA_DECLINE_CONTROL:
+        # CUDA's Gemm claim checks dtype before creating the kernel; f64 is
+        # supported on CPU and by the bridge but declined at CUDA placement.
+        a = numpy_helper.from_array(np.array([[1.0, 2.0]], np.float64), "A")
+        b = numpy_helper.from_array(np.array([[3.0], [4.0]], np.float64), "B")
+        graph = helper.make_graph(
+            [helper.make_node("Gemm", ["A", "B"], ["Y"], name=case)],
+            case,
+            [],
+            [helper.make_tensor_value_info("Y", a.data_type, [1, 1])],
+            [a, b],
+        )
+    else:
+        raise KeyError(case)
+    return helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9
+    )
+
+
+def smoke_inputs(case: str) -> dict[str, np.ndarray]:
+    import numpy as np
+
+    return {"X": np.array([-2.0, 0.0, 3.0], np.float32)} if case == "ReluFloat32" else {}
 
 
 def write_tensor(path: Path, array: np.ndarray) -> None:
@@ -379,9 +435,17 @@ def read_tensor(path: Path) -> np.ndarray:
 
 
 def run_case(
-    op: str, source: str, model: onnx.ModelProto, runner: Path, work_dir: Path
+    op: str,
+    source: str,
+    model: onnx.ModelProto,
+    runner: Path,
+    work_dir: Path,
+    *,
+    cuda: bool = False,
+    inputs: dict[str, np.ndarray] | None = None,
 ) -> Result:
     import numpy as np
+    from onnx import helper
     from onnx.reference import ReferenceEvaluator
 
     case_dir = work_dir / op
@@ -389,21 +453,50 @@ def run_case(
     case_dir.mkdir(parents=True)
     model_path = case_dir / "model.onnx"
     model_path.write_bytes(model.SerializeToString())
+    inputs = {} if inputs is None else inputs
     try:
         with np.errstate(all="ignore"), warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            reference = ReferenceEvaluator(model).run(None, {})
+            reference = ReferenceEvaluator(model).run(None, inputs)
     except Exception as err:
         return Result(op, source, "ERROR", f"reference failed: {err}")
 
+    for i, value in enumerate(reference):
+        if not isinstance(value, np.ndarray):
+            return Result(
+                op, source, "UNSUPPORTED_FIXTURE",
+                f"reference output #{i} is not a tensor",
+            )
+        try:
+            dtype = helper.np_dtype_to_tensor_dtype(value.dtype)
+        except ValueError:
+            dtype = None
+        if dtype not in TENSOR_DTYPES and (cuda or dtype not in {14, 15}):
+            return Result(
+                op, source, "UNSUPPORTED_FIXTURE",
+                f"NXRTCF01 cannot encode reference output #{i} of dtype {value.dtype}",
+            )
+
+    for i, value in enumerate(model.graph.input):
+        if value.name in inputs:
+            write_tensor(case_dir / f"input_{i}.nxrt", inputs[value.name])
+    command = [str(runner.resolve())]
+    if cuda:
+        command.append("--cuda")
+    command.extend([str(model_path.resolve()), str(case_dir.resolve())])
     process = subprocess.run(
-        [str(runner.resolve()), str(model_path.resolve()), str(case_dir.resolve())],
+        command,
         text=True,
         capture_output=True,
     )
-    status_line = process.stdout.strip() or process.stderr.strip()
-    if process.returncode == 2 and status_line.startswith("UNSUPPORTED_OP\t"):
-        return Result(op, source, "UNSUPPORTED", status_line.split("\t", 1)[1])
+    stdout = process.stdout.strip()
+    status_line = stdout or process.stderr.strip()
+    if process.returncode == 2 and stdout.startswith("UNSUPPORTED_OP\t"):
+        return Result(op, source, "UNSUPPORTED", stdout.split("\t", 1)[1])
+    if process.returncode == 4 and stdout.startswith("UNSUPPORTED_FIXTURE\t"):
+        return Result(op, source, "UNSUPPORTED_FIXTURE", stdout.split("\t", 1)[1])
+    if process.returncode == 5 and stdout.startswith("SKIP\t"):
+        return Result(op, source, "SKIP", stdout.split("\t", 1)[1])
     if process.returncode != 0:
         return Result(
             op,
@@ -411,10 +504,21 @@ def run_case(
             "ERROR",
             f"exit {process.returncode}: {status_line or 'no diagnostic'}",
         )
+    if cuda and stdout != f"OK\t{len(reference)} outputs on CUDA:0":
+        return Result(
+            op, source, "ERROR",
+            f"missing strict CUDA:0 success for {len(reference)} output(s): "
+            f"{status_line or 'no diagnostic'}",
+        )
 
     actual = [read_tensor(case_dir / f"output_{i}.nxrt") for i in range(len(reference))]
     try:
         for got, expected in zip(actual, reference):
+            if got.shape != expected.shape or got.dtype != expected.dtype:
+                return Result(
+                    op, source, "MISMATCH",
+                    f"expected {expected.dtype} {expected.shape}, got {got.dtype} {got.shape}",
+                )
             if np.issubdtype(expected.dtype, np.floating):
                 np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-5)
             else:
@@ -427,18 +531,32 @@ def run_case(
 def main() -> int:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     args = parse_args()
-    generators = generated_cases(args.onnx_tests)
+    if args.cuda or args.smoke:
+        generators = {}
+        expected_status = (
+            CUDA_SMOKE_STATUS if args.cuda else dict.fromkeys(CUDA_SMOKE_STATUS, "PASS")
+        )
+    else:
+        generators = generated_cases(args.onnx_tests)
+        expected_status = EXPECTED_STATUS
     args.work_dir.mkdir(parents=True, exist_ok=True)
     results = []
-    for op in EXPECTED_STATUS:
+    for op in expected_status:
         source = (
             "onnx-tests"
             if op in generators and op not in {"Conv", SYNTHETIC_UNSUPPORTED_OP}
             else "focused ONNX"
         )
         try:
-            model = generators[op]() if op in generators else manual_model(op)
-            result = run_case(op, source, model, args.runner, args.work_dir)
+            if args.cuda or args.smoke:
+                model = smoke_model(op)
+                inputs = smoke_inputs(op)
+            else:
+                model = generators[op]() if op in generators else manual_model(op)
+                inputs = None
+            result = run_case(
+                op, source, model, args.runner, args.work_dir, cuda=args.cuda, inputs=inputs
+            )
         except Exception as err:
             result = Result(op, source, "ERROR", f"driver/generator failed: {err}")
         results.append(result)
@@ -446,28 +564,28 @@ def main() -> int:
 
     counts = {
         status: sum(result.status == status for result in results)
-        for status in ("PASS", "UNSUPPORTED", "MISMATCH", "ERROR")
+        for status in ("PASS", "UNSUPPORTED", "UNSUPPORTED_FIXTURE", "SKIP", "MISMATCH", "ERROR")
     }
     print("SUMMARY " + " ".join(f"{key}={value}" for key, value in counts.items()))
+    failures = conformance_failures(results, expected_status)
     if args.json:
         args.json.write_text(
             json.dumps(
                 {
                     "counts": counts,
-                    "failures": conformance_failures(results),
-                    "expected_status": EXPECTED_STATUS,
+                    "failures": failures,
+                    "expected_status": expected_status,
                     "results": [vars(result) for result in results],
                 },
                 indent=2,
             )
             + "\n"
         )
-    failures = conformance_failures(results)
     if failures:
         print("CONFORMANCE FAILURES:")
         for failure in failures:
             print(f"  {failure}")
-    return exit_code_for_results(results)
+    return exit_code_for_results(results, expected_status)
 
 
 if __name__ == "__main__":

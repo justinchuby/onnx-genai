@@ -7,6 +7,8 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, Dim, Graph, Node, Shape, broadcast_shapes};
 use rayon::prelude::*;
 
+use onnx_runtime_ir::qlinear_matmul::{ScaleSupport, ScaleType};
+
 use super::{check_arity, qgemm_native, to_dense_bytes, write_dense_bytes};
 use crate::DerivedWeightMemory;
 #[cfg(test)]
@@ -266,6 +268,7 @@ struct QgemmPackKey {
 }
 
 pub struct QLinearMatMulKernel {
+    scale_support: ScaleSupport,
     #[cfg(feature = "mlas")]
     retain_caches: bool,
     /// Which operands the graph guarantees are constant initializers. Only
@@ -281,6 +284,7 @@ pub struct QLinearMatMulKernel {
 }
 
 pub struct QLinearMatMulFactory {
+    scale_support: ScaleSupport,
     retain_caches: bool,
     weight_memory: DerivedWeightMemory,
 }
@@ -288,9 +292,15 @@ impl QLinearMatMulFactory {
     /// Bind retained reference packs to the provider's immutable Host grant source.
     pub fn new(retain_caches: bool, weight_memory: DerivedWeightMemory) -> Self {
         Self {
+            scale_support: ScaleSupport::FloatOnly,
             retain_caches,
             weight_memory,
         }
+    }
+
+    pub(crate) fn with_scale_support(mut self, scale_support: ScaleSupport) -> Self {
+        self.scale_support = scale_support;
+        self
     }
 }
 impl Default for QLinearMatMulFactory {
@@ -305,11 +315,20 @@ impl Default for QLinearMatMulKernel {
 }
 
 impl KernelFactory for QLinearMatMulFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_reason(self.scale_support, input_dtypes, shapes)
+    }
+
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(QLinearMatMulKernel::new(
-            self.retain_caches,
-            self.weight_memory.clone(),
-        )))
+        let mut kernel = QLinearMatMulKernel::new(self.retain_caches, self.weight_memory.clone());
+        kernel.scale_support = self.scale_support;
+        Ok(Box::new(kernel))
     }
 }
 
@@ -331,6 +350,7 @@ impl QLinearMatMulKernel {
             weight_memory.register_idle_cache(&packed_b);
         }
         Self {
+            scale_support: ScaleSupport::FloatOnly,
             #[cfg(feature = "mlas")]
             retain_caches,
             constant_inputs: [false; 8],
@@ -444,7 +464,8 @@ impl QLinearMatMulKernel {
 }
 
 /// Return a claim-time denial for metadata the CPU reference kernel cannot run.
-pub(crate) fn unsupported_reason(
+fn unsupported_reason(
+    scale_support: ScaleSupport,
     input_dtypes: &[DataType],
     input_shapes: &[Shape],
 ) -> Option<String> {
@@ -471,13 +492,13 @@ pub(crate) fn unsupported_reason(
                 ));
             }
         }
-        for &index in &[1, 4, 6] {
-            if input_dtypes[index] != DataType::Float32 {
-                return Some(format!(
-                    "QLinearMatMul: scale input {index} must be Float32, got {:?}",
-                    input_dtypes[index]
-                ));
-            }
+        if let Err(reason) = ScaleType::resolve(
+            scale_support,
+            input_dtypes[1],
+            input_dtypes[4],
+            input_dtypes[6],
+        ) {
+            return Some(format!("QLinearMatMul: {reason}"));
         }
     }
     if input_shapes.is_empty() {
@@ -719,13 +740,13 @@ impl QLinearMatMulKernel {
                 "QLinearMatMul: output dtype must match y_zero_point dtype".into(),
             ));
         }
-        for &index in &[1, 4, 6] {
-            if inputs[index].dtype != DataType::Float32 {
-                return Err(EpError::KernelFailed(format!(
-                    "QLinearMatMul: scale input {index} must be Float32"
-                )));
-            }
-        }
+        let scale_type = ScaleType::resolve(
+            self.scale_support,
+            inputs[1].dtype,
+            inputs[4].dtype,
+            inputs[6].dtype,
+        )
+        .map_err(|reason| EpError::KernelFailed(format!("QLinearMatMul: {reason}")))?;
 
         let geometry = Geometry::new(a.shape, b.shape)?;
         if outputs[0].shape != geometry.output_shape.as_slice() {
@@ -748,9 +769,23 @@ impl QLinearMatMulKernel {
                 )
             }
         };
-        let a_quant = QuantParams::load("a", &inputs[1], &inputs[2], a.shape, QuantAxis::Row)?;
-        let b_quant = QuantParams::load("b", &inputs[4], &inputs[5], b.shape, QuantAxis::Column)?;
-        let (y_scale, y_zero_point) = output_quant_params(&inputs[6], &inputs[7])?;
+        let a_quant = QuantParams::load(
+            "a",
+            &inputs[1],
+            &inputs[2],
+            a.shape,
+            QuantAxis::Row,
+            scale_type,
+        )?;
+        let b_quant = QuantParams::load(
+            "b",
+            &inputs[4],
+            &inputs[5],
+            b.shape,
+            QuantAxis::Column,
+            scale_type,
+        )?;
+        let (y_scale, y_zero_point) = output_quant_params(&inputs[6], &inputs[7], scale_type)?;
         if geometry.result_len == 0 {
             return Ok(());
         }
@@ -875,9 +910,11 @@ impl QLinearMatMulKernel {
             // element it is given (the shim leaves `IsAccumulateMode` false, so
             // the first `k` block runs in `ZeroMode`).
             #[cfg(feature = "mlas")]
-            let fused = match &qgemm {
-                Some(_) => fused_scale(&a_quant, a_batch, &b_scales, y_scale, &mut combined_scales),
-                None => None,
+            let fused = match (&qgemm, scale_type) {
+                (Some(_), ScaleType::Float32) => {
+                    fused_scale(&a_quant, a_batch, &b_scales, y_scale, &mut combined_scales)
+                }
+                _ => None,
             };
 
             if let Some(plan) = &qgemm {
@@ -934,7 +971,8 @@ impl QLinearMatMulKernel {
                         products,
                     )?,
                 }
-                requantize_rows(
+                requantize_typed_rows(
+                    scale_type,
                     products,
                     &a_quant,
                     a_batch,
@@ -979,7 +1017,8 @@ impl QLinearMatMulKernel {
                 products,
             );
 
-            requantize_rows(
+            requantize_typed_rows(
+                scale_type,
                 products,
                 &a_quant,
                 a_batch,
@@ -1036,6 +1075,7 @@ impl QuantParams {
         zero_point: &TensorView,
         operand_shape: &[usize],
         axis: QuantAxis,
+        scale_type: ScaleType,
     ) -> Result<Self> {
         if scale.shape != zero_point.shape {
             return Err(EpError::KernelFailed(format!(
@@ -1052,7 +1092,7 @@ impl QuantParams {
                 scale.shape, operand_shape
             )));
         };
-        let scales = read_scales(scale)?;
+        let scales = read_scales(scale, scale_type)?;
         let zero_points = read_quantized(zero_point)?;
         let axis_len = match axis {
             QuantAxis::Row => {
@@ -1108,7 +1148,11 @@ fn is_axis_shape(shape: &[usize], operand: &[usize], axis: QuantAxis) -> bool {
     }
 }
 
-fn output_quant_params(scale: &TensorView, zero_point: &TensorView) -> Result<(f32, i32)> {
+fn output_quant_params(
+    scale: &TensorView,
+    zero_point: &TensorView,
+    scale_type: ScaleType,
+) -> Result<(f32, i32)> {
     if scale.shape != zero_point.shape {
         return Err(EpError::KernelFailed(
             "QLinearMatMul: y_scale and y_zero_point shapes must match".into(),
@@ -1119,17 +1163,35 @@ fn output_quant_params(scale: &TensorView, zero_point: &TensorView) -> Result<(f
             "QLinearMatMul: output scale and zero point must be scalar".into(),
         ));
     }
-    Ok((read_scales(scale)?[0], read_quantized(zero_point)?[0]))
+    Ok((
+        read_scales(scale, scale_type)?[0],
+        read_quantized(zero_point)?[0],
+    ))
 }
 
-fn read_scales(view: &TensorView) -> Result<Vec<f32>> {
+fn read_scales(view: &TensorView, scale_type: ScaleType) -> Result<Vec<f32>> {
     let bytes = to_dense_bytes(view)?;
-    let scales: Vec<f32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect();
+    let scales: Vec<f32> = match scale_type {
+        ScaleType::Float32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(f32::from_le_bytes)
+            .collect(),
+        ScaleType::Float16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| half::f16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
+            .collect(),
+        ScaleType::BFloat16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| half::bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
+            .collect(),
+    };
     if scales
         .iter()
         .any(|value| *value <= 0.0 || !value.is_finite())
@@ -1470,12 +1532,79 @@ fn fused_scale<'a>(
 /// during the saturating float-to-integer cast, before adding the zero point.
 #[inline]
 fn requantize_byte(accumulated: i32, scale: f32, zero: i32, dtype: DataType) -> u8 {
-    let value =
-        ((accumulated as f32 * scale).round_ties_even() as i64).saturating_add(i64::from(zero));
+    saturate_quantized(
+        (accumulated as f32 * scale).round_ties_even() as i64,
+        zero,
+        dtype,
+    )
+}
+
+#[inline]
+fn saturate_quantized(rounded: i64, zero: i32, dtype: DataType) -> u8 {
+    let value = rounded.saturating_add(i64::from(zero));
     match dtype {
         DataType::Int8 => value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8,
         _ => value.clamp(0, u8::MAX as i64) as u8,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn requantize_typed_rows(
+    scale_type: ScaleType,
+    products: &[i32],
+    a_quant: &QuantParams,
+    a_batch: usize,
+    b_scales: &[f32],
+    n: usize,
+    y_scale: f32,
+    y_zero_point: i32,
+    dtype: DataType,
+    destination: &mut [u8],
+) -> Result<()> {
+    let round_to_scale_type: fn(f64) -> f64 = match scale_type {
+        ScaleType::Float32 => {
+            return requantize_rows(
+                products,
+                a_quant,
+                a_batch,
+                b_scales,
+                n,
+                y_scale,
+                y_zero_point,
+                dtype,
+                destination,
+            );
+        }
+        ScaleType::Float16 => |value| half::f16::from_f64(value).to_f64(),
+        ScaleType::BFloat16 => |value| half::bf16::from_f64(value).to_f64(),
+    };
+    // The ONNX reference evaluates the multiply and divide in TS, then
+    // multiplies the resulting scale by the i32 accumulator in Float64.
+    let combine = |a: f32, b: f32| {
+        let numerator = round_to_scale_type(f64::from(a) * f64::from(b));
+        round_to_scale_type(numerator / f64::from(y_scale))
+    };
+    let shared_scales: Option<Vec<_>> = (!a_quant.per_axis).then(|| {
+        let a = a_quant.at(a_batch, 0).0;
+        b_scales.iter().map(|&b| combine(a, b)).collect()
+    });
+    apply_requantization_rows(products, destination, n, |row, acc, out| {
+        let a = a_quant.at(a_batch, row).0;
+        for (col, (&sum, byte)) in acc.iter().zip(out).enumerate() {
+            let scale = shared_scales
+                .as_ref()
+                .map_or_else(|| combine(a, b_scales[col]), |scales| scales[col]);
+            let rounded = (f64::from(sum) * scale).round_ties_even();
+            // A zero accumulator times an overflowing scale yields NaN. The
+            // ONNX reference casts that final NaN to integer zero.
+            *byte = if rounded.is_nan() {
+                0
+            } else {
+                saturate_quantized(rounded as i64, y_zero_point, dtype)
+            };
+        }
+    });
+    Ok(())
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -2535,8 +2664,88 @@ mod tests {
         Owned {
             bytes: values.iter().map(|&value| value as u8).collect(),
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
             dtype: DataType::Int8,
+        }
+    }
+
+    #[test]
+    fn scale_types_match_expected_integer_bytes() {
+        let a = Owned::u8(&[2, 1], &[4, 6]);
+        let a_zero = Owned::u8(&[2], &[3, 3]);
+        let b = i8(&[1, 2], &[2, -2]);
+        let b_zero = i8(&[2], &[1, -1]);
+        let y_zero = Owned::u8(&[], &[10]);
+        let registry = crate::kernels::build_cpu_registry();
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
+        for (opset, scale) in [
+            (10, Owned::f32 as fn(&[usize], &[f32]) -> Owned),
+            (10, Owned::f16),
+            (10, Owned::bf16),
+            (21, Owned::f16),
+            (21, Owned::bf16),
+        ] {
+            let a_scale = scale(&[2], &[0.5, 1.5]);
+            let b_scale = scale(&[2], &[1.0, 0.5]);
+            let y_scale = scale(&[], &[1.0]);
+            let inputs = [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ]
+            .map(|input| input.view());
+            let mut output = Owned::u8(&[2, 2], &[0; 4]);
+            let kernel = registry
+                .lookup("QLinearMatMul", "", opset)
+                .unwrap()
+                .create(&node, &[])
+                .unwrap();
+            let mut scratch = [MaybeUninit::<i32>::uninit(); 4];
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(scratch.as_mut_ptr().cast()),
+                std::mem::size_of_val(&scratch),
+            );
+            kernel
+                .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(workspace))
+                .unwrap();
+            assert_eq!(output.bytes, [10, 10, 14, 8], "{:?}", a_scale.dtype);
+        }
+    }
+
+    #[test]
+    fn half_scale_arithmetic_rounds_each_operation_in_the_scale_type() {
+        let b = i8(&[1, 1], &[1]);
+        let b_zero = i8(&[], &[0]);
+        let zero = Owned::u8(&[], &[0]);
+        let kernel = QLinearMatMulKernel {
+            scale_support: ScaleSupport::FloatAndHalf,
+            ..QLinearMatMulKernel::default()
+        };
+        for (make_scale, scales, accumulator, output_zero, expected) in [
+            (
+                Owned::f16 as fn(&[usize], &[f32]) -> Owned,
+                [0.2, 0.75, 0.2],
+                2,
+                0,
+                1,
+            ),
+            (Owned::bf16, [0.5, 1024.0, 76.0], 2, 0, 14),
+            (Owned::f16, [256.0; 3], 1, 0, 255),
+            (Owned::bf16, [f32::from_bits(0x5f80_0000); 3], 1, 0, 255),
+            (Owned::f16, [256.0; 3], 0, 17, 0),
+            (Owned::bf16, [f32::from_bits(0x5f80_0000); 3], 0, 17, 0),
+        ] {
+            let a = Owned::u8(&[1, 1], &[accumulator]);
+            let [a_scale, b_scale, y_scale] = scales.map(|scale| make_scale(&[], &[scale]));
+            let y_zero = Owned::u8(&[], &[output_zero]);
+            let inputs = [
+                &a, &a_scale, &zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ]
+            .map(|input| input.view());
+            let mut output = Owned::u8(&[1, 1], &[0]);
+            kernel
+                .execute_prepared(&inputs, &mut [output.view_mut()])
+                .unwrap();
+            assert_eq!(output.bytes, [expected], "{:?} {scales:?}", a_scale.dtype);
         }
     }
 
@@ -3287,6 +3496,7 @@ mod tests {
             &a_zero.view(),
             &[m, k],
             QuantAxis::Row,
+            ScaleType::Float32,
         )
         .unwrap();
         let mut buffer = Vec::new();
@@ -3352,6 +3562,7 @@ mod tests {
             &a_zero.view(),
             &[m, k],
             QuantAxis::Row,
+            ScaleType::Float32,
         )
         .unwrap();
         let mut buffer = Vec::new();
@@ -3417,6 +3628,7 @@ mod tests {
             &a_zero.view(),
             &[m, k],
             QuantAxis::Row,
+            ScaleType::Float32,
         )
         .unwrap();
         let mut buffer = Vec::new();
@@ -3536,6 +3748,7 @@ mod tests {
             &a_zero.view(),
             &[2, 2],
             QuantAxis::Row,
+            ScaleType::Float32,
         )
         .unwrap();
         let mut buffer = Vec::new();

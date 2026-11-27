@@ -48,6 +48,208 @@ fn assert_strings(tensor: &Tensor, dims: &[usize], values: &[&str]) {
     assert!(tensor.device_ptr().is_null());
 }
 
+fn compress_graph(opset: u64, axis: Option<i64>, dtype: DataType, dims: &[usize]) -> Graph {
+    let mut graph = graph(opset);
+    let x = input(&mut graph, "X", &[2, 3]);
+    let condition =
+        graph.create_named_value("condition", dtype, static_shape(dims.iter().copied()));
+    graph.add_input(condition);
+    let selected = Dim::Symbolic(graph.intern_symbol("selected"));
+    let output_shape = match axis {
+        None => vec![selected],
+        Some(0) => vec![selected, Dim::Static(3)],
+        Some(-1) => vec![Dim::Static(2), selected],
+        _ => unreachable!(),
+    };
+    let y = graph.create_named_value("Y", DataType::String, output_shape);
+    let attrs: Vec<_> = axis
+        .into_iter()
+        .map(|axis| ("axis", Attribute::Int(axis)))
+        .collect();
+    node(&mut graph, "Compress", &[x, condition], &[y], &attrs);
+    graph.add_output(y);
+    graph
+}
+
+#[test]
+fn string_compress_loads_opsets_19_and_28_and_preserves_values() {
+    let x = strings(&[2, 3], &["α", "a\0b", "猫", "", "é", "other"]);
+    for opset in [19, 28] {
+        for (axis, mask, dims, expected) in [
+            (
+                None,
+                &[0, 1, 0, 1, 0, 0, 1][..],
+                &[2][..],
+                &["a\0b", ""][..],
+            ),
+            (
+                Some(-1),
+                &[1, 1][..],
+                &[2, 2][..],
+                &["α", "a\0b", "", "é"][..],
+            ),
+            (
+                Some(0),
+                &[0, 1, 1][..],
+                &[1, 3][..],
+                &["", "é", "other"][..],
+            ),
+            (None, &[][..], &[0][..], &[][..]),
+            (Some(-1), &[0, 0, 0, 1][..], &[2, 0][..], &[][..]),
+        ] {
+            let graph = compress_graph(opset, axis, DataType::Bool, &[mask.len()]);
+            let model = onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph))
+                .unwrap();
+            let mut session = InferenceSession::load_bytes(&model).unwrap();
+            let mask = Tensor::from_raw(DataType::Bool, vec![mask.len()], mask).unwrap();
+            let outputs = session.run(&[("X", &x), ("condition", &mask)]).unwrap();
+            assert_strings(&outputs[0], dims, expected);
+        }
+    }
+}
+
+#[test]
+fn string_compress_requires_a_rank_one_bool_condition() {
+    let graph = compress_graph(19, None, DataType::Bool, &[1, 2]);
+    let model =
+        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph)).unwrap();
+    let error = InferenceSession::load_bytes(&model)
+        .err()
+        .expect("ONNX loading must reject a declared rank-two condition");
+    let detail = error.to_string();
+    assert!(
+        detail.contains("Compress") && detail.contains("rank 1"),
+        "{detail}"
+    );
+
+    let x = strings(&[2, 3], &["a", "b", "c", "d", "e", "f"]);
+    // In-memory graphs may reach the kernel without the loader's shape inference.
+    let rank_two = Tensor::from_raw(DataType::Bool, vec![1, 2], &[0, 1]).unwrap();
+    let mut session = InferenceSession::from_graph(graph).unwrap();
+    let detail = session
+        .run(&[("X", &x), ("condition", &rank_two)])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        detail.contains("Compress: condition must be a one-dimensional Bool tensor"),
+        "{detail}"
+    );
+
+    let bad_condition = Tensor::from_i64(&[2], &[0, 1]).unwrap();
+    let detail = match InferenceSession::from_graph(compress_graph(28, None, DataType::Int64, &[2]))
+    {
+        Ok(mut session) => session
+            .run(&[("X", &x), ("condition", &bad_condition)])
+            .unwrap_err()
+            .to_string(),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        detail.contains("Compress") && detail.to_ascii_lowercase().contains("bool"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn string_compress_reads_a_bound_host_bool_condition() {
+    let mut session =
+        InferenceSession::from_graph(compress_graph(28, Some(-1), DataType::Bool, &[2])).unwrap();
+    let mut mask = session
+        .allocate_device_binding(
+            "condition",
+            None::<String>,
+            DataType::Bool,
+            vec![4],
+            vec![2],
+        )
+        .unwrap();
+    mask.write_bytes(0, &[0, 1, 1, 1]).unwrap();
+    let x = strings(&[2, 3], &["α", "a\0b", "猫", "", "é", "other"]);
+    let outputs = session
+        .run_with_device_bindings(&[("X", &x)], std::slice::from_mut(&mut mask))
+        .unwrap();
+    assert_strings(outputs[0].as_ref().unwrap(), &[2, 1], &["a\0b", "é"]);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+fn string_compress_requested_cuda_reports_host_placement() {
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+    use std::{path::Path, sync::Arc};
+
+    let mut session = InferenceSession::from_graph_with_provider(
+        compress_graph(28, Some(-1), DataType::Bool, &[2]),
+        Arc::new(onnx_runtime_loader::WeightStore::new()),
+        Path::new("."),
+        Arc::new(CudaExecutionProvider::initialized(0).expect("initialize CUDA device 0")),
+        None,
+    )
+    .unwrap();
+    let report = session
+        .execution_provider_fallback_report()
+        .unwrap()
+        .to_string();
+    assert!(
+        report.contains("Compress") && report.contains("no device representation"),
+        "{report}"
+    );
+    let x = strings(&[2, 3], &["a", "猫", "c", "d", "e\0", "f"]);
+    let mask = Tensor::from_raw(DataType::Bool, vec![2], &[0, 1]).unwrap();
+    let outputs = session.run(&[("X", &x), ("condition", &mask)]).unwrap();
+    assert_strings(&outputs[0], &[2, 1], &["猫", "e\0"]);
+}
+
+fn equal_graph(opset: u64, dtype: DataType) -> Graph {
+    let mut graph = graph(opset);
+    let x = graph.create_named_value("X", dtype, static_shape([3, 1]));
+    let y = graph.create_named_value("Y", dtype, static_shape([4]));
+    graph.add_input(x);
+    graph.add_input(y);
+    let z = graph.create_named_value("Z", DataType::Bool, static_shape([3, 4]));
+    node(&mut graph, "Equal", &[x, y], &[z], &[]);
+    graph.add_output(z);
+    graph
+}
+
+#[test]
+fn equal_string_broadcasts_exact_values_to_bool_at_opset_19_and_later() {
+    let lhs = strings(&[3, 1], &["caf\u{e9}", "", "a\0b"]);
+    let rhs = strings(&[4], &["cafe\u{301}", "", "a\0b", "caf\u{e9}"]);
+    for opset in [19, 20] {
+        let mut session = InferenceSession::from_graph(equal_graph(opset, DataType::String))
+            .unwrap_or_else(|error| panic!("Equal at opset {opset}: {error}"));
+        let output = session.run(&[("X", &lhs), ("Y", &rhs)]).unwrap();
+        assert_eq!(output[0].dtype, DataType::Bool);
+        assert_eq!(output[0].shape, [3, 4]);
+        assert_eq!(output[0].as_bytes(), [0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0]);
+    }
+}
+
+#[test]
+fn equal_string_requires_opset_19_without_changing_pre_19_numeric_equal() {
+    let error = InferenceSession::from_graph(equal_graph(18, DataType::String))
+        .err()
+        .expect("opset 18 must not admit string Equal");
+    let message = error.to_string();
+    assert!(
+        message.contains("Equal") && message.contains("opset 18"),
+        "{message}"
+    );
+    assert!(message.contains("opset 19"), "{message}");
+
+    for opset in [18, 19] {
+        let mut session = InferenceSession::from_graph(equal_graph(opset, DataType::Float32))
+            .unwrap_or_else(|error| panic!("Equal at opset {opset}: {error}"));
+        let lhs = Tensor::from_f32(&[3, 1], &[0.0, 1.0, f32::NAN]).unwrap();
+        let rhs = Tensor::from_f32(&[4], &[-0.0, 1.0, f32::NAN, 2.0]).unwrap();
+        let output = session.run(&[("X", &lhs), ("Y", &rhs)]).unwrap();
+        assert_eq!(output[0].dtype, DataType::Bool);
+        assert_eq!(output[0].shape, [3, 4]);
+        assert_eq!(output[0].as_bytes(), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    }
+}
+
 fn regex_graph(opset: u64, dims: &[usize], pattern: &str) -> Graph {
     let mut graph = graph(opset);
     let x = input(&mut graph, "X", dims);

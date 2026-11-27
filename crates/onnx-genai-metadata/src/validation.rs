@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extensions::{
-    ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
+    ADAPTERS_GGUF_V1, ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
     DFLASH_FLAT_BLOCK_V1, DFLASH_FLAT_BLOCK_V2, ExtensionConsumerSupport, ExtensionSurface,
     GRAMMAR_GUIDANCE_V1, ORT_LORA_ADAPTER_V1, PARAMETER_OVERLAY_V1, SPECULATIVE_V1, TELEMETRY_V1,
     TOKEN_CONTEXT_V1, admit_exact,
@@ -110,12 +110,72 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     // derived complaint about the same missing fact.
     let version = crate::version::normalize(metadata.schema_version.as_deref())
         .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
+    if let Some(infill) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.infill.as_ref())
+    {
+        if let Err(error) = crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::InfillContext,
+            "package.infill",
+        ) {
+            errors.push(error);
+        }
+        let tokens = [
+            &infill.prefix_token,
+            &infill.middle_token,
+            &infill.suffix_token,
+        ];
+        if tokens.iter().any(|token| token.is_empty())
+            || tokens
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != 3
+        {
+            errors.push("package.infill requires three distinct nonempty control token spellings; use the package tokenizer's exact registered roles".into());
+        }
+        if infill.additional_stop_tokens.iter().any(String::is_empty) {
+            errors.push("package.infill.additional_stop_tokens contains an empty spelling; declare exact registered tokenizer tokens or omit the list".into());
+        }
+        if infill
+            .extra_context_template
+            .as_ref()
+            .is_some_and(|template| template.trim().is_empty())
+        {
+            errors.push("package.infill.extra_context_template must be nonempty; author the file context serialization or omit the capability".into());
+        }
+    }
+    crate::schema::validate_graph_weights(&metadata.graph_weights, &mut errors);
+    if !metadata.graph_weights.is_empty()
+        && let Err(error) = crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::GraphWeights,
+            "graph_weights",
+        )
+    {
+        errors.push(error);
+    }
     if let Some(pipeline) = &metadata.pipeline
         && let Err(error) = validate_pipeline_spec(pipeline, version)
     {
         errors.extend(error.errors);
     }
     if let Some(service) = &metadata.adapters {
+        for (name, artifact) in &service.artifacts {
+            for (index, weight) in artifact.weights.iter().enumerate() {
+                if weight.format == crate::schema::AdapterWeightFormat::Gguf
+                    && let Err(error) = crate::version::gate_feature_use(
+                        version,
+                        crate::version::SchemaFeature::GgufAdapter,
+                        &format!("adapters.artifacts.{name}.weights[{index}].format"),
+                    )
+                {
+                    errors.push(error);
+                }
+            }
+        }
         validate_adapter_service(
             service,
             metadata.pipeline.as_ref().map(|p| &p.workflow),
@@ -889,11 +949,15 @@ const KNOWN_PROFILE_KINDS: &[&str] = &[
     "classification",
     "reward",
     "transcription",
+    "realtime",
 ];
 
 /// A required profile must be executable by this reader; an ignorable profile
 /// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
 fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if let Err(error) = crate::realtime::realtime_contract(metadata) {
+        errors.push(error);
+    }
     if let Err(error) = crate::decision::decision_contract(metadata) {
         errors.push(error.to_string());
     }
@@ -1259,7 +1323,15 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
         ),
     ];
     for (kind, abi, program_outputs) in programs {
-        validate_preprocessing_program(workflow, kind, abi, program_outputs, errors);
+        validate_preprocessing_program(
+            workflow,
+            kind,
+            abi,
+            program_outputs,
+            crate::version::normalize(metadata.schema_version.as_deref())
+                .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION),
+            errors,
+        );
     }
 }
 
@@ -1268,41 +1340,109 @@ fn validate_preprocessing_program(
     kind: &str,
     abi: &str,
     program_outputs: Option<Vec<PreprocessingOutputView<'_>>>,
+    version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
-    const ABI_VERSION: &str = "1";
-
+    use crate::extensions::PreprocessingOutputScope;
     let adapters = workflow
         .components
         .iter()
-        .filter(|(_, component)| {
-            matches!(
-                &component.implementation,
-                crate::schema::ComponentImplementation::Adapter { abi: component_abi, version, .. }
-                    if component_abi == abi && version == ABI_VERSION
-            )
+        .filter_map(|(name, component)| {
+            let crate::schema::ComponentImplementation::Adapter {
+                abi: component_abi,
+                version,
+                ..
+            } = &component.implementation
+            else {
+                return None;
+            };
+            if component_abi != abi {
+                return None;
+            }
+            let scope = match PreprocessingOutputScope::for_version(version) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    errors.push(format!(
+                        "workflow preprocessing component '{name}' using {abi}: {error}"
+                    ));
+                    return None;
+                }
+            };
+            Some((name, component, scope, version))
         })
         .collect::<Vec<_>>();
     if program_outputs.is_none() && !adapters.is_empty() {
-        errors.push(format!(
-            "workflow adapter components using {abi}@{ABI_VERSION} require \
-                 preprocessing.{kind} metadata"
-        ));
+        for version in adapters
+            .iter()
+            .map(|(_, _, _, version)| *version)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            errors.push(format!(
+                "workflow adapter components using {abi}@{version} require preprocessing.{kind} metadata"
+            ));
+        }
         return;
     }
     let Some(program_outputs) = program_outputs else {
         return;
     };
     validate_program_companion_roles(kind, &program_outputs, errors);
+    // An external feature program binds a named runtime media tensor directly;
+    // an encoded program instead belongs to its workflow adapter invocation.
+    if kind == "audio" && adapters.is_empty() {
+        let bindings = program_outputs
+            .iter()
+            .filter_map(|output| {
+                let input = workflow.inputs.get(output.name)?;
+                (input.contract.dtype == "float32"
+                    && input.contract.rank() == 3
+                    && matches!(
+                        input.role,
+                        crate::schema::SemanticInputRole::Runtime {
+                            role: crate::schema::RuntimeInputRole::Media,
+                            ..
+                        }
+                    ))
+                .then_some((output, input))
+            })
+            .collect::<Vec<_>>();
+        if !bindings.is_empty() {
+            if let Err(error) = crate::version::gate_feature_use(
+                version,
+                crate::version::SchemaFeature::AudioFeatureInputs,
+                "preprocessing.audio feature input binding",
+            ) {
+                errors.push(error);
+            }
+            if bindings.len() != 1 {
+                errors.push("preprocessing.audio external feature binding is ambiguous; declare exactly one named float32 rank-3 runtime media input".into());
+            }
+            for (output, input) in bindings {
+                if output.dtype != "float32"
+                    || output.content != "audio_features"
+                    || output.optional
+                    || !matches!(input.source, crate::schema::WorkflowInputSource::Request)
+                {
+                    errors.push(format!("preprocessing.audio output '{}' must be required float32 audio_features bound to a request-sourced media input; correct its content/dtype/source", output.name));
+                }
+                if let Some(contract) = output.contract
+                    && !contract.representation_compatible_with(&input.contract)
+                {
+                    errors.push(format!("preprocessing.audio external feature output '{}' disagrees with its media input; match dtype, shape, batch layout and padding",output.name));
+                }
+            }
+            return;
+        }
+    }
     if adapters.len() != 1 {
         errors.push(format!(
             "preprocessing.{kind} requires exactly one workflow adapter component using \
-                 {abi}@{ABI_VERSION}, found {}",
+                 {abi}, found {}",
             adapters.len()
         ));
         return;
     }
-    let (adapter_name, adapter) = adapters[0];
+    let (adapter_name, adapter, scope, version) = adapters[0];
     match adapter.ports.inputs.get("encoded") {
         Some(contract) if contract.dtype == "uint8" && contract.rank() == 1 => {}
         Some(contract) => errors.push(format!(
@@ -1355,15 +1495,16 @@ fn validate_preprocessing_program(
     };
     let mut invocations = Vec::new();
     collect_invocations(&compiled.graph, adapter_name, &mut invocations);
-    if invocations.len() != 1 {
+    if invocations.is_empty()
+        || (scope == PreprocessingOutputScope::WorkflowValue && invocations.len() != 1)
+    {
         errors.push(format!(
-            "workflow {kind} preprocessing adapter '{adapter_name}' must be invoked exactly once, \
-                 found {} invocations",
+            "workflow {kind} preprocessing adapter '{adapter_name}' version {version} requires {}; found {} invocations",
+            if scope == PreprocessingOutputScope::WorkflowValue { "exactly one invocation with workflow-scoped output names" } else { "at least one invocation with component-local output ports" },
             invocations.len()
         ));
         return;
     }
-    let invocation_outputs = invocations[0];
     for output in &program_outputs {
         if output.optional {
             errors.push(format!(
@@ -1385,15 +1526,21 @@ fn validate_preprocessing_program(
                 output.name, output.dtype, contract.dtype
             ));
         }
-        let port = invocation_outputs
-            .iter()
-            .find_map(|(port, value)| (value == output.name).then_some(port));
+        let port = match scope {
+            PreprocessingOutputScope::WorkflowValue => invocations[0]
+                .iter()
+                .find_map(|(port, value)| (value == output.name).then_some(port.as_str())),
+            PreprocessingOutputScope::ComponentPort => {
+                for invocation in &invocations {
+                    if !invocation.contains_key(output.name) {
+                        errors.push(format!("preprocessing.{kind} output port '{}' must be bound by every invocation of '{adapter_name}'", output.name));
+                    }
+                }
+                Some(output.name)
+            }
+        };
         let Some(port) = port else {
-            errors.push(format!(
-                "preprocessing.{kind} output '{}' must be a declared SSA output of adapter \
-                     invocation '{adapter_name}'",
-                output.name
-            ));
+            errors.push(format!("preprocessing.{kind} output '{}' must be a declared SSA output of adapter invocation '{adapter_name}'", output.name));
             continue;
         };
         match adapter.ports.outputs.get(port) {
@@ -1788,6 +1935,7 @@ fn validate_adapter_service(
                 crate::schema::AdapterWeightFormat::Json => ADAPTERS_JSON_V1,
                 crate::schema::AdapterWeightFormat::OrtGenai => ORT_LORA_ADAPTER_V1,
                 crate::schema::AdapterWeightFormat::HfPeft => ADAPTERS_HF_PEFT_V1,
+                crate::schema::AdapterWeightFormat::Gguf => ADAPTERS_GGUF_V1,
                 crate::schema::AdapterWeightFormat::Safetensors => ADAPTERS_SAFETENSORS_V1,
             };
             if !expected_loader.matches_wire_name(&weight.loader_capability) {
@@ -1799,13 +1947,15 @@ fn validate_adapter_service(
             }
             match (&weight.format, &weight.scale_encoding) {
                 (
-                    crate::schema::AdapterWeightFormat::HfPeft,
+                    crate::schema::AdapterWeightFormat::HfPeft
+                    | crate::schema::AdapterWeightFormat::Gguf,
                     crate::schema::AdapterScaleEncoding::AlphaOverRank,
                 )
                 | (
                     crate::schema::AdapterWeightFormat::OrtGenai,
                     crate::schema::AdapterScaleEncoding::Baked,
                 )
+                | (crate::schema::AdapterWeightFormat::Gguf, _)
                 | (crate::schema::AdapterWeightFormat::Json, _)
                 | (crate::schema::AdapterWeightFormat::Safetensors, _) => {}
                 (crate::schema::AdapterWeightFormat::HfPeft, _) => errors.push(format!(
@@ -3874,7 +4024,7 @@ fn describe_batch_layout(layout: &crate::schema::BatchLayout) -> String {
 /// axis. Stating that exactly is what lets a runtime index it without knowing
 /// what the value means.
 #[allow(clippy::too_many_arguments)]
-fn validate_valid_lengths_shape(
+pub(crate) fn validate_valid_lengths_shape(
     path: &str,
     contract: &crate::schema::TensorContract,
     dimension: &str,

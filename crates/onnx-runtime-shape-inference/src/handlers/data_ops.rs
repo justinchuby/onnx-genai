@@ -123,6 +123,51 @@ pub fn constant(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// the `value` attribute (default float32).
 pub fn constant_of_shape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let (dtype, fill) = value_attr_scalar(ctx.node);
+    // The value tensor determines T2, even when the shape is a runtime input.
+    let since = match dtype {
+        DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Uint8
+        | DataType::Uint16
+        | DataType::Uint32
+        | DataType::Uint64
+        | DataType::Bool => 9,
+        DataType::BFloat16
+        | DataType::Float8E4M3FN
+        | DataType::Float8E4M3FNUZ
+        | DataType::Float8E5M2
+        | DataType::Float8E5M2FNUZ => 20,
+        DataType::Int4 | DataType::Uint4 => 21,
+        DataType::Float4E2M1 => 23,
+        DataType::Float8E8M0 => 24,
+        DataType::Int2 | DataType::Uint2 => 25,
+        _ => {
+            return Err(ShapeInferError::Invalid {
+                op: "ConstantOfShape".into(),
+                detail: format!(
+                    "the 'value' tensor dtype {dtype:?} is not admitted at opset {}; \
+                     use a numeric or bool dtype supported by that ConstantOfShape revision",
+                    ctx.opset("")
+                ),
+            });
+        }
+    };
+    let opset = ctx.opset("");
+    if opset < since {
+        return Err(ShapeInferError::Invalid {
+            op: "ConstantOfShape".into(),
+            detail: format!(
+                "the 'value' tensor dtype {dtype:?} requires opset {since} or later, \
+                 but this node uses opset {opset}; export with opset {since} or later \
+                 or choose a dtype supported at opset {opset}"
+            ),
+        });
+    }
     if let Some(rank) = ctx.input_rank(0)
         && rank != 1
     {
@@ -457,35 +502,68 @@ fn validate_quantization_granularity(
 /// `QuantizeLinear`: output shape follows x; its type follows zero_point,
 /// `output_dtype` (opset 21+), or defaults to uint8.
 fn quantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    validate_quantization_granularity(ctx, 0, 1, 2)?;
     let attribute_dtype = quantized_output_dtype(ctx)?;
     let dtype = if ctx.has_input(2) {
-        let Some(zero_point_dtype) = ctx.input_dtype(2) else {
-            return Ok(());
-        };
-        if attribute_dtype.is_some_and(|dtype| dtype != zero_point_dtype) {
+        let zero_point_dtype = ctx.input_dtype(2);
+        if let (Some(attribute), Some(zero_point)) = (attribute_dtype, zero_point_dtype)
+            && attribute != zero_point
+        {
             return Err(ShapeInferError::Invalid {
                 op: "QuantizeLinear".into(),
                 detail: "output_dtype does not match y_zero_point dtype".into(),
             });
         }
-        Some(zero_point_dtype)
+        zero_point_dtype
     } else {
         Some(attribute_dtype.unwrap_or(DataType::Uint8))
     };
+    if dtype
+        .or(attribute_dtype)
+        .is_some_and(onnx_runtime_ir::int16_quantization::is_code)
+    {
+        use onnx_runtime_ir::int16_quantization as q;
+        let invalid = |detail| ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail,
+        };
+        let opset = ctx.opset("");
+        q::validate_revision(ctx.node, opset, ctx.input_rank(1)).map_err(invalid)?;
+        if let (Some(x), Some(scale)) = (ctx.input_dtype(0), ctx.input_dtype(1)) {
+            q::validate_quantize_types(opset, x, scale).map_err(invalid)?;
+            let precision = q::attribute_dtype(ctx.node, "precision").map_err(invalid)?;
+            q::quantize_precision(precision, x, scale).map_err(invalid)?;
+        }
+    }
+    validate_quantization_granularity(ctx, 0, 1, 2)?;
     if let (Some(shape), Some(dtype)) = (ctx.input_shape(0).map(<[DimExpr]>::to_vec), dtype) {
         ctx.set_output(0, dtype, shape);
     }
     Ok(())
 }
 
-/// `DequantizeLinear`: output shape follows x and dtype follows scale.
+/// `DequantizeLinear`: output shape follows x; 16-bit integer inputs can
+/// override the scale's output dtype starting at opset 23.
 fn dequantize_linear(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let mut output = ctx.input_dtype(1);
+    if ctx
+        .input_dtype(0)
+        .or_else(|| ctx.input_dtype(2))
+        .is_some_and(onnx_runtime_ir::int16_quantization::is_code)
+    {
+        use onnx_runtime_ir::int16_quantization as q;
+        let invalid = |detail| ShapeInferError::Invalid {
+            op: ctx.op().into(),
+            detail,
+        };
+        let opset = ctx.opset("");
+        q::validate_revision(ctx.node, opset, ctx.input_rank(1)).map_err(invalid)?;
+        if let Some(dtype) = output {
+            q::validate_dequantize_scale(opset, dtype).map_err(invalid)?;
+            output = Some(q::dequantize_output(ctx.node, dtype).map_err(invalid)?);
+        }
+    }
     validate_quantization_granularity(ctx, 0, 1, 2)?;
-    if let (Some(shape), Some(dtype)) = (
-        ctx.input_shape(0).map(<[DimExpr]>::to_vec),
-        ctx.input_dtype(1),
-    ) {
+    if let (Some(shape), Some(dtype)) = (ctx.input_shape(0).map(<[DimExpr]>::to_vec), output) {
         ctx.set_output(0, dtype, shape);
     }
     Ok(())

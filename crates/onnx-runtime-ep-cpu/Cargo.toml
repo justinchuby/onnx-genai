@@ -61,6 +61,7 @@ tracing-crate = { package = "tracing", version = "0.1", optional = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 rayon = "1"
+num-traits = "0.2"
 smallvec = { workspace = true }
 libc = "0.2"
 # Pure-Rust libm (no FFI, no `cc`): supplies the correctly-rounded `erf` used by

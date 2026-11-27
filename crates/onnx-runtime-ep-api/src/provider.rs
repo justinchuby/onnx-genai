@@ -1217,6 +1217,32 @@ pub trait SealedDeviceAllocation: Send + Sync {
     fn runtime_identity(&self) -> usize;
 }
 
+/// Exact funding domain for every ordinary Host buffer produced by an EP.
+/// This proves buffer funding only, not complete session/worker ownership.
+#[derive(Clone, Debug)]
+pub struct HostPayloadFunding {
+    authority: onnx_runtime_memory_governor::MemoryAuthorityId,
+    manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+}
+impl HostPayloadFunding {
+    /// Providers must supply the authority and manager retained by their actual
+    /// ordinary-buffer owner, rather than a separately configured budget.
+    pub fn new(
+        authority: onnx_runtime_memory_governor::MemoryAuthorityId,
+        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    ) -> Self {
+        Self { authority, manager }
+    }
+    /// Both identities must match; either alone is insufficient funding proof.
+    pub fn matches(
+        &self,
+        authority: onnx_runtime_memory_governor::MemoryAuthorityId,
+        manager: &onnx_runtime_memory_governor::ProcessMemoryManager,
+    ) -> bool {
+        self.authority == authority && self.manager.is_same_instance(manager)
+    }
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -1224,6 +1250,25 @@ pub trait ExecutionProvider: Send + Sync {
 
     fn device_type(&self) -> DeviceType;
     fn device_id(&self) -> DeviceId;
+
+    /// Return this only when ordinary Host allocations retain the reported
+    /// authority and process-manager owners through their physical release.
+    fn host_payload_funding(&self) -> Option<HostPayloadFunding> {
+        None
+    }
+
+    /// Ambient context reader required to memoize this provider's workspace bounds.
+    /// Caches must include its read key alongside tensor metadata. The reader
+    /// itself is fixed for this provider's lifetime and can be captured cold,
+    /// avoiding provider locks on each dispatch. The default is
+    /// valid only when requirements do not depend on the caller's environment.
+    /// Keys are scoped to this provider and must stay stable during one prepare
+    /// or dispatch; a new context requires preparation/refinement before launch.
+    /// Implementations must not allocate scratch, issue quota calls or spawn a
+    /// scheduler just to report this key. Delegating providers must forward it.
+    fn workspace_preparation_context(&self) -> crate::WorkspaceContextReader {
+        crate::WorkspaceContextReader::STABLE
+    }
 
     /// PCI vendor id of this EP's device memory (0 = generic/host). Used by the
     /// plugin executor to reconstruct the device `OrtMemoryInfo` ORT registered

@@ -171,7 +171,8 @@ half = { workspace = true, features = ["use-intrinsics"] }
 regex = "1.12"
 regex-automata = "0.4.16"
 regex-syntax = "0.8.11"
-llguidance = "1.9.1"
+# One maintained, publishable compiler source, also bundled in Python sdists.
+onnx-genai-llguidance = { workspace = true }
 toktrie_hf_tokenizers = "1.9.1"
 
 [target.'cfg(unix)'.dependencies]

@@ -51,8 +51,8 @@ plugin EPs (via C ABI bridge) handle them.
 | Equal | 7 | Mask generation. |
 | Less / Greater / LessOrEqual / GreaterOrEqual | 7–12 | Comparisons for masking. |
 | Expand | 8 | Broadcasting. |
-| Shape | 1 | Dynamic shape queries. |
-| ConstantOfShape | 9 | Mask/padding creation. |
+| Shape / Size | 1 | Shape returns an INT64 dimension vector (`start`/`end` since Shape-15); Size returns a scalar INT64 logical element count. For both, IR9 FP8 inputs start at opset 19, INT4/UINT4 at 21, FLOAT4E2M1 at 23, and FLOAT8E8M0 at 24. |
+| ConstantOfShape | 9 | Mask/padding creation. Native CPU and CUDA support BF16 and the four IR 9 FP8 types at opset 20, INT4/UINT4 at 21, FLOAT4E2M1 at 23, FLOAT8E8M0 at 24, and INT2/UINT2 at 25. Packed fills zero unused lanes in the last byte. |
 | ScatterND | 11 | Slice update; opset 29 adds Int32 indices and mean reduction on native CPU/CUDA. |
 | TensorScatter | 24 | KV cache update, standardized. Fixed-capacity buffer written at a per-sample `write_indices` offset; `linear` (append) and `circular` (ring) modes. Prefill omits `write_indices`; decode supplies it. |
 | GatherElements | 11 | Top-k/sampling. |
@@ -74,8 +74,8 @@ plugin EPs (via C ABI bridge) handle them.
 | Pad | 11 | |
 | Flatten | 9 | |
 | MatMulNBits (contrib) | — | INT4 quantized matmul (replaces MatMulInteger). |
-| DequantizeLinear | 10 | INT4/INT8 weight dequantization. |
-| QuantizeLinear | 10 | Activation quantization. |
+| DequantizeLinear | 10 | Standalone INT16/UINT16: scalar at opset 10+, per-axis at 13+, blocked at 21+, and independent floating `output_dtype` at 23+. |
+| QuantizeLinear | 10 | Standalone INT16/UINT16: scalar at opset 10+, per-axis at 13+, blocked at 21+, and independent division `precision` at 23+. A typed zero point selects 16-bit output before opset 21. |
 | QLinearMatMul | 10 | Quantized matmul. |
 | Einsum | 12, 28 | Schema-aware universal semantic/index plan for every legal expression, with `Einsum-12` selected for imported opsets 12..27 and `Einsum-28` for opset 28+ (adding BF16). CPU and CUDA execute the full schema dtype set and arbitrary legal 1..N expressions through zero-copy views, reduction/product, MatMul/BMM, bounded exact-DP/greedy trees, or the mandatory GenericNative fallback; CUDA retains capture-safe snapshots and cuBLASLt fast paths when the complete layout/alignment contract matches. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md), [EINSUM_CONFORMANCE.md](../testing/EINSUM_CONFORMANCE.md), and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
 | Tile | 6 | Repeat for broadcasting. |
@@ -109,11 +109,11 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | SpaceToDepth | 1 | |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
-| Compress | 9 | |
+| Compress | 9, 11, 28 | Compress-28 adds BF16. Native CPU and CUDA preserve BF16 element bits during selection. String tensors are not handled by the CUDA kernel. |
 | Scatter | 9 | |
 | Unique | 11 | |
 | NMS (NonMaxSuppression) | 10 | Detection models. |
-| RoiAlign | 10 | |
+| RoiAlign | 10, 16, 22 | Standalone CPU and CUDA. Opset 22 adds bfloat16; CUDA runs eagerly to report invalid device-side ROI indices. |
 
 ---
 

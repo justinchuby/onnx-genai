@@ -247,7 +247,10 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
         }
         let strides = shapes
             .iter()
-            .map(|shape| compute_contiguous_strides(shape))
+            .map(|shape| {
+                compute_contiguous_strides(shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
             .collect::<Vec<_>>();
         let views = case
             .inputs
@@ -267,7 +270,8 @@ fn eager_shape_metadata_reuses_one_owner_without_private_allocations() {
         let (dtype, shape) = &outputs[0];
         let output_bytes = dtype.storage_bytes(shape.iter().product());
         let mut output_buffer = ep.allocate(output_bytes.max(1), 256).unwrap();
-        let output_strides = compute_contiguous_strides(shape);
+        let output_strides = compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut output = [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
             *dtype,

@@ -10,7 +10,7 @@ skipped tokens.
 | Model | Native CUDA | ORT CUDA | Greedy parity | Coherence |
 |---|---:|---:|---|---|
 | GLM-4-9B int4 CUDA | 108.78 tok/s | Cannot load | Not testable: ORT rejects partial-RoPE GQA | Coherent natural-language/math continuation |
-| GLM-5.2 tiny QMoE | 176.66 tok/s | Cannot load | Not testable: ORT lacks `pkg.nxrt::IndexShare` | Structurally valid deterministic decimal-token stream |
+| GLM-5.2 tiny QMoE | 176.66 tok/s | Cannot load | Not testable: ORT lacks `pkg.nxrt._private::IndexShare` | Structurally valid deterministic decimal-token stream |
 | GLM-5.2 tiny q4 | Decodes (eager, no CUDA-graph capture) — see fix note below | 1,182.89 tok/s* | Token 0 matches (`110`); tiny random weights, full parity oracle N/A | Structurally valid deterministic decimal-token stream |
 
 \* This tiny-model ORT number is GPU-resident but is not representative of a
@@ -59,7 +59,7 @@ the model, so no valid native-vs-ORT performance comparison exists.
 - ORT CUDA cannot load the model. Exact load error:
 
   ```text
-  Fatal error: pkg.nxrt:IndexShare(-1) is not a registered function/op
+  Fatal error: pkg.nxrt._private:IndexShare(-1) is not a registered function/op
   ```
 
 - ORT therefore supplies neither a token/log-probability reference nor a valid
@@ -67,7 +67,7 @@ the model, so no valid native-vs-ORT performance comparison exists.
 
 **Result:** the native GLM QMoE path runs successfully on the tiny conformance
 model. Cross-runtime parity and performance remain unmeasured because the
-artifact contains a native-only `pkg.nxrt::IndexShare` op.
+artifact contains a native-only `pkg.nxrt._private::IndexShare` op.
 
 ## GLM-5.2 tiny dense q4
 
@@ -115,7 +115,7 @@ artifact contains a native-only `pkg.nxrt::IndexShare` op.
 
 **Result:** dense GLM-5.2 q4 native decode is currently broken at the second
 generated token. This artifact has two standard `ai.onnx::Attention` nodes and
-no `pkg.nxrt::IndexShare` node: `indexer` here names the GLM DSA subgraph, not
+no `pkg.nxrt._private::IndexShare` node: `indexer` here names the GLM DSA subgraph, not
 the native IndexShare kernel. The native CUDA fixed-capacity decode state
 deliberately exposes `attention_mask` at physical capacity (4096) on
 single-token steps. That is valid for the ordinary attention bias, but this
@@ -144,7 +144,7 @@ oracle is not applicable until the binding policy is fixed.
    GLM-4 parity, log-probability comparison, and native-vs-ORT speed claims are
    unavailable.
 3. Produce an ORT-compatible GLM-5.2 QMoE reference without the native-only
-   `pkg.nxrt::IndexShare` op, or register an equivalent ORT custom op, so greedy
+   `pkg.nxrt._private::IndexShare` op, or register an equivalent ORT custom op, so greedy
    tokens/log-probabilities and GPU throughput can be compared.
 4. Validate GLM-5.2 QMoE with real checkpoint weights and a real tokenizer; the
    current tiny random-weight artifact proves execution only, not language

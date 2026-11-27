@@ -1,7 +1,7 @@
 //! End-to-end regression for the deterministic tiny GLM-5.2 **dense
 //! full-attention fallback** fixture (`config.use_dsa=False`, mirroring the
 //! Mobius CLI's `--glm-full-attention` flag): plain dense MLA with **zero**
-//! `pkg.nxrt::IndexShare` nodes, still exporting routed MoE experts as a
+//! `pkg.nxrt._private::IndexShare` nodes, still exporting routed MoE experts as a
 //! single fused `com.microsoft::QMoE` node.
 //!
 //! Unlike the sibling DSA/IndexShare fixture
@@ -9,7 +9,7 @@
 //! op, so it must run correctly through **stock ONNX Runtime** as well as the
 //! native CPU/CUDA backends — this is the explicit dense/full-attention
 //! fallback stock ORT can execute when a caller cannot or does not want the
-//! native runtime's `pkg.nxrt::IndexShare` kernel. Coherence is checked at
+//! native runtime's `pkg.nxrt._private::IndexShare` kernel. Coherence is checked at
 //! three levels: structural (no IndexShare, has fused QMoE), a locked native
 //! CPU/CUDA anchor (regression), and stock-ORT-vs-native-CPU token agreement
 //! (proves the fallback graph is executable and numerically consistent on the
@@ -114,7 +114,7 @@ fn generate(engine: &mut Engine) -> anyhow::Result<Vec<u32>> {
 }
 
 /// Structural gate: the full-attention export must contain **zero**
-/// `pkg.nxrt::IndexShare` nodes (that is the entire point of the fallback)
+/// `pkg.nxrt._private::IndexShare` nodes (that is the entire point of the fallback)
 /// while still fusing routed experts into `com.microsoft::QMoE`.
 fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
     let model = resolve_model_path(dir)
@@ -124,11 +124,11 @@ fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
         graph
             .nodes
             .values()
-            .filter(|node| node.domain == "pkg.nxrt" && node.op_type == "IndexShare")
+            .filter(|node| node.domain == "pkg.nxrt._private" && node.op_type == "IndexShare")
             .count(),
         0,
         "{} is the dense full-attention fallback and must contain zero \
-         pkg.nxrt::IndexShare nodes",
+         pkg.nxrt._private::IndexShare nodes",
         model.display(),
     );
     assert!(

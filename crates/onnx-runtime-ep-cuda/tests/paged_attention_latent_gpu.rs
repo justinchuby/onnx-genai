@@ -385,15 +385,24 @@ fn run_native(ctx: &Ctx, b: &BuiltScenario) -> (Vec<f32>, Vec<f32>) {
     let slot_shape = vec![b.token_count];
     let out_shape = vec![b.token_count, nh * vhs];
 
-    let q_str = compute_contiguous_strides(&q_shape);
-    let k_str = compute_contiguous_strides(&k_shape);
-    let cache_str = compute_contiguous_strides(&cache_shape);
-    let cos_str = compute_contiguous_strides(&cos_shape);
-    let cumseq_str = compute_contiguous_strides(&cumseq_shape);
-    let past_str = compute_contiguous_strides(&past_shape);
-    let block_str = compute_contiguous_strides(&block_shape);
-    let slot_str = compute_contiguous_strides(&slot_shape);
-    let out_str = compute_contiguous_strides(&out_shape);
+    let q_str = compute_contiguous_strides(&q_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let k_str = compute_contiguous_strides(&k_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_str = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cos_str = compute_contiguous_strides(&cos_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cumseq_str = compute_contiguous_strides(&cumseq_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let past_str = compute_contiguous_strides(&past_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let block_str = compute_contiguous_strides(&block_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let slot_str = compute_contiguous_strides(&slot_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_str = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let cache_ptr = cache_buf.as_ptr();
     let cache_mut_ptr = cache_buf.as_mut_ptr();
@@ -830,15 +839,24 @@ fn latent_capture_replay_matches_eager() {
     let slot_shape = vec![b.token_count];
     let out_shape = vec![b.token_count, nh * vhs];
 
-    let q_str = compute_contiguous_strides(&q_shape);
-    let k_str = compute_contiguous_strides(&k_shape);
-    let cache_str = compute_contiguous_strides(&cache_shape);
-    let cos_str = compute_contiguous_strides(&cos_shape);
-    let cumseq_str = compute_contiguous_strides(&cumseq_shape);
-    let past_str = compute_contiguous_strides(&past_shape);
-    let block_str = compute_contiguous_strides(&block_shape);
-    let slot_str = compute_contiguous_strides(&slot_shape);
-    let out_str = compute_contiguous_strides(&out_shape);
+    let q_str = compute_contiguous_strides(&q_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let k_str = compute_contiguous_strides(&k_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_str = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cos_str = compute_contiguous_strides(&cos_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cumseq_str = compute_contiguous_strides(&cumseq_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let past_str = compute_contiguous_strides(&past_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let block_str = compute_contiguous_strides(&block_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let slot_str = compute_contiguous_strides(&slot_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_str = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let cache_ptr = cache_buf.as_ptr();
     let cache_mut_ptr = cache_buf.as_mut_ptr();
@@ -1178,15 +1196,24 @@ struct Strides {
 impl Strides {
     fn new(r: &NativeRun) -> Self {
         Strides {
-            q: compute_contiguous_strides(&r.q_shape),
-            k: compute_contiguous_strides(&r.k_shape),
-            cache: compute_contiguous_strides(&r.cache_shape),
-            cos: compute_contiguous_strides(&r.cos_shape),
-            cumseq: compute_contiguous_strides(&r.cumseq_shape),
-            past: compute_contiguous_strides(&r.past_shape),
-            block: compute_contiguous_strides(&r.block_shape),
-            slot: compute_contiguous_strides(&r.slot_shape),
-            out: compute_contiguous_strides(&r.out_shape),
+            q: compute_contiguous_strides(&r.q_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            k: compute_contiguous_strides(&r.k_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            cache: compute_contiguous_strides(&r.cache_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            cos: compute_contiguous_strides(&r.cos_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            cumseq: compute_contiguous_strides(&r.cumseq_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            past: compute_contiguous_strides(&r.past_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            block: compute_contiguous_strides(&r.block_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            slot: compute_contiguous_strides(&r.slot_shape)
+                .expect("fixture shape has representable contiguous strides"),
+            out: compute_contiguous_strides(&r.out_shape)
+                .expect("fixture shape has representable contiguous strides"),
         }
     }
 }

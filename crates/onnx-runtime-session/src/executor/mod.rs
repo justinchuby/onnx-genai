@@ -38,7 +38,7 @@
 //! A [`TensorView`] carries no backing length, so it cannot self-check storage
 //! bounds. This executor owns every buffer, so it is the layer that *can*: for
 //! **every** input and output view of **every** node it calls
-//! [`strided::view_in_bounds`] (or, for sub-byte dtypes, the `storage_bytes`
+//! [`strided::view_in_bounds`] (or, for sub-byte dtypes, the bit-range
 //! equivalent in [`view_bounds`]) against the **run-scoped resolved** buffer and
 //! refuses to dispatch on failure. That check is the sole thing that makes
 //! ep-cpu's unchecked pointer derefs sound.
@@ -871,6 +871,10 @@ pub(crate) fn is_sequence_op(op_type: &str, domain: &str) -> bool {
         )
 }
 
+pub(crate) fn is_container_op(op_type: &str, domain: &str) -> bool {
+    is_sequence_op(op_type, domain) || optional_ops::is_optional_op(op_type, domain)
+}
+
 fn heterogeneous_api_error(operation: &str) -> SessionError {
     SessionError::HeterogeneousExecutionUnsupported {
         placement_summary: format!(
@@ -1069,6 +1073,7 @@ impl Drop for Executor {
     }
 }
 
+mod cpu_workers;
 mod state;
 use state::*;
 pub(crate) use state::{ChildExecutor, ChildExecutorStats, Executor};
@@ -1103,6 +1108,7 @@ mod capture;
 mod control_flow;
 mod dispatch;
 pub(crate) mod host_strings;
+mod optional_ops;
 mod platform;
 mod prefetch;
 mod run;
@@ -1112,6 +1118,9 @@ pub use prefetch::{PrefetchStep, drive_double_buffer, plan_double_buffer};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod resize_recovery_tests;
 
 #[cfg(test)]
 mod graph_kernel_tests;

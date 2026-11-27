@@ -37,6 +37,31 @@ def metadata(packages: list[dict]):
 
 
 class PublishOrderTests(unittest.TestCase):
+    def test_managed_compiler_is_an_owned_dependency_published_before_engine(self):
+        packages = [
+            package("onnx-genai-llguidance", "/repo/vendor/llguidance/Cargo.toml"),
+            package("onnx-genai-engine", "/repo/crates/onnx-genai-engine/Cargo.toml"),
+        ]
+        packages[1]["dependencies"] = [{"name":"onnx-genai-llguidance","path":"/repo/vendor/llguidance","req":"=0.1.0-dev.6"}]
+        graph = metadata(packages)
+        problems, edges = check_publish_order.validate_publish_order(
+            ["onnx-genai-llguidance", "onnx-genai-engine"], graph, exclusions=frozenset()
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(edges, 1)
+        problems, _ = check_publish_order.validate_publish_order(
+            ["onnx-genai-engine", "onnx-genai-llguidance"], graph, exclusions=frozenset()
+        )
+        self.assertTrue(any("published later" in problem for problem in problems), problems)
+
+    def test_external_vendor_metadata_cannot_hide_a_missing_release_package(self):
+        owned = package("consumer", "/repo/consumer/Cargo.toml")
+        owned["dependencies"] = [{"name":"external","path":"/repo/vendor/external","req":"^1.9.1"}]
+        graph = metadata([owned])
+        graph["metadata"] = {"vendored-crates":["vendor/external/UPSTREAM.json"]}
+        errors, _ = check_publish_order.validate_publish_order(["consumer"], graph, exclusions=frozenset())
+        self.assertTrue(any("not a workspace package" in error for error in errors), errors)
+
     def test_nested_manifest_dependency_violation_is_detected(self):
         packages = [
             package(

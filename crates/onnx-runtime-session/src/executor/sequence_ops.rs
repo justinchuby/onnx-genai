@@ -246,10 +246,11 @@ impl Executor {
             resolved,
             external,
         )?;
+        let allocator = crate::HostTensorAllocator::new(self.output_host_allocator())?;
         let ep = Arc::clone(&self.ep);
         if let Some(value) = external.outputs.get(&outputs[0]) {
             let mut buffer = value.writable_buffer()?;
-            plan.write(&seq, |offset, bytes| {
+            plan.write(&seq, &allocator, |offset, bytes| {
                 ep.copy_from_host_at(bytes, &mut buffer, offset)?;
                 Ok(())
             })?;
@@ -260,7 +261,7 @@ impl Executor {
                     outputs[0].0
                 ))
             })?;
-            plan.write(&seq, |offset, bytes| {
+            plan.write(&seq, &allocator, |offset, bytes| {
                 ep.copy_from_host_at(bytes, buffer, offset)?;
                 Ok(())
             })?;
@@ -357,29 +358,40 @@ impl Executor {
     }
 
     pub(super) fn restore_shared_buffers(&mut self) -> Result<()> {
-        let mut retained = Vec::new();
-        for (vid, storage) in self.shared_buffers.drain() {
-            if let Some(alias) = self.buffers.remove(&vid) {
+        // Do not drain the owner map: one replacement can be denied while
+        // every later alias still requires its original live owner.
+        let values: Vec<_> = self.shared_buffers.keys().copied().collect();
+        for vid in values {
+            if self.graph.initializers.contains_key(&vid) {
+                // Immutable initializer aliases remain shared across runs.
+                continue;
+            }
+            let storage = self.shared_buffers.remove(&vid).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "shared buffer value#{} lost its owner during restoration; rebuild the session and report this ownership invariant failure",
+                    vid.0
+                ))
+            })?;
+            let (replacement, _retained_owner) = match Arc::try_unwrap(storage) {
+                Ok(storage) => (storage.into_buffer(), None),
+                Err(storage) => {
+                    let len = storage.buffer().len();
+                    let alignment = storage.buffer().alignment();
+                    // Restore publication before the fallible admission. Both
+                    // this alias and untouched entries remain retryable on
+                    // denial; external views still own unchanged readable tensor bytes.
+                    self.shared_buffers.insert(vid, storage);
+                    let replacement = self.ep.allocate(len, alignment)?;
+                    (replacement, self.shared_buffers.remove(&vid))
+                }
+            };
+            let alias = self.buffers.insert(vid, replacement);
+            if let Some(alias) = alias {
+                // Publish the replacement first. A consumed descriptor cannot
+                // be restored after a provider release/quarantine failure.
+                // Retain the former shared owner through this callback.
                 self.ep.deallocate(alias)?;
             }
-            match Arc::try_unwrap(storage) {
-                Ok(storage) => {
-                    self.buffers.insert(vid, storage.into_buffer());
-                }
-                Err(storage) if self.graph.initializers.contains_key(&vid) => {
-                    self.buffers.insert(vid, storage.alias());
-                    retained.push((vid, storage));
-                }
-                Err(storage) => {
-                    let replacement = self
-                        .ep
-                        .allocate(storage.buffer().len(), storage.buffer().alignment())?;
-                    self.buffers.insert(vid, replacement);
-                }
-            }
-        }
-        for (vid, storage) in retained {
-            self.shared_buffers.insert(vid, storage);
         }
         Ok(())
     }

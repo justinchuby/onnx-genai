@@ -13,6 +13,7 @@ pub(super) fn identity(
     tokenizer: &Tokenizer,
     precision: onnx_runtime_session::DecodePrecision,
     graph: &onnx_runtime_ir::Graph,
+    keyed: &crate::keyed_weights::GraphWeightFiles,
 ) -> anyhow::Result<[u8; 32]> {
     let file = std::fs::File::open(&directory.model_path).with_context(|| {
         format!(
@@ -44,7 +45,10 @@ pub(super) fn identity(
     part(&mut hash, bytes);
     let mut regions = BTreeSet::new();
     if let Some(graph) = model.graph {
-        graph.collect(&mut regions)?;
+        graph.collect(
+            &mut regions,
+            keyed.for_graph(&directory.model_path)?.is_some(),
+        )?;
     }
     for function in model.functions {
         for node in function.nodes {
@@ -93,6 +97,59 @@ pub(super) fn identity(
                 .with_context(|| format!("hash external weight '{}' at offset {}; restore a complete immutable model package", path.display(), offset + length - remaining))?;
             hash.update(&buffer[..count]);
             remaining -= count as u64;
+        }
+    }
+    // A keyed initializer's bytes live in its declared container rather than
+    // an ONNX location/offset region. Bind state files to complete immutable
+    // containers, including their directory/index metadata and encoding.
+    let sources = keyed.sources();
+    if !sources.is_empty() {
+        let root = directory
+            .root
+            .canonicalize()
+            .context("resolve Native keyed-weight identity package root")?;
+        let sources = sources
+            .into_iter()
+            .map(|path| {
+                let label = path.strip_prefix(&root).with_context(|| {
+                    format!(
+                        "keyed-weight identity source '{}' escapes its admitted package",
+                        path.display()
+                    )
+                })?;
+                let label = label
+                    .components()
+                    .map(|part| {
+                        part.as_os_str()
+                            .to_str()
+                            .map(str::to_owned)
+                            .context("keyed-weight identity path must be UTF-8")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?
+                    .join("/");
+                Ok((label, path))
+            })
+            .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()?;
+        part(&mut hash, b"nxrt.native-state.keyed-containers.v1");
+        hash.update((sources.len() as u64).to_le_bytes());
+        for (label, path) in sources {
+            part(&mut hash, b"nxrt.native-state.keyed-container.v1");
+            part(&mut hash, label.as_bytes());
+            let mut file = std::fs::File::open(path).with_context(|| {
+                format!(
+                    "open Native keyed-weight identity source '{}'",
+                    path.display()
+                )
+            })?;
+            let length = file.metadata()?.len();
+            hash.update(length.to_le_bytes());
+            let mut remaining = length;
+            while remaining > 0 {
+                let count = usize::try_from(remaining.min(buffer.len() as u64))?;
+                file.read_exact(&mut buffer[..count]).with_context(|| format!("hash keyed-weight identity source '{}' at byte {}; restore its complete immutable container", path.display(), length - remaining))?;
+                hash.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
         }
     }
     // Canonical object ordering prevents HashMap-backed tokenizer vocabulary
@@ -248,12 +305,12 @@ struct ScanEntry {
     value: String,
 }
 impl ScanGraph {
-    fn collect(self, regions: &mut Regions) -> anyhow::Result<()> {
+    fn collect(self, regions: &mut Regions, keyed_initializers: bool) -> anyhow::Result<()> {
         for node in self.nodes {
             node.collect(regions)?;
         }
         for tensor in self.tensors {
-            tensor.collect(regions)?;
+            tensor.collect(regions, keyed_initializers)?;
         }
         for sparse in self.sparse {
             sparse.collect(regions)?;
@@ -272,16 +329,16 @@ impl ScanNode {
 impl ScanAttribute {
     fn collect(self, regions: &mut Regions) -> anyhow::Result<()> {
         if let Some(t) = self.tensor {
-            t.collect(regions)?;
+            t.collect(regions, false)?;
         }
         if let Some(g) = self.graph {
-            g.collect(regions)?;
+            g.collect(regions, false)?;
         }
         for t in self.tensors {
-            t.collect(regions)?;
+            t.collect(regions, false)?;
         }
         for g in self.graphs {
-            g.collect(regions)?;
+            g.collect(regions, false)?;
         }
         if let Some(s) = self.sparse {
             s.collect(regions)?;
@@ -295,16 +352,16 @@ impl ScanAttribute {
 impl ScanSparse {
     fn collect(self, regions: &mut Regions) -> anyhow::Result<()> {
         if let Some(t) = self.values {
-            t.collect(regions)?;
+            t.collect(regions, false)?;
         }
         if let Some(t) = self.indices {
-            t.collect(regions)?;
+            t.collect(regions, false)?;
         }
         Ok(())
     }
 }
 impl ScanTensor {
-    fn collect(self, regions: &mut Regions) -> anyhow::Result<()> {
+    fn collect(self, regions: &mut Regions, keyed: bool) -> anyhow::Result<()> {
         if self.location != 1 {
             return Ok(());
         }
@@ -315,6 +372,11 @@ impl ScanTensor {
                 "duplicate external weight descriptor {:?}; repair the model package before enabling Native state files",
                 item.key
             );
+        }
+        if keyed && fields.get("location").is_none_or(String::is_empty) {
+            // The loaded Native graph already proved these bindings through
+            // the keyed loader. Container identity is hashed separately above.
+            return Ok(());
         }
         let location = fields
             .get("location")
@@ -388,7 +450,7 @@ mod tests {
         let scanned = ScanModel::decode(model.encode_to_vec().as_slice())?;
         let mut result = Regions::new();
         if let Some(g) = scanned.graph {
-            g.collect(&mut result)?;
+            g.collect(&mut result, false)?;
         }
         for f in scanned.functions {
             for node in f.nodes {
@@ -511,6 +573,7 @@ mod tests {
                 &tokenizer,
                 onnx_runtime_session::DecodePrecision::Model,
                 &graph,
+                &crate::keyed_weights::GraphWeightFiles::default(),
             )
         };
         let original = hash()?;

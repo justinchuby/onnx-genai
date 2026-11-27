@@ -683,6 +683,8 @@ pub enum AdapterWeightFormat {
     HfPeft,
     /// Manifest-keyed safetensors parameter bundle.
     Safetensors,
+    /// Explicitly bound GGUF LoRA factor container.
+    Gguf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

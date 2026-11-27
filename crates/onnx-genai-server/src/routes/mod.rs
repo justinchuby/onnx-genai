@@ -38,12 +38,11 @@ use crate::{
     },
     state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{
-        AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob,
-        ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest,
-        CompletionResponse, EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
-        EmbeddingUsage, EmbeddingVector, InputAudio, ReasoningEffort, ResponseFormat, StopInput,
-        ToolChoice, ToolChoiceMode, Usage,
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatLogprobs, ChatMessage,
+        ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob, ChatTopLogprob,
+        CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
+        EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector,
+        InputAudio, ReasoningEffort, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -53,6 +52,7 @@ pub(crate) mod decision;
 mod images;
 pub(crate) mod llama;
 pub(crate) mod lora;
+pub(crate) mod model_management;
 mod multimodal;
 pub(crate) mod native;
 pub(crate) mod prompt;
@@ -115,6 +115,7 @@ struct ModelObject {
     context_length: Option<usize>,
     in_cache: bool,
     can_remove: bool,
+    source: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -440,8 +441,7 @@ pub(crate) struct PreparedCompletion {
 pub(crate) enum CompletionGeneration {
     Plain(GenerateRequest),
     Fim {
-        prefix: String,
-        suffix: String,
+        tokens: Vec<u32>,
         options: GenerateOptions,
     },
 }
@@ -483,7 +483,7 @@ impl ApiError {
         }
     }
 
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
@@ -530,7 +530,7 @@ impl ApiError {
         }
     }
 
-    fn payload_too_large(message: impl Into<String>) -> Self {
+    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
@@ -757,7 +757,7 @@ fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
 ///   all; never falls back to the default model for a named request.
 /// - **Empty `requested`** — falls back to the default model, lazily loading it
 ///   if necessary, preserving the single-model UX where clients omit `model`.
-async fn resolve_model(
+pub(crate) async fn resolve_model(
     registry: &crate::registry::ModelRegistry,
     requested: &str,
 ) -> Result<Arc<ModelHandle>, ApiError> {
@@ -770,7 +770,7 @@ async fn resolve_model(
         registry
             .default_id()
             .map_err(map_registry_error)?
-            .ok_or_else(|| ApiError::internal("no model loaded"))?
+            .ok_or_else(|| ApiError::unavailable("no model is ready; download a model with POST /models or select a configured model"))?
     } else {
         requested.to_string()
     };
@@ -785,15 +785,14 @@ async fn resolve_model(
     registry
         .load(&id)
         .await
-        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))
+        .map_err(|error| map_model_load_error(&id, error))
 }
-
-fn audio_decoder_prompt(
-    tokenizer: &Tokenizer,
-    language: Option<&str>,
-) -> Result<Vec<u32>, ApiError> {
-    crate::multimodal::audio_decoder_prompt(tokenizer, language)
-        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))
+fn map_model_load_error(id: &str, error: anyhow::Error) -> ApiError {
+    if error.is::<crate::registry::ModelDownloadPending>() {
+        ApiError::unavailable(format!("{error:#}"))
+    } else {
+        ApiError::internal(format!("failed to load model '{id}': {error:#}"))
+    }
 }
 
 /// Close a session the registry let go of, on the model that owns it, under the

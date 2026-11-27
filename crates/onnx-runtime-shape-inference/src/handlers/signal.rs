@@ -39,39 +39,21 @@ fn output_datatype(ctx: &InferenceContext) -> DataType {
         .unwrap_or(DataType::Float32)
 }
 
-/// Whether integer attribute `name` is set and non-zero (a boolean flag).
-fn flag(ctx: &InferenceContext, name: &str) -> bool {
-    ctx.node.attr(name).and_then(Attribute::as_int).unwrap_or(0) != 0
-}
-
 /// The size of the onesided (nonredundant) half-spectrum of an `n`-point DFT:
 /// `floor(n / 2) + 1`.
 fn onesided_bins(n: i64) -> i64 {
     (n >> 1) + 1
 }
 
-/// Normalize and validate a DFT `axis`. The last dimension carries the
-/// real/imaginary components and is never a valid signal axis, so the accepted
-/// range is `[-rank, -2] ∪ [0, rank - 2]`. Returns the non-negative index, or
-/// `None` when the axis is out of range.
-fn dft_axis_index(axis: i64, rank: usize) -> Option<usize> {
-    let r = rank as i64;
-    if axis < -r || axis == -1 || axis >= r - 1 {
-        return None;
-    }
-    let normalized = if axis >= 0 { axis } else { axis + r };
-    usize::try_from(normalized).ok()
-}
-
 /// `DFT` (opset 17 and 20): the discrete Fourier transform along one signal
 /// axis.
 ///
-/// The output matches the input rank. The trailing dimension is always coerced
-/// to `2` (real and imaginary parts). The signal axis becomes `dft_length` when
-/// that optional scalar input is given, and is halved to `floor(n / 2) + 1` when
-/// `onesided` is set. In opset 20 the axis moved from an attribute (default `1`)
+/// The output matches the input rank. Full/RFFT output has two components;
+/// IRFFT has one real component and a default length of twice (input bins - 1). The signal axis becomes `dft_length` when
+/// that optional scalar input is given. Only forward onesided output is halved
+/// to `floor(n / 2) + 1`. In opset 20 the axis moved from an attribute (default `1`)
 /// to an optional scalar input (default `-2`); when that input is present but
-/// not statically known, only the rank and the trailing `2` can be resolved.
+/// not statically known, the component width still follows the transform mode.
 fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
@@ -87,9 +69,18 @@ fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         });
     }
 
-    let onesided = flag(ctx, "onesided");
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "DFT".into(),
+        detail,
+    };
+    let mode = onnx_runtime_ir::dft::DftMode::parse(ctx.node).map_err(invalid)?;
     let has_dft_length = ctx.has_input(1);
     let last = rank - 1;
+    if let Some(components) = input.shape[last].as_const() {
+        let components = usize::try_from(components)
+            .map_err(|_| invalid(format!("invalid input component dimension {components}")))?;
+        mode.validate_components(components).map_err(invalid)?;
+    }
 
     // Opset 20 carries the axis as an optional input; earlier opsets use an
     // attribute. The default differs accordingly: `-2` for the input form,
@@ -98,13 +89,7 @@ fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let axis_value: Option<i64> = if axis_is_input {
         scalar_int(ctx, 2)
     } else {
-        let default_axis = if ctx.opset("") >= 20 { -2 } else { 1 };
-        Some(
-            ctx.node
-                .attr("axis")
-                .and_then(Attribute::as_int)
-                .unwrap_or(default_axis),
-        )
+        Some(onnx_runtime_ir::dft::default_axis(ctx.node, ctx.opset("")))
     };
 
     let mut out = input.shape.clone();
@@ -113,35 +98,53 @@ fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         // Opset-20 axis input present but not statically known. When onesided or
         // dft_length would rewrite the signal axis we cannot know which axis
         // that is, so every signal extent becomes a fresh symbol; otherwise the
-        // input shape is preserved. Either way the trailing dimension is 2.
-        if onesided || has_dft_length {
+        // input shape is preserved. Component width follows the transform mode.
+        if matches!(
+            mode,
+            onnx_runtime_ir::dft::DftMode::RealForward | onnx_runtime_ir::dft::DftMode::RealInverse
+        ) || has_dft_length
+        {
             out = (0..rank).map(|_| ctx.fresh_dim()).collect();
         }
-        out[last] = DimExpr::constant(2);
+        out[last] = DimExpr::constant(mode.output_components() as i64);
         ctx.set_output(0, dtype, out);
         return Ok(());
     };
 
-    let Some(axis_idx) = dft_axis_index(axis, rank) else {
-        return Err(ShapeInferError::Invalid {
-            op: "DFT".into(),
-            detail: format!("axis {axis} is invalid for a tensor of rank {rank}"),
-        });
-    };
+    let axis_idx = onnx_runtime_ir::dft::normalize_axis(axis, rank).map_err(invalid)?;
 
-    if has_dft_length {
-        out[axis_idx] = match scalar_int(ctx, 1) {
-            Some(length) => DimExpr::constant(length),
+    let length = if has_dft_length {
+        scalar_int(ctx, 1)
+            .map(onnx_runtime_ir::dft::explicit_length)
+            .transpose()
+            .map_err(invalid)?
+    } else {
+        input.shape[axis_idx]
+            .as_const()
+            .map(|n| {
+                let n = usize::try_from(n)
+                    .map_err(|_| invalid(format!("invalid signal-axis extent {n}")))?;
+                mode.default_length(n).map_err(invalid)
+            })
+            .transpose()?
+    };
+    out[axis_idx] = if !has_dft_length
+        && matches!(
+            mode,
+            onnx_runtime_ir::dft::DftMode::Forward | onnx_runtime_ir::dft::DftMode::Inverse
+        ) {
+        input.shape[axis_idx].clone()
+    } else {
+        match length {
+            Some(n) => DimExpr::constant(i64::try_from(mode.output_length(n)).map_err(|_| {
+                invalid(format!(
+                    "DFT output extent for length {n} exceeds i64; reduce the transform length"
+                ))
+            })?),
             None => ctx.fresh_dim(),
-        };
-    }
-    if onesided {
-        out[axis_idx] = match out[axis_idx].as_const() {
-            Some(n) => DimExpr::constant(onesided_bins(n)),
-            None => ctx.fresh_dim(),
-        };
-    }
-    out[last] = DimExpr::constant(2);
+        }
+    };
+    out[last] = DimExpr::constant(mode.output_components() as i64);
     ctx.set_output(0, dtype, out);
     Ok(())
 }

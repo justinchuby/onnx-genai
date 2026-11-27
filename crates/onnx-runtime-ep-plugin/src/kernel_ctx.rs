@@ -69,32 +69,14 @@ pub const CPU_EP_SUPPORTED_DTYPES: &[DataType] = &[
 /// Row-major strides for `shape`, without touching the allocator for an
 /// ordinary rank.
 ///
-/// Deliberately not a call to `onnx_runtime_ir::compute_contiguous_strides`:
-/// that one returns a `Vec` and so allocates for every operand of every
-/// dispatch. The arithmetic is identical and pinned to it by
-/// `contiguous_strides_matches_the_ir_crate` below, which is what keeps the
-/// duplication honest.
-fn contiguous_strides(shape: &[usize]) -> DimVec<i64> {
-    let n = shape.len();
-    let mut strides = DimVec::zeroed(n);
-    // Take the storage once. Indexing a `DimVec` goes through `DerefMut`, which
-    // re-matches `Inline` against `Heap` on every access; the loop below reads
-    // and writes twice per element, so the representation was being resolved
-    // four times per dimension to fill a buffer whose length is known here.
-    // Carrying the running product in a register also removes the read of
-    // `strides[i + 1]`, which was a loop-carried memory dependency.
-    let out = strides.as_mut_slice();
-    if n > 0 {
-        out[n - 1] = 1;
-        let mut acc: i64 = 1;
-        for i in (0..n - 1).rev() {
-            // Same products in the same order as reading back `strides[i + 1]`,
-            // so this overflows for exactly the inputs the previous form did.
-            acc *= shape[i + 1] as i64;
-            out[i] = acc;
-        }
-    }
-    strides
+/// The shared IR plan validates suffix arithmetic before the inline/spilled
+/// buffer is created, then fills it without an intermediate `Vec`.
+fn contiguous_strides(shape: &[usize]) -> Result<crate::dim_vec::DimVec<i64>, String> {
+    let plan = onnx_runtime_ir::ContiguousStridePlan::new(shape).map_err(|e| e.to_string())?;
+    let mut strides = crate::dim_vec::DimVec::zeroed(shape.len());
+    plan.write(strides.as_mut_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(strides)
 }
 
 /// Validate raw ORT dimensions for a single tensor, converting to `usize` shape.
@@ -445,7 +427,7 @@ pub(crate) unsafe fn read_inputs_into(
         // allocation at all; only a tensor of rank > `INLINE_RANK` reaches the
         // allocator, and then it is charged below.
         let (shape, _, _) = validate_dims(dims, dtype, format_args!("input {i}"))?;
-        let strides = contiguous_strides(&shape);
+        let strides = contiguous_strides(&shape).map_err(|e| format!("input {i} strides: {e}"))?;
         crate::dispatch_probe::count_n(
             crate::dispatch_probe::Event::DispatchAlloc,
             u64::from(shape.len() > crate::dim_vec::INLINE_RANK) * 2,
@@ -508,6 +490,16 @@ pub(crate) unsafe fn allocate_output(
     want_mem_info: bool,
 ) -> Result<OwnedOutput, String> {
     let _probe = crate::dispatch_probe::Phase::Allocate.enter();
+    if matches!(dtype, DataType::Undefined | DataType::String) {
+        return Err(format!(
+            "output {index} dtype {dtype:?} has no raw numeric storage; bind a concrete raw tensor dtype"
+        ));
+    }
+    onnx_runtime_ir::checked_expected_bytes(dtype,shape).ok_or_else(||format!("output {index} dtype {dtype:?} shape {shape:?} has unrepresentable storage bytes; reduce output dimensions"))?;
+    let strides = contiguous_strides(shape).map_err(|e| format!("output {index} strides: {e}"))?;
+    for (axis, &dimension) in shape.iter().enumerate() {
+        i64::try_from(dimension).map_err(|_|format!("output {index} axis {axis} extent {dimension} exceeds ORT's signed 64-bit dimension range; reduce the extent"))?;
+    }
     let get_output = api
         .KernelContext_GetOutput
         .ok_or("OrtApi.KernelContext_GetOutput is null")?;
@@ -583,7 +575,6 @@ pub(crate) unsafe fn allocate_output(
     // An ordinary rank keeps both of these inline, so the common output costs
     // the allocator nothing. `count_n` charges only the ranks that spill.
     let shape: DimVec<usize> = DimVec::from_slice(shape);
-    let strides = contiguous_strides(&shape);
     crate::dispatch_probe::count_n(
         crate::dispatch_probe::Event::DispatchAlloc,
         2 * u64::from(shape.len() > crate::dim_vec::INLINE_RANK),
@@ -1301,7 +1292,8 @@ mod tests {
             );
             assert_eq!(
                 &output.strides[..],
-                &onnx_runtime_ir::compute_contiguous_strides(&shape)[..],
+                &onnx_runtime_ir::compute_contiguous_strides(&shape)
+                    .expect("fixture shape has representable contiguous strides")[..],
                 "rank {rank} strides diverged from the IR crate"
             );
         }
@@ -1363,7 +1355,8 @@ mod tests {
         let shape: Vec<usize> = vec![2, 1, 3, 1, 2, 1, 3, 1, 2, 1, 3];
         let rank = shape.len();
         assert!(rank > crate::dim_vec::INLINE_RANK);
-        let strides = contiguous_strides(&shape);
+        let strides =
+            contiguous_strides(&shape).expect("fixture shape has representable contiguous strides");
         assert!(
             strides.len() == rank && shape.len() > crate::dim_vec::INLINE_RANK,
             "this test is only meaningful past the inline limit"
@@ -1381,7 +1374,8 @@ mod tests {
         assert_eq!(view.shape, &shape[..], "spilled shape did not survive");
         assert_eq!(
             view.strides,
-            &onnx_runtime_ir::compute_contiguous_strides(&shape)[..],
+            &onnx_runtime_ir::compute_contiguous_strides(&shape)
+                .expect("fixture shape has representable contiguous strides")[..],
             "spilled strides did not survive"
         );
     }
@@ -1604,8 +1598,10 @@ mod tests {
         cases.push(zero_at_depth);
 
         for shape in cases {
-            let ours = super::contiguous_strides(&shape);
-            let theirs = onnx_runtime_ir::compute_contiguous_strides(&shape);
+            let ours = super::contiguous_strides(&shape)
+                .expect("fixture shape has representable contiguous strides");
+            let theirs = onnx_runtime_ir::compute_contiguous_strides(&shape)
+                .expect("fixture shape has representable contiguous strides");
             assert_eq!(
                 ours.as_slice(),
                 theirs.as_slice(),
@@ -1973,5 +1969,150 @@ mod dispatch_cost {
         assert_eq!(a[0].strides, b[0].strides);
         assert_eq!(a[0].dtype, b[0].dtype);
         assert_eq!(a[0].data_ptr, b[0].data_ptr);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    mod stride_preflight_tests {
+        use super::*;
+        thread_local! {
+            static INPUT_DATA: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            static OUTPUT_ALLOC: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            static OUTPUT_DATA: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        static BAD_DIMS: [i64; 3] = [0, i64::MAX, i64::MAX];
+        unsafe extern "C" fn bad_reference(
+            _: *const ort::OrtValue,
+            dtype: *mut ort::ONNXTensorElementDataType,
+            dims: *mut *const i64,
+            count: *mut usize,
+        ) -> ort::OrtStatusPtr {
+            unsafe {
+                *dtype = ORT_ELEM_FLOAT;
+                *dims = BAD_DIMS.as_ptr();
+                *count = 3;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn bad_dims(
+            _: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut i64,
+            count: usize,
+        ) -> ort::OrtStatusPtr {
+            let n = count.min(3);
+            unsafe {
+                std::ptr::copy_nonoverlapping(BAD_DIMS.as_ptr(), out, n);
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn input_data(
+            value: *const ort::OrtValue,
+            out: *mut *const std::ffi::c_void,
+        ) -> ort::OrtStatusPtr {
+            INPUT_DATA.with(|n| n.set(n.get() + 1));
+            unsafe { fake_get_tensor_data(value, out) }
+        }
+        unsafe extern "C" fn output_alloc(
+            ctx: *mut ort::OrtKernelContext,
+            index: usize,
+            dims: *const i64,
+            count: usize,
+            out: *mut *mut ort::OrtValue,
+        ) -> ort::OrtStatusPtr {
+            OUTPUT_ALLOC.with(|n| n.set(n.get() + 1));
+            unsafe { fake_get_output(ctx, index, dims, count, out) }
+        }
+        unsafe extern "C" fn output_data(
+            value: *mut ort::OrtValue,
+            out: *mut *mut std::ffi::c_void,
+        ) -> ort::OrtStatusPtr {
+            OUTPUT_DATA.with(|n| n.set(n.get() + 1));
+            unsafe { fake_get_mutable_data(value, out) }
+        }
+        #[test]
+        fn both_input_shape_routes_reject_suffix_before_reading_data_then_recover() {
+            let _guard = shape_counters_reset();
+            let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+            for borrowed in [false, true] {
+                let mut api = api_with_both_shape_routes();
+                api.GetTensorData = Some(input_data);
+                if borrowed {
+                    api.GetTensorElementTypeAndShapeDataReference = Some(bad_reference);
+                } else {
+                    api.GetTensorElementTypeAndShapeDataReference = None;
+                    api.GetDimensions = Some(bad_dims);
+                }
+                INPUT_DATA.with(|n| n.set(0));
+                let error = unsafe { read_inputs(&api, ctx) }
+                    .err()
+                    .expect("bad suffix must fail");
+                assert!(
+                    error.contains("input 0")
+                        && error.contains("axis 0")
+                        && error.contains("suffix product"),
+                    "{error}"
+                );
+                assert_eq!(INPUT_DATA.with(std::cell::Cell::get), 0);
+                if borrowed {
+                    api.GetTensorElementTypeAndShapeDataReference = Some(counting_shape_reference);
+                } else {
+                    api.GetDimensions = Some(legacy_get_dims);
+                }
+                let input = unsafe { read_inputs(&api, ctx) }.expect("legal call after refusal");
+                assert_eq!(input[0].shape, [2, 3, 4]);
+                assert_eq!(INPUT_DATA.with(std::cell::Cell::get), 1);
+            }
+        }
+        #[test]
+        fn outputs_refuse_suffix_and_ort_dimension_overflow_before_external_allocation() {
+            let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+            api.KernelContext_GetOutput = Some(output_alloc);
+            api.GetTensorMutableData = Some(output_data);
+            let ctx = std::ptr::dangling_mut::<ort::OrtKernelContext>();
+            OUTPUT_ALLOC.with(|n| n.set(0));
+            OUTPUT_DATA.with(|n| n.set(0));
+            let error = unsafe {
+                allocate_output(
+                    &api,
+                    ctx,
+                    2,
+                    &[0, i64::MAX as usize, i64::MAX as usize],
+                    DataType::Float32,
+                    false,
+                )
+            }
+            .err()
+            .expect("bad suffix must fail");
+            assert!(
+                error.contains("output 2")
+                    && error.contains("axis 0")
+                    && error.contains("suffix product"),
+                "{error}"
+            );
+            let error =
+                unsafe { allocate_output(&api, ctx, 3, &[usize::MAX], DataType::Uint2, false) }
+                    .err()
+                    .expect("ORT dimension must not wrap");
+            assert!(
+                error.contains("output 3") && error.contains("dimension range"),
+                "{error}"
+            );
+            assert_eq!(
+                (
+                    OUTPUT_ALLOC.with(std::cell::Cell::get),
+                    OUTPUT_DATA.with(std::cell::Cell::get)
+                ),
+                (0, 0)
+            );
+            let out = unsafe { allocate_output(&api, ctx, 0, &[2, 2], DataType::Float32, false) }
+                .expect("legal output after refusal");
+            assert_eq!(out.strides, [2, 1]);
+            assert_eq!(
+                (
+                    OUTPUT_ALLOC.with(std::cell::Cell::get),
+                    OUTPUT_DATA.with(std::cell::Cell::get)
+                ),
+                (1, 1)
+            );
+        }
     }
 }

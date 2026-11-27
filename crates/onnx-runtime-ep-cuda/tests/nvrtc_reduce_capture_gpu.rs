@@ -158,10 +158,13 @@ fn execute_reduce(
     output: &mut DeviceBuffer,
     out_shape: &[usize],
 ) -> onnx_runtime_ep_api::Result<()> {
-    let data_strides = compute_contiguous_strides(data_shape);
+    let data_strides = compute_contiguous_strides(data_shape)
+        .expect("fixture shape has representable contiguous strides");
     let axes_shape = [n_axes];
-    let axes_strides = compute_contiguous_strides(&axes_shape);
-    let out_strides = compute_contiguous_strides(out_shape);
+    let axes_strides = compute_contiguous_strides(&axes_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_strides = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data.as_ptr()),

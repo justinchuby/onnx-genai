@@ -13,6 +13,12 @@ use crate::{
     },
 };
 
+mod canonical_xml;
+pub use canonical_xml::{CanonicalXmlPrefix, canonical_xml_prefix};
+
+mod fragments;
+pub use fragments::ToolCallFragment;
+
 /// Maximum complete protocol envelope size accepted from a model.
 pub const MAX_TOOL_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Maximum calls in one completed protocol envelope sequence.
@@ -57,7 +63,23 @@ pub enum ToolProtocol {
     AtemXmlV1,
 }
 
+const TAGGED_JSON_MARKERS: &[&str] = &["<tool_call>", "</tool_call>"];
+const ATEM_XML_MARKERS: &[&str] = &[
+    "<atem:invoke",
+    "</atem:invoke>",
+    "<atem:parameter",
+    "</atem:parameter>",
+];
+
 impl ToolProtocol {
+    /// Wire delimiters whose added-token IDs must survive text decoding.
+    pub fn syntax_markers(self) -> &'static [&'static str] {
+        match self {
+            Self::TaggedJsonV1 => TAGGED_JSON_MARKERS,
+            Self::AtemXmlV1 => ATEM_XML_MARKERS,
+        }
+    }
+
     pub fn declaration(self) -> (&'static str, &'static str) {
         match self {
             Self::TaggedJsonV1 => ("tagged-json", "v1"),
@@ -146,6 +168,18 @@ impl ToolCallStream {
         outcome
     }
 
+    /// Read cumulative provisional argument prefixes. These are not executable
+    /// calls: transports must validate prefixes and complete batch admission.
+    pub fn fragments(
+        &self,
+        protocol: ToolProtocol,
+    ) -> Result<Vec<ToolCallFragment>, ToolProtocolError> {
+        if let Some(error) = &self.terminal_error {
+            return Err(ToolProtocolError(error.clone()));
+        }
+        fragments::snapshot(protocol, &self.input).map_err(ToolProtocolError)
+    }
+
     pub fn finish(self, protocol: ToolProtocol) -> ToolParseOutcome {
         if let Some(error) = self.terminal_error {
             return ToolParseOutcome::Malformed(error);
@@ -194,158 +228,45 @@ pub fn resolve(
 }
 
 fn parse_tagged_json(input: &str) -> ToolParseOutcome {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
-    if input.trim().is_empty() {
-        return ToolParseOutcome::NoCall;
-    }
-    let Some((prefix, mut rest)) = input.split_once(OPEN) else {
-        return if OPEN.starts_with(input.trim_start()) {
-            ToolParseOutcome::Incomplete
-        } else {
-            ToolParseOutcome::NoCall
-        };
-    };
-    if !prefix.trim().is_empty() {
-        return ToolParseOutcome::Malformed(format!(
-            "tagged-json@v1 has non-whitespace text before the first tool_call envelope: \
-             {prefix:?}"
-        ));
-    }
-    let mut values = Vec::new();
-    loop {
-        let Some((body, after)) = rest.split_once(CLOSE) else {
-            return ToolParseOutcome::Incomplete;
-        };
-        match serde_json::from_str::<serde_json::Value>(body.trim()) {
-            Ok(value) => values.push(value),
-            Err(error) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "tagged-json@v1 tool_call envelope contains invalid JSON: {error}"
-                ));
-            }
-        }
-        match after.split_once(OPEN) {
-            Some((between, next)) if between.trim().is_empty() => rest = next,
-            Some((between, _)) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "tagged-json@v1 has non-whitespace text between tool_call envelopes: {between:?}"
-                ));
-            }
-            None => {
-                let trailing = after.trim_start();
-                if trailing.is_empty() {
-                    return values_to_calls("tagged-json@v1", values);
-                }
-                if OPEN.starts_with(trailing) {
-                    return ToolParseOutcome::Incomplete;
-                }
-                return ToolParseOutcome::Malformed(
-                    "tagged-json@v1 has trailing text after a tool_call envelope".to_string(),
-                );
-            }
-        }
-    }
+    fragments::parse_json(input)
 }
 
 fn parse_atem_xml(input: &str) -> ToolParseOutcome {
-    const OPEN: &str = "<atem:invoke";
-    const CLOSE: &str = "</atem:invoke>";
-    let first = input.trim_start();
-    if first.is_empty() {
-        return ToolParseOutcome::NoCall;
-    }
-    let mut rest = if let Some(rest) = first.strip_prefix(OPEN) {
-        rest
-    } else if OPEN.starts_with(first) {
-        return ToolParseOutcome::Incomplete;
-    } else if let Some((prefix, _)) = input.split_once(OPEN) {
-        return ToolParseOutcome::Malformed(format!(
-            "atem-xml@v1 has non-whitespace text before the first invoke envelope: {prefix:?}"
-        ));
-    } else {
-        return ToolParseOutcome::NoCall;
-    };
-    let mut values = Vec::new();
-    loop {
-        let Some((open_tag, body)) = rest.split_once('>') else {
-            return ToolParseOutcome::Incomplete;
-        };
-        let Some(name) = xml_attribute(open_tag, "name") else {
-            return ToolParseOutcome::Malformed(
-                "atem-xml@v1 invoke envelope is missing its quoted name attribute".to_string(),
-            );
-        };
-        let Some((body, after)) = body.split_once(CLOSE) else {
-            return ToolParseOutcome::Incomplete;
-        };
-        let mut arguments = serde_json::Map::new();
-        let mut parameters = body;
-        while !parameters.trim().is_empty() {
-            parameters = parameters.trim_start();
-            let Some(after_open) = parameters.strip_prefix("<atem:parameter") else {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 invoke envelope contains text outside parameter envelopes"
-                        .to_string(),
-                );
-            };
-            let Some((parameter_tag, after_tag)) = after_open.split_once('>') else {
-                return ToolParseOutcome::Incomplete;
-            };
-            let Some(key) = xml_attribute(parameter_tag, "name") else {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 parameter envelope is missing its quoted name attribute"
-                        .to_string(),
-                );
-            };
-            let Some((raw, after_parameter)) = after_tag.split_once("</atem:parameter>") else {
-                return ToolParseOutcome::Incomplete;
-            };
-            if raw.contains("<atem:parameter") {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 does not permit nested parameter envelopes".to_string(),
-                );
-            }
-            let raw = xml_unescape(raw);
-            let value =
-                serde_json::from_str(raw.trim()).unwrap_or_else(|_| serde_json::Value::String(raw));
-            if arguments.insert(key, value).is_some() {
-                return ToolParseOutcome::Malformed(
-                    "atem-xml@v1 invoke envelope has duplicate parameter names".to_string(),
-                );
-            }
-            parameters = after_parameter;
-        }
-        values.push(serde_json::json!({ "name": name, "arguments": arguments }));
-        match after.split_once(OPEN) {
-            Some((between, next)) if between.trim().is_empty() => rest = next,
-            Some((between, _)) => {
-                return ToolParseOutcome::Malformed(format!(
-                    "atem-xml@v1 has non-whitespace text between invoke envelopes: {between:?}"
-                ));
-            }
-            None => {
-                let trailing = after.trim_start();
-                if trailing.is_empty() {
-                    return values_to_calls("atem-xml@v1", values);
-                }
-                if OPEN.starts_with(trailing) {
-                    return ToolParseOutcome::Incomplete;
-                }
-                return ToolParseOutcome::Malformed(format!(
-                    "atem-xml@v1 has non-whitespace trailing text after an invoke envelope: {trailing:?}"
-                ));
-            }
-        }
-    }
+    fragments::parse_xml(input)
 }
 
 fn xml_attribute(tag: &str, attribute: &str) -> Option<String> {
-    let marker = format!("{attribute}=\"");
-    let value = tag.split_once(&marker)?.1;
-    let value = value.split_once('"')?.0;
-    let value = xml_unescape(value);
-    (!value.is_empty() && value.len() <= MAX_TOOL_NAME_BYTES).then_some(value)
+    if !tag.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let mut rest = tag.trim_start();
+    let mut seen = BTreeSet::new();
+    let mut selected = None;
+    while !rest.is_empty() {
+        let end = rest.find(|c: char| c.is_whitespace() || c == '=')?;
+        let key = &rest[..end];
+        if key.is_empty() || !seen.insert(key) {
+            return None;
+        }
+        rest = rest[end..].trim_start().strip_prefix('=')?.trim_start();
+        let quote = rest.chars().next()?;
+        if !matches!(quote, '\'' | '"') {
+            return None;
+        }
+        let (raw, after) = rest[1..].split_once(quote)?;
+        if !after.is_empty() && !after.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        if key == attribute {
+            let value = xml_unescape(raw);
+            if value.is_empty() || value.len() > MAX_TOOL_NAME_BYTES {
+                return None;
+            }
+            selected = Some(value);
+        }
+        rest = after.trim_start();
+    }
+    selected
 }
 
 fn xml_unescape(value: &str) -> String {

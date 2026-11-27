@@ -500,6 +500,8 @@ fn finish_candidate_tree_without_generation(
         observer.commit_turn();
     }
     Ok(GenerateResult {
+        timings: None,
+        retained_cache_tokens: 0,
         preserved_tokens: preserved_tokens.clone(),
         text: String::new(),
         token_ids: Vec::new(),
@@ -583,6 +585,7 @@ struct CandidateTreeWorkflowHost<'a> {
     loop_stop: Option<super::GenerationStopReason>,
     staged_output_observer: Option<&'a mut super::ToolCallStagedOutputObserver>,
     staged_output_finalized: bool,
+    output_observer: Option<super::generation::GenerationOutputObserver>,
 }
 
 impl CandidateTreeWorkflowHost<'_> {
@@ -635,6 +638,17 @@ impl CandidateTreeWorkflowHost<'_> {
     fn finalize_staged_output(&mut self, boundary: &'static str) -> anyhow::Result<()> {
         if self.staged_output_finalized {
             return Ok(());
+        }
+        if let Some(output) = self.output_observer.as_mut() {
+            output
+                .finish(self.tokenizer, self.options)
+                .with_context(|| {
+                    format!("finalize candidate-tree output controls at {boundary}")
+                })?;
+            if let Some(reason) = output.stop_reason() {
+                self.finish_reason = reason.finish_reason();
+                self.loop_stop = Some(reason.clone());
+            }
         }
         if let Some(stop) =
             finalize_candidate_staged_output(self.staged_output_observer.as_deref_mut(), boundary)?
@@ -865,6 +879,13 @@ impl CandidateTreeWorkflowHost<'_> {
              the authored control path must not enter the seam after it becomes zero-trip",
             self.plan.target_path
         );
+        if let Some(limit) = self.output_observer.as_mut() {
+            let accepted = limit.observe_prefix(self.tokenizer, &committed, self.options)?;
+            committed.truncate(accepted);
+            if let Some(reason) = limit.stop_reason() {
+                self.finish_reason = reason.finish_reason();
+            }
+        }
         let mut accepted_context = pending.context.clone();
         accepted_context.extend(committed.iter().copied().map(i64::from));
         self.recompute_accepted_state(&accepted_context, &committed, &pending.tree, values)?;
@@ -900,7 +921,13 @@ impl CandidateTreeWorkflowHost<'_> {
                     )
                 })?;
         }
-        let loop_stop = if self.finish_reason == FinishReason::EosToken {
+        let loop_stop = if let Some(reason) = self
+            .output_observer
+            .as_ref()
+            .and_then(|observer| observer.stop_reason())
+        {
+            Some(reason.clone())
+        } else if self.finish_reason == FinishReason::EosToken {
             Some(super::GenerationStopReason::EosCommitted)
         } else if self.generated.len() >= self.options.max_new_tokens {
             Some(super::GenerationStopReason::BudgetExhausted)
@@ -925,7 +952,7 @@ impl CandidateTreeWorkflowHost<'_> {
         let mut context = self.complete_target(values)?;
         if self.plan.execution_mode == CandidateTreeExecutionMode::DrainAtSeam {
             while self.generated.len() < self.options.max_new_tokens
-                && self.finish_reason != FinishReason::EosToken
+                && self.loop_stop.is_none()
                 && !self
                     .options
                     .max_context
@@ -934,10 +961,11 @@ impl CandidateTreeWorkflowHost<'_> {
                 self.invoke_proposer(context, values)?;
                 context = self.complete_target(values)?;
             }
-            if self
-                .options
-                .max_context
-                .is_some_and(|limit| context.len() >= limit)
+            if self.loop_stop.is_none()
+                && self
+                    .options
+                    .max_context
+                    .is_some_and(|limit| context.len() >= limit)
                 && self.generated.len() < self.options.max_new_tokens
             {
                 self.finish_reason = FinishReason::Length;
@@ -1015,10 +1043,10 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
         self.text = self
             .tokenizer
             .map(|tokenizer| {
-                crate::tokenization::decode_output(
+                crate::tokenization::decode_generation_output(
                     tokenizer,
                     &self.authoritative_tokens,
-                    &self.options.effective_preserved_tokens(),
+                    self.options,
                 )
             })
             .transpose()
@@ -1671,16 +1699,19 @@ impl WorkflowRuntime {
             );
         }
         let control = request.generation_control.clone().unwrap_or_default();
-        if plan.execution_mode == CandidateTreeExecutionMode::DrainAtSeam
-            && let Some(limit) = options.max_context
-            && match &request.request.prompt {
-                crate::config::GeneratePrompt::TokenIds(tokens) => tokens.len() >= limit,
-                crate::config::GeneratePrompt::TokenRows(rows) => {
-                    rows.first().is_some_and(|tokens| tokens.len() >= limit)
-                }
-                crate::config::GeneratePrompt::Text(_) => false,
-            }
-        {
+        let initial_context_exhausted = plan.execution_mode
+            == CandidateTreeExecutionMode::DrainAtSeam
+            && options
+                .max_context
+                .is_some_and(|limit| match &request.request.prompt {
+                    crate::config::GeneratePrompt::TokenIds(tokens) => tokens.len() >= limit,
+                    crate::config::GeneratePrompt::TokenRows(rows) => {
+                        rows.first().is_some_and(|tokens| tokens.len() >= limit)
+                    }
+                    crate::config::GeneratePrompt::Text(_) => false,
+                });
+        let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
+        if initial_context_exhausted {
             return finish_candidate_tree_without_generation(
                 staged_output_observer,
                 "candidate-tree initial context-limit boundary",
@@ -1688,7 +1719,12 @@ impl WorkflowRuntime {
                 &options.effective_preserved_tokens(),
             );
         }
-        let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
+        let output_observer = super::generation::GenerationOutputObserver::new(
+            options,
+            tokenizer,
+            super::generation::OutputObservationMode::AcceptedPrefix,
+        )
+        .context("admit candidate-tree generation output controls")?;
         let mut host = CandidateTreeWorkflowHost {
             runtime: self,
             plan,
@@ -1711,6 +1747,7 @@ impl WorkflowRuntime {
             loop_stop: None,
             staged_output_observer,
             staged_output_finalized: false,
+            output_observer,
         };
         {
             let mut hosted: Option<&mut dyn super::workflow::WorkflowNodeHost> = Some(&mut host);
@@ -1761,6 +1798,7 @@ impl WorkflowRuntime {
         if let Some(callback) = callback.as_mut() {
             for (index, token) in published_tokens.iter().copied().enumerate() {
                 if let Err(error) = callback(crate::config::GenerateToken {
+                    timings: None,
                     logprob: None,
                     token_id: token,
                     text: host.token_text[index].clone(),
@@ -1775,6 +1813,8 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            timings: None,
+            retained_cache_tokens: 0,
             preserved_tokens: options.effective_preserved_tokens(),
             text: host.text,
             token_ids: published_tokens,
@@ -2352,6 +2392,8 @@ impl WorkflowRuntime {
                 observer.commit_turn();
             }
             return Ok(GenerateResult {
+                timings: None,
+                retained_cache_tokens: 0,
                 preserved_tokens: options.effective_preserved_tokens(),
                 text: String::new(),
                 token_ids: Vec::new(),
@@ -2365,6 +2407,12 @@ impl WorkflowRuntime {
                 budget_cap: None,
             });
         }
+        let mut output_observer = super::generation::GenerationOutputObserver::new(
+            options,
+            tokenizer,
+            super::generation::OutputObservationMode::AcceptedPrefix,
+        )
+        .context("admit DFlash generation output controls")?;
         let mut turn = super::TurnTransaction::admit_runtime_participant(
             self.worker.next_turn_transaction_id(),
         );
@@ -2507,6 +2555,42 @@ impl WorkflowRuntime {
             {
                 committed_path.truncate(eos + 1);
             }
+            if let Some(limit) = output_observer.as_mut() {
+                let observed = committed_path
+                    .iter()
+                    .map(|token| {
+                        u32::try_from(*token)
+                            .context("DFlash predicted token is outside the u32 domain")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .and_then(|tokens| limit.observe_prefix(tokenizer, &tokens, options));
+                match observed {
+                    Ok(accepted) => committed_path.truncate(accepted),
+                    Err(error) => {
+                        let mut error = error.context(
+                            "DFlash generation output observation failed before state commit",
+                        );
+                        if let Err(rollback) = self.abort_dflash_state_transaction(
+                            transaction,
+                            &mut state,
+                            super::TurnAbortReason::ExecutionFailure,
+                        ) {
+                            error = error.context(format!(
+                                "restore DFlash output observer baseline failed: {rollback:#}"
+                            ));
+                        }
+                        if let Err(abort) = turn.abort(super::TurnAbortReason::ExecutionFailure) {
+                            error = error.context(format!(
+                                "abort DFlash output observer turn failed: {abort:#}"
+                            ));
+                        }
+                        return Err(error);
+                    }
+                }
+                if let Some(reason) = limit.stop_reason() {
+                    finish_reason = reason.finish_reason();
+                }
+            }
             let committed_drafts = acceptance
                 .accepted
                 .min(committed_path.len().saturating_sub(1));
@@ -2598,18 +2682,35 @@ impl WorkflowRuntime {
                     })?;
             }
             staged_contract_executions = staged_contract_executions.saturating_add(1);
-            if finish_reason == FinishReason::EosToken {
+            if matches!(
+                finish_reason,
+                FinishReason::EosToken
+                    | FinishReason::IndentationLimit
+                    | FinishReason::PredictionTimeLimit
+                    | FinishReason::StopSequence { .. }
+            ) {
                 break;
             }
         }
 
+        if let Some(output) = output_observer.as_mut() {
+            if let Err(error) = output.finish(tokenizer, options) {
+                let mut error =
+                    error.context("finalize DFlash output controls before semantic commit");
+                if let Err(abort) = turn.abort(super::TurnAbortReason::ExecutionFailure) {
+                    error = error.context(format!(
+                        "abort DFlash output finalization failed: {abort:#}"
+                    ));
+                }
+                return Err(error);
+            }
+            if let Some(reason) = output.stop_reason() {
+                finish_reason = reason.finish_reason();
+            }
+        }
         let text = tokenizer
             .map(|tokenizer| {
-                crate::tokenization::decode_output(
-                    tokenizer,
-                    &generated,
-                    &options.effective_preserved_tokens(),
-                )
+                crate::tokenization::decode_generation_output(tokenizer, &generated, options)
             })
             .transpose()?
             .unwrap_or_default();
@@ -2679,6 +2780,7 @@ impl WorkflowRuntime {
             )?;
             for (index, (token, text)) in generated.iter().copied().zip(pieces).enumerate() {
                 callback(crate::config::GenerateToken {
+                    timings: None,
                     logprob: None,
                     token_id: token,
                     text,
@@ -2694,6 +2796,8 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            timings: None,
+            retained_cache_tokens: 0,
             preserved_tokens: options.effective_preserved_tokens(),
             text,
             token_ids: generated,

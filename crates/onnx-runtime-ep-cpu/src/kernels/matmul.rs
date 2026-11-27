@@ -4324,8 +4324,8 @@ fn matmul_geometry_from_shapes(a_raw: &[usize], b_raw: &[usize]) -> Result<MatMu
     let b_mat = checked_matmul_numel(&[k, n], "B matrix")?;
     let c_mat = checked_matmul_numel(&[m, n], "output matrix")?;
     let result_len = batch_count.checked_mul(c_mat).ok_or_else(|| EpError::KernelFailed(format!("MatMul broadcast result {batch_shape:?} x [{m}, {n}] element count overflowed usize; reduce the dimensions")))?;
-    let a_batch_strides = compute_contiguous_strides(&a_batch);
-    let b_batch_strides = compute_contiguous_strides(&b_batch);
+    let a_batch_strides = compute_contiguous_strides(&a_batch)?;
+    let b_batch_strides = compute_contiguous_strides(&b_batch)?;
 
     Ok(MatMulGeometry {
         m,
@@ -10445,7 +10445,8 @@ mod tests {
 
         let buf = [0.0f32; 8];
         let shape = [2usize, 2];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let base = buf.as_ptr() as usize;
         let bytes = 4 * 4; // 4 f32
 
@@ -10502,7 +10503,8 @@ mod tests {
         let mut shared = vec![1.0f32, 2.0, 3.0, 4.0];
         let b_buf = [0.0f32, 1.0, 1.0, 0.0];
         let shape = vec![2usize, 2];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let a_ptr = shared.as_ptr() as *const std::ffi::c_void;
         let c_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
 
@@ -12408,6 +12410,9 @@ mod weight_cache_accounting {
             "DeformConv" => NoWeightCache(
                 "samples into execution-local panels and consumes weights without retaining them",
             ),
+            "RoiAlign" => NoWeightCache(
+                "retains only parsed attributes; tensor copies and pooled output staging are per execution",
+            ),
             "GroupedMatMul" => NoWeightCache(
                 "indexes weight layouts directly using execution-local dense views or copies",
             ),
@@ -12548,6 +12553,7 @@ mod weight_cache_accounting {
             "Max",
             "MaxPool",
             "Mean",
+            "MeanVarianceNormalization",
             "MelWeightMatrix",
             "Min",
             "Mish",
