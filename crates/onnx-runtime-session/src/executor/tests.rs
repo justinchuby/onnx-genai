@@ -10989,21 +10989,51 @@ fn view_bounds_rejects_offset_overrun() {
 }
 
 #[test]
-fn sub_byte_view_bounds_rejects_geometry_overflow() {
+fn sub_byte_view_bounds_accepts_exact_usize_backing() {
     let shape = [usize::MAX, 2];
     let strides = compute_contiguous_strides(&shape)
         .expect("fixture shape has representable contiguous strides");
-    let error = view_bounds(&shape, &strides, 0, DataType::Int4, usize::MAX);
-    assert!(matches!(error, Err(SessionError::ShapeOverflow { .. })));
+    assert!(
+        view_bounds(&shape, &strides, 0, DataType::Int4, usize::MAX).is_ok(),
+        "two Int4 values per byte exactly fill a usize::MAX-byte backing"
+    );
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn sub_byte_view_bounds_rejects_geometry_overflow() {
+    let overflow_shape = [usize::MAX, 6];
+    let overflow_strides = [i64::MAX, i64::MAX];
+    let error = view_bounds(
+        &overflow_shape,
+        &overflow_strides,
+        0,
+        DataType::Int4,
+        usize::MAX,
+    );
+    assert!(matches!(
+        error,
+        Err(SessionError::ShapeOverflow { ref value, ref dims })
+            if value == "sub-byte tensor view element range" && dims == &overflow_shape
+    ));
 }
 
 #[test]
-fn sub_byte_view_bounds_rejects_offset_overflow() {
+fn sub_byte_view_bounds_rejects_offset_overrun() {
     let shape = [1usize];
     let strides = compute_contiguous_strides(&shape)
         .expect("fixture shape has representable contiguous strides");
+    assert!(
+        view_bounds(&shape, &strides, usize::MAX - 1, DataType::Int4, usize::MAX).is_ok(),
+        "the last backing byte can hold one Int4 value"
+    );
     let error = view_bounds(&shape, &strides, usize::MAX, DataType::Int4, usize::MAX);
-    assert!(matches!(error, Err(SessionError::ShapeOverflow { .. })));
+    assert!(matches!(
+        error,
+        Err(SessionError::Ep(
+            onnx_runtime_ep_api::EpError::InvalidTensorView { ref reason }
+        )) if reason.contains("outside backing allocation")
+    ));
 }
 
 #[test]
