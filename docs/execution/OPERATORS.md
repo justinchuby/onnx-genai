@@ -110,6 +110,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | InstanceNormalization | 6 | Style transfer, diffusion. |
 | DepthToSpace | 1 | Standalone nxrt NCHW rearrangement; `mode` since opset 11 (DCR default, or CRD). |
 | SpaceToDepth | 1 | Standalone nxrt inverse NCHW rearrangement; `mode` since opset 28 (DCR default, or CRD). ORT plugin registration remains unchanged. |
+| ReverseSequence | 10, 28 | Standalone CPU/CUDA only. Fixed-width tensors; standalone execution accepts BF16 from opset 10, although ONNX first lists it in the opset 28 schema. Mixed managed-string/Int64 inputs are not supported. |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
 | Compress | 9, 11, 28 | Compress-28 adds BF16. Native CPU and CUDA preserve BF16 element bits during selection. String tensors are not handled by the CUDA kernel. |

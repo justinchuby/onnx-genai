@@ -239,7 +239,7 @@ pub unsafe extern "C" fn CreateEpFactories(
             unsafe {
                 onnx_runtime_ep_plugin::factory::exclude_operators(
                     *out_factories_raw,
-                    onnx_runtime_ep_plugin::ep::STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM,
+                    onnx_runtime_ep_plugin::ep::SHIPPED_ORT_EXCLUSIONS,
                 );
                 onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(
                     *out_factories_raw,
