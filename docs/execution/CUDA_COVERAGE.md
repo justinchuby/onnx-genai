@@ -122,9 +122,11 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes / justification |
 |----|--------|--------|---------|-----------------------|
 | `MaxPool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | 2-D NCHW f32/f16/bf16; kernel, strides, symmetric explicit padding, `VALID`, and symmetric `SAME_UPPER`/`SAME_LOWER`. `ceil_mode=1`, dilated pooling, `storage_order`, asymmetric padding, and the optional ONNX Indices output are rejected explicitly. |
+| `MaxUnpool` | `` | ✅ | **NVRTC scatter** | Opsets 9/11 support f16/f32/f64; opset 22 adds bf16. Uses full row-major Int64 indices and an optional full output shape; duplicate indices select the last source as in the ONNX reference. Eager CUDA only: reads index-validation status before writing output. |
 | `AveragePool` | `` | ✅ | **cuDNN** / **NVRTC** | Unit dilation keeps the 2-D NCHW cuDNN path (symmetric padding and floor mode only). Non-unit dilation uses a native N-D CUDA kernel (opset ≥19), with explicit or automatic padding, ceil mode, and both divisors. Contiguous f32/f16, plus bf16 in opset ≥22; f64 is not supported. |
-| `LpPool` | `` | ✅ | **NVRTC-custom** | Arbitrary-rank NCHW-style f32/f16/bf16 Lp window reduction with positive integer `p`, strides, dilation, explicit/automatic padding, and `ceil_mode`; accumulation widens to f32 (`pooling.rs`). |
+| `LpPool` | `` | ✅ | **NVRTC-custom** | N-D Lp window reduction with positive integer `p`, strides, dilation, explicit/automatic padding, and `ceil_mode`. f16/f32/f64 since opset 18; bf16 since 22. f16 and bf16 accumulate in f32; f64 stays in f64 (`pooling.rs`). |
 | `GlobalAveragePool`, `GlobalMaxPool`, `GlobalLpPool` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank NCHW-style f32/f16/bf16 global spatial reduction. Average, max, and integer-`p` Lp semantics match the CPU EP (`global_reduction.rs`). |
+| `MaxRoiPool` | `` | ✅ | **NVRTC-custom** | NCHW f16/f32/f64 and bf16 from opset 22; quantized ROI bins, clipping, and zero-filled empty bins. Device ROI validation reads back a status word, so CUDA graph capture is not supported. |
 
 ### Elementwise — unary / activations
 
@@ -250,9 +252,10 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `ArgMax` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `ArgMin` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int64 indices (Int32 since opset 29), negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
-| `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic NCHW spatial-block rearrangement with runtime `blocksize`, including multi-channel and empty-batch tensors (`structural.rs`). |
-| `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
-| `AffineGrid` | `` | ✅ | **NVRTC-custom** | Two- and three-dimensional sampling-grid construction for f32/f16/bf16 theta, including `align_corners` and singleton spatial dimensions (`data_transform.rs`). |
+| `DepthToSpace` | `` | ✅ | **NVRTC-custom** | Standalone nxrt: fixed-width NCHW rearrangement with runtime `blocksize`; DCR default, CRD from opset 11 (`structural.rs`). |
+| `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Standalone nxrt: fixed-width inverse NCHW rearrangement; DCR default, explicit DCR/CRD from opset 28 (`structural.rs`). ORT plugin retains its legacy registration and DCR kernel. |
+| `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and optional output dtype override. BF16 is supported on either edge from opset 22; the other numeric and boolean types are supported from opset 9 (`structural.rs`). |
+| `AffineGrid` | `` | ✅ | **NVRTC-custom** | Two- and three-dimensional sampling-grid construction for f32/f16/bf16/f64 theta, including `align_corners` and singleton spatial dimensions; f64 uses native double arithmetic (`data_transform.rs`). |
 | `Compress` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width selection with omitted-axis flattening, positive/negative axes, and short conditions (`data_transform.rs`). |
 | `DynamicQuantizeLinear` | `` | ✅ | **NVRTC-custom** | Float32 per-tensor dynamic uint8 quantization; one block derives min/max, scale, and ties-to-even zero point before quantizing (`quantization.rs`). |
 | `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
@@ -585,9 +588,10 @@ operators: `GatherND`, `SpaceToDepth`, and `EyeLike`. All three use
 dtype-agnostic NVRTC byte kernels rather than a vendor library:
 `GatherND` supports Int64 indices (Int32 since opset 29), negative wrapping, tuple tails, and
 `batch_dims`; `SpaceToDepth` rearranges arbitrary fixed-width NCHW tensors; and
-`EyeLike` emits exact zero/one storage for every numeric/bool dtype supported by
-the CPU EP. GPU parity covers batch dimensions, negative indices, multiple
-channels, dtype overrides, diagonal offsets, and empty tensors. This raises the
+`EyeLike` emits exact zero/one storage for every numeric/bool dtype allowed by
+its opset, including BF16 from opset 22. GPU parity covers batch dimensions,
+negative indices, multiple channels, dtype overrides, diagonal offsets, and
+empty tensors. This raises the
 machine-verified `CUDA_COVERED_OPS` count from **131** to **134** and the current
 CPU standard-domain parity count from **102 / 141** to **105 / 141**. These ops
 move out of the CPU `ai.onnx` gap list.
@@ -640,6 +644,10 @@ negative/interior normalization axes, and dynamic quantization for mixed-sign,
 constant, and empty inputs. Historical snapshot after batch 10: **152** advertised CUDA op names, **157**
 CUDA `(domain, op_type)` pairs, and **134 / 145** CPU standard-domain op types.
 
+ONNX opset 22 adds BF16 to the three global pooling schemas. The `global_pool_v22`
+session tests check exact BF16 results on native CPU and on CUDA without fallback;
+the batch 10 tests retain legacy-opset kernel parity coverage.
+
 The issue #67 operator-coverage batch 11 adds `InstanceNormalization` and
 `GroupNormalization`; batch 12 adds `LpPool`, `CenterCropPad`, and `Col2Im`.
 The latter shares a general N-D pooling geometry path and a fixed-width index
@@ -667,10 +675,13 @@ Standalone `ConvTranspose` covers 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16
 overlap-add with strides, asymmetric pads, dilations, output padding, bias, groups,
 and depthwise geometry. SAME_UPPER and SAME_LOWER target `input * stride`;
 explicit `output_shape` overrides `pads`.
-`GridSample` covers 4-D bilinear/nearest sampling for zeros, border, and
-reflection padding with either `align_corners` setting. Cubic/bicubic and
-volumetric GridSample remain explicitly fail-closed. GPU parity covers the
-supported narrow storage types and out-of-bounds sampling. Historical snapshot after batch 14: **163** advertised CUDA op names, **168**
+Standalone `GridSample` supports `bilinear`, `bicubic`, and `nearest` on 2-D
+inputs at opsets 16–19; opset 20 onward supports `linear`, `cubic`, and `nearest`
+on 1-D, 2-D, and 3-D inputs. All support zeros, border, and reflection with
+either `align_corners` setting. X/Y and grid independently support f32 and f16,
+plus bf16 starting at opset 22. Higher spatial ranks and other dtypes are not
+claimed. The ORT CUDA plugin retains 2-D linear/nearest routes with matching
+f32, f16, or bf16 inputs. Historical snapshot after batch 14: **163** advertised CUDA op names, **168**
 CUDA `(domain, op_type)` pairs, and **143 / 145** CPU standard-domain op types.
 
 The issue #67 operator-coverage batch 15 adds `com.microsoft::LinearAttention`

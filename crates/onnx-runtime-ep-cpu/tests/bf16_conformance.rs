@@ -24,7 +24,7 @@ use common::{FloatDType, PreparedKernel, Tensor};
 use half::bf16;
 use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, static_shape};
 
 /// One positional operator input.
 enum Inp {
@@ -121,6 +121,146 @@ fn assert_bf16_matches_f32(case: &OpCase) {
             (r - a).abs() <= tol || (r.is_nan() && a.is_nan()),
             "{}: element {i} bf16={a} vs f32={r} exceeds tol {tol}",
             case.op
+        );
+    }
+}
+
+#[test]
+fn window_pool_bf16_starts_at_opset_22_and_executes_natively() {
+    let ep = CpuExecutionProvider::new();
+    let input_values: Vec<f32> = (1..=16).map(|value| value as f32).collect();
+    let shape = static_shape([1, 1, 4, 4]);
+
+    for (op_type, expected) in [
+        ("AveragePool", vec![3.5, 5.5, 11.5, 13.5]),
+        ("MaxPool", vec![6.0, 8.0, 14.0, 16.0]),
+    ] {
+        let mut node = Node::new(NodeId(0), op_type, vec![], vec![]);
+        node.attributes
+            .insert("kernel_shape".into(), Attribute::Ints(vec![2, 2]));
+        node.attributes
+            .insert("strides".into(), Attribute::Ints(vec![2, 2]));
+
+        let legacy = ep.supports_op(
+            &node,
+            21,
+            std::slice::from_ref(&shape),
+            &[DataType::BFloat16],
+            &[],
+        );
+        let reason = legacy.reason().expect("opset 21 BF16 must be declined");
+        assert!(
+            reason.contains("requires ONNX opset 22"),
+            "{op_type}: {reason}"
+        );
+        assert!(
+            ep.supports_op(
+                &node,
+                22,
+                std::slice::from_ref(&shape),
+                &[DataType::BFloat16],
+                &[],
+            )
+            .is_supported(),
+            "{op_type}-22 BF16 must be admitted"
+        );
+
+        let kernel = ep.get_kernel(&node, &[vec![1, 1, 4, 4]], 22).unwrap();
+        let input = Tensor::floats(FloatDType::Bf16, &[1, 1, 4, 4], &input_values);
+        let mut output = Tensor::zeros(FloatDType::Bf16, &[1, 1, 2, 2]);
+        kernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        for (index, (&actual, &expected)) in output.to_f32().iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.05,
+                "{op_type} output {index}: got {actual}, expected {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lp_normalization_supported_dtypes_are_admitted_across_opsets() {
+    let ep = CpuExecutionProvider::new();
+    let node = Node::new(
+        NodeId(0),
+        "LpNormalization",
+        vec![Some(ValueId(0))],
+        vec![ValueId(1)],
+    );
+    let shape = static_shape([2, 3]);
+
+    for dtype in [
+        DataType::BFloat16,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+    ] {
+        for opset in [1, 21, 22] {
+            let claim = ep.supports_op(&node, opset, std::slice::from_ref(&shape), &[dtype], &[]);
+            assert!(
+                claim.is_supported(),
+                "{dtype:?} must remain legal at opset {opset}: {:?}",
+                claim.reason()
+            );
+        }
+    }
+}
+
+#[test]
+fn instance_normalization_dtype_admission_changes_at_opset22() {
+    let ep = CpuExecutionProvider::new();
+    let node = Node::new(
+        NodeId(0),
+        "InstanceNormalization",
+        vec![Some(ValueId(0)), Some(ValueId(1)), Some(ValueId(2))],
+        vec![ValueId(3)],
+    );
+    let shapes = [
+        static_shape([1, 2, 2, 2]),
+        static_shape([2]),
+        static_shape([2]),
+    ];
+
+    for dtype in [DataType::Float16, DataType::Float32, DataType::Float64] {
+        for opset in [6, 21, 22] {
+            let claim = ep.supports_op(&node, opset, &shapes, &[dtype; 3], &[]);
+            assert!(
+                claim.is_supported(),
+                "{dtype:?} must remain legal at opset {opset}: {:?}",
+                claim.reason()
+            );
+        }
+    }
+
+    let rejected = ep.supports_op(&node, 21, &shapes, &[DataType::BFloat16; 3], &[]);
+    assert!(!rejected.is_supported());
+    let reason = rejected.reason().unwrap_or_default();
+    assert!(reason.contains("BFloat16"), "{reason}");
+    assert!(reason.contains("opset 22"), "{reason}");
+
+    let admitted = ep.supports_op(&node, 22, &shapes, &[DataType::BFloat16; 3], &[]);
+    assert!(admitted.is_supported(), "{:?}", admitted.reason());
+}
+
+#[test]
+fn lp_normalization_bf16_legacy_opset_matches_independent_golden() {
+    let case = OpCase {
+        op: "LpNormalization",
+        domain: "",
+        opset: 1,
+        attrs: vec![("axis", Attribute::Int(-1)), ("p", Attribute::Int(2))],
+        inputs: vec![Inp::F(vec![2, 3], vec![3.0, 4.0, 0.0, 0.0, 0.0, 5.0])],
+        out_shape: vec![2, 3],
+        abs_tol: 0.0,
+    };
+    let actual = run_case(&case, FloatDType::Bf16);
+    let expected = [0.6, 0.8, 0.0, 0.0, 0.0, 1.0];
+    for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 0.004,
+            "LpNormalization BF16 golden index {index}: got {actual}, expected {expected}"
         );
     }
 }

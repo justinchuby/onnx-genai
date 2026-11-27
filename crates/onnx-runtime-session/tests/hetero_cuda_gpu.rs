@@ -4,7 +4,7 @@
 #[path = "packed_shape_only/cases.rs"]
 mod packed_shape_only_cases;
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use onnx_runtime_ep_api::{
     DeviceBuffer, DeviceId, DeviceType, EpConfig, EpId, ExecutionProvider, Fence, Kernel,
@@ -12,10 +12,12 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
-use onnx_runtime_ir::{DataType, Graph, Node, NodeId, Shape, TensorLayout, static_shape};
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, NodeId, Shape, TensorLayout, static_shape,
+};
 use onnx_runtime_loader::WeightStore;
-use onnx_runtime_session::Tensor;
 use onnx_runtime_session::hetero::{ProviderPlacement, execute, plan};
+use onnx_runtime_session::{InferenceSession, Tensor};
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]
@@ -154,6 +156,80 @@ fn graph() -> Graph {
     graph
 }
 
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn eye_like_22_unknown_input_rank_runs_without_cpu_fallback() {
+    let mut cuda = CudaExecutionProvider::new(0).expect("CUDA device 0");
+    cuda.initialize(&EpConfig::default())
+        .expect("initialize CUDA");
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 22);
+    let dtype = DataType::BFloat16;
+    let input = graph.create_named_value("x", dtype, vec![]);
+    graph.mark_value_shape_unknown(input);
+    graph.add_input(input);
+    let output = graph.create_named_value("y", dtype, static_shape([2, 3]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "EyeLike",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let mut session = InferenceSession::from_graph_with_provider(
+        graph,
+        Arc::new(WeightStore::new()),
+        Path::new("."),
+        Arc::new(cuda),
+        None,
+    )
+    .expect("build CUDA-only EyeLike-22 with unknown input rank");
+    assert_eq!(session.device_id().device_type, DeviceType::Cuda);
+    assert!(
+        session.execution_provider_fallback_report().is_none(),
+        "EyeLike-22 must not fall back to CPU: {:?}",
+        session.execution_provider_fallback_report()
+    );
+    let x = Tensor::from_raw(dtype, vec![2, 3], &0x40e0_u16.to_le_bytes().repeat(6)).unwrap();
+    let result = session.run(&[("x", &x)]).expect("run CUDA-only EyeLike-22");
+    assert_eq!(result[0].dtype, dtype);
+    assert_eq!(result[0].shape, [2, 3]);
+    assert_eq!(
+        result[0].as_bytes(),
+        &[0x80, 0x3f, 0, 0, 0, 0, 0, 0, 0x80, 0x3f, 0, 0]
+    );
+}
+
+fn einsum_graph(opset: u64) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), opset);
+    let lhs = graph.create_named_value("lhs", DataType::BFloat16, static_shape([2, 3]));
+    let rhs = graph.create_named_value("rhs", DataType::BFloat16, static_shape([3, 2]));
+    let output = graph.create_named_value("output", DataType::BFloat16, static_shape([2, 2]));
+    graph.add_input(lhs);
+    graph.add_input(rhs);
+    graph.add_output(output);
+    let mut node = Node::new(
+        NodeId(0),
+        "Einsum",
+        vec![Some(lhs), Some(rhs)],
+        vec![output],
+    );
+    node.attributes
+        .insert("equation".into(), Attribute::String(b"ik,kj->ij".to_vec()));
+    graph.insert_node(node);
+    graph
+}
+
+fn bf16_tensor(shape: &[usize], values: &[f32]) -> Tensor {
+    let bytes = values
+        .iter()
+        .flat_map(|&value| half::bf16::from_f32(value).to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    Tensor::from_raw(DataType::BFloat16, shape.to_vec(), &bytes).unwrap()
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires a CUDA device; enable gpu-tests to execute"
@@ -204,4 +280,49 @@ fn cuda_cpu_cuda_chain_executes_on_both_real_providers() {
     )
     .expect("heterogeneous CUDA execution");
     assert_eq!(output[0].to_vec_f32(), vec![-0.0, -2.0, -0.0, -4.0]);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires a CUDA device; enable gpu-tests to execute"
+)]
+#[test]
+fn einsum_bf16_executes_at_v27_and_v28_in_strict_single_cuda_sessions() {
+    let provider = Arc::new(CudaExecutionProvider::initialized(0).expect("initialize CUDA"));
+    let lhs = bf16_tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let rhs = bf16_tensor(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let expected = bf16_tensor(&[2, 2], &[22.0, 28.0, 49.0, 64.0]);
+
+    for opset in [27, 28] {
+        let graph = einsum_graph(opset);
+        assert_eq!(graph.opset_imports.get("").copied(), Some(opset));
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.local_opset().is_none()),
+            "the session must resolve the graph import without rewriting node-local opsets"
+        );
+        let mut session = InferenceSession::from_graph_with_provider(
+            graph,
+            Arc::new(WeightStore::new()),
+            Path::new("."),
+            provider.clone(),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!("build a sole-provider CUDA session for Einsum-{opset} BFloat16: {error}")
+        });
+        assert_eq!(session.device_id(), DeviceId::new(DeviceType::Cuda, 0));
+        assert!(session.execution_provider_fallback_report().is_none());
+        assert!(session.heterogeneous_placement_report().is_none());
+
+        let outputs = session
+            .run(&[("lhs", &lhs), ("rhs", &rhs)])
+            .unwrap_or_else(|error| panic!("execute Einsum-{opset} BFloat16 on CUDA: {error}"));
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].dtype, DataType::BFloat16);
+        assert_eq!(outputs[0].shape, [2, 2]);
+        assert_eq!(outputs[0].as_bytes(), expected.as_bytes());
+    }
 }

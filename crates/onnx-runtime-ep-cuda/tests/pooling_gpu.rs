@@ -14,6 +14,7 @@
 )]
 //! Physical CUDA tests for ONNX pooling; CPU references live in cpu_fixture_checks.
 
+mod common;
 #[path = "fixtures/pooling.rs"]
 mod fixtures;
 use fixtures::{assert_close, build_pool_model, dilated_cases};
@@ -196,6 +197,93 @@ fn require_cuda() -> CudaExecutionProvider {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn max_unpool_cuda_pinned_reference_and_bounds() {
+    use common::{absent_input, float_input, input, raw, run_cuda, try_run_cuda};
+
+    let ep = require_cuda();
+    let f32_dtype = DataType::Float32;
+    let i64_dtype = DataType::Int64;
+    let attrs = [
+        ("kernel_shape", Attribute::Ints(vec![2])),
+        ("strides", Attribute::Ints(vec![2])),
+    ];
+    let shape = [1, 1, 2];
+    let out = vec![1, 1, 4];
+    // Pinned ONNX export_1d, including older schema versions and an omitted slot.
+    for (version, dtype) in [
+        (9, DataType::Float16),
+        (11, f32_dtype),
+        (22, DataType::BFloat16),
+    ] {
+        let actual = run_cuda(
+            &ep,
+            "MaxUnpool",
+            "",
+            version,
+            &[
+                float_input(dtype, &shape, &[1., 2.]),
+                input(i64_dtype, &shape, &[1i64, 3]),
+                absent_input(i64_dtype),
+            ],
+            &[(dtype, out.clone())],
+            &attrs,
+        );
+        assert_eq!(actual[0], common::encode_floats(&[0., 1., 0., 2.], dtype));
+    }
+
+    // Pinned reference's last-source rule, with an explicit shape overriding
+    // asymmetric pads and an f64 payload that cannot round-trip through f32.
+    let attrs = [
+        ("kernel_shape", Attribute::Ints(vec![2])),
+        ("strides", Attribute::Ints(vec![2])),
+        ("pads", Attribute::Ints(vec![0, 1])),
+    ];
+    let dtype = DataType::Float64;
+    let precise = f64::from_bits(0x3ff0000000000001);
+    let x = input(dtype, &shape, &[7., precise]);
+    let control = input(i64_dtype, &[3], &[1i64, 1, 5]);
+    let outputs = [(dtype, vec![1, 1, 5])];
+    let actual = run_cuda(
+        &ep,
+        "MaxUnpool",
+        "",
+        22,
+        &[
+            x.clone(),
+            input(i64_dtype, &shape, &[4i64, 4]),
+            control.clone(),
+        ],
+        &outputs,
+        &attrs,
+    );
+    assert_eq!(actual[0], raw(&[0., 0., 0., 0., precise]));
+    for bad in [-1, 5] {
+        let error = try_run_cuda(
+            &ep,
+            "MaxUnpool",
+            "",
+            22,
+            &[
+                x.clone(),
+                input(i64_dtype, &shape, &[4i64, bad]),
+                control.clone(),
+            ],
+            &outputs,
+            &attrs,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("I[1]={bad}")),
+            "{error}"
+        );
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn cudnn_maxpool_matches_cpu_for_f32_and_f16() {
     let ep = require_cuda();
     let input = [
@@ -256,6 +344,53 @@ fn cudnn_averagepool_padding_count_modes_match_cpu() {
     }
 
     println!("cuDNN AveragePool padded include/exclude-padding cases passed");
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cuda_window_pool_bf16_starts_at_opset_22_and_stays_device_resident() {
+    let ep = require_cuda();
+    let input: Vec<f32> = (1..=16).map(|value| value as f32).collect();
+    let shape = static_shape([1, 1, 4, 4]);
+
+    for (op_type, expected) in [
+        ("AveragePool", vec![3.5, 5.5, 11.5, 13.5]),
+        ("MaxPool", vec![6.0, 8.0, 14.0, 16.0]),
+    ] {
+        let (mut graph, node_id) = build_pool_model(
+            op_type,
+            DataType::BFloat16,
+            &[1, 1, 4, 4],
+            &[1, 1, 2, 2],
+            [2, 2],
+            [2, 2],
+            [0, 0, 0, 0],
+            None,
+        );
+        graph.opset_imports.insert(String::new(), 21);
+        let legacy = ep.supports_op(
+            graph.node(node_id),
+            21,
+            std::slice::from_ref(&shape),
+            &[DataType::BFloat16],
+            &[],
+        );
+        let reason = legacy.reason().expect("opset 21 BF16 must be declined");
+        assert!(
+            reason.contains("requires ONNX opset 22"),
+            "{op_type}: {reason}"
+        );
+
+        graph.opset_imports.insert(String::new(), 22);
+        assert_close(
+            &run_model(&ep, &Model::new(&graph), node_id, &input),
+            &expected,
+            0.05,
+        );
+    }
 }
 
 #[test]

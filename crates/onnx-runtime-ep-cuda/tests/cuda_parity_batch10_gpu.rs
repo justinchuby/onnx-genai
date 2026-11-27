@@ -16,8 +16,12 @@
 
 mod common;
 
-use common::{assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda};
-use onnx_runtime_ir::{Attribute, DataType};
+use common::{
+    assert_close, build_graph, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
+};
+use onnx_runtime_ep_api::ExecutionProvider;
+use onnx_runtime_ir::{Attribute, DataType, static_shape};
+use onnx_runtime_loader::Model;
 
 fn tolerance(dtype: DataType) -> f32 {
     match dtype {
@@ -36,6 +40,76 @@ fn assert_float_outputs(label: &str, dtype: DataType, cuda: &[Vec<u8>], cpu: &[V
         &decode_floats(&cpu[0], dtype),
         tolerance(dtype),
     );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn affine_grid_f64_matches_cpu_and_preserves_double_precision() {
+    let ep = require_cuda();
+    let dtype = DataType::Float64;
+    // The scale rounds to 1.0 in f32; non-dyadic coordinates also expose f32 intermediates.
+    let delta = 2f64.powi(-30);
+    let scale = 1.0 + delta;
+    for (align_corners, xs, zs) in [
+        (0, [-2.0 / 3.0, 0.0, 2.0 / 3.0], [-0.5, 0.5]),
+        (1, [-1.0, 0.0, 1.0], [-1.0, 1.0]),
+    ] {
+        let attrs = [("align_corners", Attribute::Int(align_corners))];
+        let expected_2d: Vec<f64> = xs.iter().flat_map(|&x| [scale * x, scale]).collect();
+        let expected_3d: Vec<f64> = zs
+            .iter()
+            .flat_map(|&z| {
+                xs.into_iter()
+                    .flat_map(move |x| [scale * x + z, z + scale, x - z + delta])
+            })
+            .collect();
+        for (theta_shape, theta, size, output_shape, expected) in [
+            (
+                vec![1, 2, 3],
+                vec![scale, 0.25, 0.0, 0.0, 1.0, scale],
+                vec![1i64, 1, 1, 3],
+                vec![1, 1, 3, 2],
+                expected_2d,
+            ),
+            (
+                vec![1, 3, 4],
+                vec![
+                    scale, 0.25, 1.0, 0.0, 0.0, 1.0, 1.0, scale, 1.0, 0.5, -1.0, delta,
+                ],
+                vec![1, 1, 2, 1, 3],
+                vec![1, 2, 1, 3, 3],
+                expected_3d,
+            ),
+        ] {
+            let inputs = [
+                input(dtype, &theta_shape, &theta),
+                input(DataType::Int64, &[size.len()], &size),
+            ];
+            let outputs = [(dtype, output_shape)];
+            let cuda = run_cuda(&ep, "AffineGrid", "", 20, &inputs, &outputs, &attrs);
+            let cpu = run_cpu("AffineGrid", "", 20, &inputs, &outputs, &attrs);
+            assert_eq!(cuda[0].len(), expected.len() * size_of::<f64>());
+            assert_eq!(cpu[0].len(), cuda[0].len());
+            for (index, ((cuda, cpu), expected)) in cuda[0]
+                .chunks_exact(size_of::<f64>())
+                .zip(cpu[0].chunks_exact(size_of::<f64>()))
+                .zip(expected)
+                .enumerate()
+            {
+                let cuda = f64::from_ne_bytes(cuda.try_into().unwrap());
+                let cpu = f64::from_ne_bytes(cpu.try_into().unwrap());
+                assert!(
+                    (cuda - expected).abs() <= 1e-14
+                        && (cpu - expected).abs() <= 1e-14
+                        && (cuda - cpu).abs() <= 1e-14,
+                    "AffineGrid {theta_shape:?}, align_corners={align_corners}, index {index}: CUDA {cuda}, CPU {cpu}, expected {expected}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg_attr(
@@ -216,19 +290,151 @@ fn global_lp_pool_matches_cpu_for_nondefault_p() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn lp_normalization_matches_cpu_for_negative_and_interior_axes() {
+fn lp_normalization_supported_dtypes_are_admitted_across_opsets_gpu() {
+    let ep = require_cuda();
+    for (dtype, opset) in [
+        (DataType::Float16, 21),
+        (DataType::Float32, 21),
+        (DataType::BFloat16, 1),
+        (DataType::BFloat16, 21),
+        (DataType::BFloat16, 22),
+    ] {
+        let inputs = vec![float_input(dtype, &[2, 3], &[3.0, 4.0, 0.0, 0.0, 0.0, 5.0])];
+        let outputs = vec![(dtype, vec![2, 3])];
+        let (graph, node_id) = build_graph("LpNormalization", "", opset, &inputs, &outputs, &[]);
+        let model = Model::new(&graph);
+        let claim = ep.supports_op(
+            model.graph.node(node_id),
+            opset,
+            &[static_shape([2, 3])],
+            &[dtype],
+            &[],
+        );
+        assert!(
+            claim.is_supported(),
+            "{dtype:?} must be admitted at opset {opset}: {:?}",
+            claim.reason()
+        );
+    }
+
+    let inputs = vec![float_input(
+        DataType::BFloat16,
+        &[2, 3],
+        &[3.0, 4.0, 0.0, 0.0, 0.0, 5.0],
+    )];
+    let outputs = vec![(DataType::BFloat16, vec![2, 3])];
+    let attrs = vec![("fused_reduce_chain", Attribute::Int(1))];
+    let (graph, node_id) = build_graph("LpNormalization", "", 21, &inputs, &outputs, &attrs);
+    let model = Model::new(&graph);
+    let claim = ep.supports_op(
+        model.graph.node(node_id),
+        21,
+        &[static_shape([2, 3])],
+        &[DataType::BFloat16],
+        &[],
+    );
+    assert!(
+        claim.is_supported(),
+        "optimizer-created BF16 LpNormalization must remain claimable: {:?}",
+        claim.reason()
+    );
+    let cuda = run_cuda(
+        &ep,
+        "LpNormalization",
+        "",
+        21,
+        &inputs,
+        &outputs,
+        &[
+            ("axis", Attribute::Int(-1)),
+            ("p", Attribute::Int(2)),
+            ("fused_reduce_chain", Attribute::Int(1)),
+        ],
+    );
+    assert_close(
+        "optimizer-created LpNormalization independent golden",
+        DataType::BFloat16,
+        &decode_floats(&cuda[0], DataType::BFloat16),
+        &[0.6, 0.8, 0.0, 0.0, 0.0, 1.0],
+        tolerance(DataType::BFloat16),
+    );
+}
+
+fn lp_normalization_reference(values: &[f32], shape: [usize; 3], axis: usize, p: i64) -> Vec<f32> {
+    let outer = shape[..axis].iter().product::<usize>();
+    let axis_len = shape[axis];
+    let inner = shape[axis + 1..].iter().product::<usize>();
+    let mut output = vec![0.0; values.len()];
+    for outer_index in 0..outer {
+        for inner_index in 0..inner {
+            let mut norm = 0.0;
+            for axis_index in 0..axis_len {
+                let index = (outer_index * axis_len + axis_index) * inner + inner_index;
+                let value = values[index].abs();
+                norm += if p == 1 { value } else { value * value };
+            }
+            if p == 2 {
+                norm = norm.sqrt();
+            }
+            for axis_index in 0..axis_len {
+                let index = (outer_index * axis_len + axis_index) * inner + inner_index;
+                output[index] = values[index] / norm;
+            }
+        }
+    }
+    output
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn lp_normalization_legacy_dtypes_match_independent_golden_gpu() {
     let ep = require_cuda();
     let values = [
         1.0f32, -2.0, 3.0, 4.0, -5.0, 6.0, -7.0, 8.0, 9.0, -10.0, 11.0, 12.0,
     ];
-    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
-        for (axis, p) in [(-1i64, 1i64), (1, 2)] {
+    for dtype in [DataType::Float16, DataType::Float32] {
+        for (axis, normalized_axis, p) in [(-1i64, 2usize, 1i64), (1, 1, 2)] {
             let inputs = vec![float_input(dtype, &[2, 3, 2], &values)];
             let outputs = vec![(dtype, vec![2, 3, 2])];
             let attrs = vec![("axis", Attribute::Int(axis)), ("p", Attribute::Int(p))];
             let cuda = run_cuda(&ep, "LpNormalization", "", 1, &inputs, &outputs, &attrs);
-            let cpu = run_cpu("LpNormalization", "", 1, &inputs, &outputs, &attrs);
-            assert_float_outputs("LpNormalization", dtype, &cuda, &cpu);
+            let expected = lp_normalization_reference(&values, [2, 3, 2], normalized_axis, p);
+            assert_close(
+                "LpNormalization legacy independent golden",
+                dtype,
+                &decode_floats(&cuda[0], dtype),
+                &expected,
+                tolerance(dtype),
+            );
         }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn lp_normalization_bf16_legacy_opset_matches_independent_golden_gpu() {
+    let ep = require_cuda();
+    let values = [
+        1.0f32, -2.0, 3.0, 4.0, -5.0, 6.0, -7.0, 8.0, 9.0, -10.0, 11.0, 12.0,
+    ];
+    for (axis, normalized_axis, p) in [(-1i64, 2usize, 1i64), (1, 1, 2)] {
+        let inputs = vec![float_input(DataType::BFloat16, &[2, 3, 2], &values)];
+        let outputs = vec![(DataType::BFloat16, vec![2, 3, 2])];
+        let attrs = vec![("axis", Attribute::Int(axis)), ("p", Attribute::Int(p))];
+        let cuda = run_cuda(&ep, "LpNormalization", "", 1, &inputs, &outputs, &attrs);
+        let expected = lp_normalization_reference(&values, [2, 3, 2], normalized_axis, p);
+        assert_close(
+            "LpNormalization independent golden",
+            DataType::BFloat16,
+            &decode_floats(&cuda[0], DataType::BFloat16),
+            &expected,
+            tolerance(DataType::BFloat16),
+        );
     }
 }

@@ -97,6 +97,7 @@ EXPECTED_CUDA_TARGETS_BY_DIR = {
             "matmul_gpu",
             "matmul_nbits_gpu",
             "matmul_nbits_marlin_numerics",
+            "max_roi_pool_gpu",
             "mean_variance_normalization_gpu",
             "megakernel_headroom_gpu",
             "movement_gpu",
@@ -272,6 +273,8 @@ SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
 SESSION_HETERO_EXPECTED_TESTS = frozenset(
     {
         "cuda_cpu_cuda_chain_executes_on_both_real_providers",
+        "eye_like_22_unknown_input_rank_runs_without_cpu_fallback",
+        "einsum_bf16_executes_at_v27_and_v28_in_strict_single_cuda_sessions",
         "packed_shape_only_cuda_no_fallback",
     }
 )

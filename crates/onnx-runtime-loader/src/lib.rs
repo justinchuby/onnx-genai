@@ -388,7 +388,7 @@ pub fn prepare_graph_for_execution(graph: &mut Graph) -> Result<(), LoaderError>
         changed
     }
 
-    validate_einsum_nodes(graph)?;
+    validate_einsum_nodes_with_policy(graph, EinsumValidationPolicy::NativeRuntime)?;
     if lower(graph) {
         infer_shapes(graph)?;
     }
@@ -568,7 +568,7 @@ fn validate_ir(graph: &Graph) -> Result<(), LoaderError> {
 fn validate_loaded_model(graph: &Graph) -> Result<(), LoaderError> {
     // Check structure before inference, once initializer-backed values are sourced.
     let mut span = trace_span("load.validate_model", "load");
-    validate_model_structure(graph)?;
+    validate_model_structure(graph, EinsumValidationPolicy::NativeRuntime)?;
     if let Some(span) = span.as_mut() {
         span.set_args(Args::new().with("nodes", graph.num_nodes() as u64));
     }
@@ -584,7 +584,7 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
     // declared shapes rather than clobbering them. Values that stay symbolic
     // (genuinely data-dependent extents) are left for the session's JIT
     // fallback to resolve at run time.
-    let registry = InferenceRegistry::default_registry();
+    let registry = InferenceRegistry::native_runtime_registry();
     let opset_imports = graph.opset_imports.clone();
     let mut span = trace_span("load.shape_inference", "load");
     registry.infer_graph(graph, &opset_imports, MergePolicy::Permissive)?;
@@ -603,10 +603,12 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// illegal or unsupported (RULES #1: fail at *load*, never via a silent
 /// sentinel at run time).
 ///
-/// This is the single cohesive entry point wired into **both** load paths — the
+/// The same structural validator is wired into **both** load paths — the
 /// disk/bytes loader ([`build_from_bytes_with_weights`]) and the session's
 /// programmatic entry ([`onnx_runtime_session`]'s `from_parts`/`from_graph`) —
-/// so the checks cannot drift between the two. It runs, in order:
+/// so the checks cannot drift between the two. Official validation uses the
+/// schema dtype table; standalone execution uses the explicit native dtype
+/// policy without changing graph or node opsets. It runs, in order:
 ///
 /// Protobuf-only invariants (`ir_version`, raw SSA names, `ref_attr_name`,
 /// subgraph shadows, and output names) run earlier in
@@ -641,13 +643,32 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// dependency cycles — are intentionally *not* re-checked here to avoid drift;
 /// this function adds the checks that path does not cover.
 pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
-    validate_model_structure(graph)?;
+    validate_model_structure(graph, EinsumValidationPolicy::OfficialSchema)?;
     validate_shape_only_types(graph, graph.opset_imports.get("").copied())
 }
 
-fn validate_model_structure(graph: &Graph) -> Result<(), LoaderError> {
+/// Validate a graph for standalone native execution.
+///
+/// The graph and each node's resolved opset remain unchanged. Only executable
+/// dtype extensions whose operator semantics are unchanged may differ from
+/// [`validate_model`]'s official schema boundary.
+pub fn validate_model_for_native_execution(graph: &Graph) -> Result<(), LoaderError> {
+    validate_model_structure(graph, EinsumValidationPolicy::NativeRuntime)?;
+    validate_shape_only_types(graph, graph.opset_imports.get("").copied())
+}
+
+#[derive(Clone, Copy)]
+enum EinsumValidationPolicy {
+    OfficialSchema,
+    NativeRuntime,
+}
+
+fn validate_model_structure(
+    graph: &Graph,
+    einsum_policy: EinsumValidationPolicy,
+) -> Result<(), LoaderError> {
     validate_opset_imports(graph)?;
-    validate_einsum_nodes(graph)?;
+    validate_einsum_nodes_with_policy(graph, einsum_policy)?;
     validate_topk_nodes(graph)?;
     validate_shape_size_dtypes(graph, &graph.opset_imports)?;
     validate_split_to_sequence_nodes(graph)?;
@@ -898,11 +919,19 @@ pub fn validate_split_to_sequence_nodes(graph: &Graph) -> Result<(), LoaderError
 /// Resolve and validate every default-domain `Einsum` against the model's
 /// effective imported opset before shape inference or placement.
 pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
+    validate_einsum_nodes_with_policy(graph, EinsumValidationPolicy::OfficialSchema)
+}
+
+fn validate_einsum_nodes_with_policy(
+    graph: &Graph,
+    policy: EinsumValidationPolicy,
+) -> Result<(), LoaderError> {
     use onnx_runtime_ir::{Attribute, EinsumInput, EinsumPlan, EinsumSchema, EinsumShapePlan};
 
     fn check_graph(
         graph: &Graph,
         imports: &std::collections::HashMap<String, u64>,
+        policy: EinsumValidationPolicy,
     ) -> Result<(), LoaderError> {
         for (_, node) in graph.nodes.iter() {
             if !node.is_default_domain() || node.op_type != "Einsum" {
@@ -981,7 +1010,15 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
                         .then_some(value.shape.as_slice()),
                 ));
             }
-            let plan = match EinsumPlan::build_for_opset(equation, &metadata, imported_opset) {
+            let planned = match policy {
+                EinsumValidationPolicy::OfficialSchema => {
+                    EinsumPlan::build_for_opset(equation, &metadata, imported_opset)
+                }
+                EinsumValidationPolicy::NativeRuntime => {
+                    EinsumPlan::build_for_native_opset(equation, &metadata, imported_opset)
+                }
+            };
+            let plan = match planned {
                 Ok(plan) => Some(plan),
                 Err(error) if error.is_incomplete_metadata() => {
                     if let Some(shapes) = metadata
@@ -1011,7 +1048,13 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
                         detail: error.to_string(),
                     }
                 })?;
-                if !schema.supports_dtype(output.dtype) {
+                let output_dtype_supported = match policy {
+                    EinsumValidationPolicy::OfficialSchema => schema.supports_dtype(output.dtype),
+                    EinsumValidationPolicy::NativeRuntime => {
+                        schema.supports_native_dtype(output.dtype)
+                    }
+                };
+                if !output_dtype_supported {
                     return Err(LoaderError::InvalidEinsum {
                         node: node_label(node),
                         detail: format!(
@@ -1039,12 +1082,12 @@ pub fn validate_einsum_nodes(graph: &Graph) -> Result<(), LoaderError> {
             }
         }
         for subgraph in graph.subgraphs.values() {
-            check_graph(subgraph, imports)?;
+            check_graph(subgraph, imports, policy)?;
         }
         Ok(())
     }
 
-    check_graph(graph, &graph.opset_imports)
+    check_graph(graph, &graph.opset_imports, policy)
 }
 
 /// Validate ONNX model metadata and protobuf-level graph invariants before

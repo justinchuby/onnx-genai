@@ -1,0 +1,17 @@
+domain: ""
+name: MaxUnpool
+since_version: 11
+doc: Scatter pooled values into a zero-filled output at row-major flat indices.
+attributes:
+  - { name: kernel_shape, type: ints, required: true }
+  - { name: strides, type: ints }
+  - { name: pads, type: ints }
+inputs:
+  - { name: X, type_str: T }
+  - { name: I, type_str: T2 }
+  - { name: output_shape, type_str: T2, optional: true }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float16, float32, float64] }
+  - { type_param: T2, allowed: [int64] }

@@ -1,0 +1,12 @@
+domain: ""
+name: GlobalLpPool
+since_version: 2
+doc: Apply Lp pooling across every spatial dimension.
+inputs:
+  - { name: X, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+attributes:
+  - { name: p, type: int, default: 2, doc: Order of the Lp norm. }
+type_constraints:
+  - { type_param: T, allowed: [float16, float32, float64] }

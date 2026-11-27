@@ -466,10 +466,10 @@ impl CudaEinsumRecipe {
         let semantic = semantic_owner.as_ref();
         let dtype = signature.inputs[0].dtype;
         let arithmetic = Arithmetic::for_dtype(dtype)?;
-        let precision =
-            EinsumPrecisionPolicy::for_schema(semantic.schema(), dtype).ok_or_else(|| {
+        let precision = EinsumPrecisionPolicy::for_native_schema(semantic.schema(), dtype)
+            .ok_or_else(|| {
                 EpError::KernelFailed(format!(
-                    "cuda_ep Einsum `{}`: dtype {dtype:?} is not admitted by {}",
+                    "cuda_ep Einsum `{}`: dtype {dtype:?} cannot execute natively under {}",
                     semantic.equation(),
                     semantic.schema()
                 ))

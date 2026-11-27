@@ -1374,6 +1374,85 @@ fn unsupported_op_error_is_actionable() {
     assert!(message.contains("To fix:"), "{message}");
 }
 
+#[test]
+fn eye_like_22_native_cpu_matches_onnx_reference() {
+    // ONNX 1.24 ReferenceEvaluator, opset 22, 2x3 input filled with sevens.
+    use DataType::{BFloat16, Float32};
+    let bf16_one = 0x3f80_u16;
+    for (input_dtype, output_dtype, dtype_attr, k, diagonal) in [
+        (BFloat16, BFloat16, None, None, &[0, 4][..]),
+        (BFloat16, Float32, Some(Float32), Some(-1), &[3][..]),
+        (Float32, BFloat16, Some(BFloat16), Some(1), &[1, 5][..]),
+    ] {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 22);
+        let x = input(&mut graph, "x", input_dtype, &[2, 3]);
+        let attrs: Vec<_> = dtype_attr
+            .map(|dtype| ("dtype", Attribute::Int(i64::from(dtype.to_onnx()))))
+            .into_iter()
+            .chain(k.map(|k| ("k", Attribute::Int(k))))
+            .collect();
+        let y = op(&mut graph, "EyeLike", &[x], output_dtype, &[2, 3], &attrs);
+        graph.mark_value_shape_unknown(y);
+        graph.add_output(y);
+        let mut session = InferenceSession::from_graph(graph).expect("build CPU EyeLike-22");
+        let data = match input_dtype {
+            BFloat16 => 0x40e0_u16.to_le_bytes().repeat(6),
+            _ => f32_bytes(&[7.0; 6]),
+        };
+        let x = Tensor::from_raw(input_dtype, vec![2, 3], &data).unwrap();
+        let outputs = session.run(&[("x", &x)]).expect("run CPU EyeLike-22");
+        assert_eq!(outputs[0].shape, [2, 3]);
+        assert_eq!(outputs[0].dtype, output_dtype);
+        let expected = match output_dtype {
+            BFloat16 => (0..6)
+                .flat_map(|i| (if diagonal.contains(&i) { bf16_one } else { 0 }).to_le_bytes())
+                .collect(),
+            _ => f32_bytes(
+                &(0..6)
+                    .map(|i| if diagonal.contains(&i) { 1.0 } else { 0.0 })
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        assert_eq!(
+            outputs[0].as_bytes(),
+            expected,
+            "{input_dtype:?} to {output_dtype:?}"
+        );
+    }
+}
+
+#[test]
+fn eye_like_22_cpu_claim_gates_input_and_output_bf16_independently() {
+    let cpu = CpuExecutionProvider::default();
+    let mut node = Node::new(
+        NodeId(0),
+        "EyeLike",
+        vec![Some(ValueId(0))],
+        vec![ValueId(1)],
+    );
+    let shapes = [static_shape([2, 3])];
+    for (input_dtype, requested, edge) in [
+        (DataType::BFloat16, DataType::Float32, "input"),
+        (DataType::Float32, DataType::BFloat16, "output"),
+    ] {
+        node.attributes.insert(
+            "dtype".into(),
+            Attribute::Int(i64::from(requested.to_onnx())),
+        );
+        let claim = cpu.supports_op(&node, 21, &shapes, &[input_dtype], &[]);
+        let reason = claim.reason().expect("EyeLike-9 must not claim BF16");
+        assert!(
+            reason.contains(&format!("{edge} dtype BFloat16")),
+            "{reason}"
+        );
+        assert!(
+            cpu.supports_op(&node, 22, &shapes, &[input_dtype], &[])
+                .is_supported()
+        );
+    }
+}
+
 fn standard_gelu_graph(opset: u64) -> Graph {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), opset);
