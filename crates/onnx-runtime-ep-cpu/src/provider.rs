@@ -578,6 +578,15 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             deny!("Dropout: {reason}");
         }
+        if op.op_type == "InstanceNormalization"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && opset < 22
+            && input_dtypes.first() == Some(&DataType::BFloat16)
+        {
+            deny!(
+                "InstanceNormalization input dtype BFloat16 requires ONNX opset 22 or later; export this node at opset 22+, or use Float16, Float32, or Float64 at opset {opset}"
+            );
+        }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
             && onnx_runtime_ir::is_default_domain(&op.domain)

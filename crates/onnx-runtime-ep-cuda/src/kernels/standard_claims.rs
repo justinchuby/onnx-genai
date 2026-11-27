@@ -61,6 +61,7 @@ pub(crate) fn unsupported_reason_at_opset(
                 input_dtypes,
             )
         }
+        "InstanceNormalization" => instance_normalization(node, opset, input_dtypes),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -107,7 +108,7 @@ pub(crate) fn unsupported_reason(
         "GlobalAveragePool" | "GlobalMaxPool" => global_pool(node, input_dtypes),
         "GlobalLpPool" => global_lp_pool(node, input_dtypes),
         "LpNormalization" => lp_normalization(node, input_dtypes),
-        "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
+        "GroupNormalization" => normalization(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
@@ -189,6 +190,20 @@ fn normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         return Err("scale and bias dtypes must match X".into());
     }
 
+    Ok(())
+}
+
+fn instance_normalization(
+    node: &Node,
+    opset: u64,
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
+    normalization(node, input_dtypes)?;
+    if input_dtypes.first() == Some(&DataType::BFloat16) && opset < 22 {
+        return Err(format!(
+            "input 'X' dtype BFloat16 requires ONNX opset 22 or later; export this node at opset 22+, or use Float16 or Float32 at opset {opset}"
+        ));
+    }
     Ok(())
 }
 

@@ -209,6 +209,42 @@ fn lp_normalization_supported_dtypes_are_admitted_across_opsets() {
 }
 
 #[test]
+fn instance_normalization_dtype_admission_changes_at_opset22() {
+    let ep = CpuExecutionProvider::new();
+    let node = Node::new(
+        NodeId(0),
+        "InstanceNormalization",
+        vec![Some(ValueId(0)), Some(ValueId(1)), Some(ValueId(2))],
+        vec![ValueId(3)],
+    );
+    let shapes = [
+        static_shape([1, 2, 2, 2]),
+        static_shape([2]),
+        static_shape([2]),
+    ];
+
+    for dtype in [DataType::Float16, DataType::Float32, DataType::Float64] {
+        for opset in [6, 21, 22] {
+            let claim = ep.supports_op(&node, opset, &shapes, &[dtype; 3], &[]);
+            assert!(
+                claim.is_supported(),
+                "{dtype:?} must remain legal at opset {opset}: {:?}",
+                claim.reason()
+            );
+        }
+    }
+
+    let rejected = ep.supports_op(&node, 21, &shapes, &[DataType::BFloat16; 3], &[]);
+    assert!(!rejected.is_supported());
+    let reason = rejected.reason().unwrap_or_default();
+    assert!(reason.contains("BFloat16"), "{reason}");
+    assert!(reason.contains("opset 22"), "{reason}");
+
+    let admitted = ep.supports_op(&node, 22, &shapes, &[DataType::BFloat16; 3], &[]);
+    assert!(admitted.is_supported(), "{:?}", admitted.reason());
+}
+
+#[test]
 fn lp_normalization_bf16_legacy_opset_matches_independent_golden() {
     let case = OpCase {
         op: "LpNormalization",
