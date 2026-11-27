@@ -2132,6 +2132,9 @@ impl RmsNormKernel {
         let groups_i = groups_u_i32(groups_u);
         let scale_is_half = i32::from(scale.dtype == DataType::Float16);
         let scale_is_bf16 = i32::from(scale.dtype == DataType::BFloat16);
+        let x_dtype = rmsnorm_storage_code(x.dtype);
+        let scale_dtype = rmsnorm_storage_code(scale.dtype);
+        let stash_type = self.stash.onnx_value();
         if self.stash == RmsNormStash::Float32 {
             builder
                 .arg(&x_ptr)
@@ -2153,9 +2156,6 @@ impl RmsNormKernel {
                 _ => unreachable!("RMSNormalization dtype validated above"),
             }
         } else {
-            let x_dtype = rmsnorm_storage_code(x.dtype);
-            let scale_dtype = rmsnorm_storage_code(scale.dtype);
-            let stash_type = self.stash.onnx_value();
             builder
                 .arg(&x_ptr)
                 .arg(&scale_ptr)
