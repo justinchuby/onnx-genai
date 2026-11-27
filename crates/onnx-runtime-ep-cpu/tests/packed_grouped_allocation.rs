@@ -242,7 +242,13 @@ fn packed_projection_payloads_reuse_one_lane_for_all_supported_input_layouts() {
             .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
             .collect::<Vec<_>>();
         let req = kernel
-            .workspace_requirement(&metadata, &[OutputMetadata::from_view(&out)])
+            .workspace_requirement_for_execution(
+                &inputs,
+                std::slice::from_ref(&out),
+                &metadata,
+                &[OutputMetadata::from_view(&out)],
+                None,
+            )
             .unwrap()
             .require_ready()
             .unwrap();

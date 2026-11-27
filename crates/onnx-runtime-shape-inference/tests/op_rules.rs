@@ -209,7 +209,7 @@ fn dequantize_packed_resolves_shape_and_checks_exact_payload() {
 fn dequantize_packed_gather_enforces_row_block_and_operand_contracts() {
     let packed_gather = |dims: Vec<i64>| {
         let mut n = node("DequantizePackedGather", 2, 1);
-        n.domain = "pkg.nxrt".into();
+        n.domain = "pkg.nxrt._private".into();
         n = with_attr(n, "format", Attribute::String(b"gguf:q5_1".to_vec()));
         with_attr(n, "shape", Attribute::Ints(dims))
     };
@@ -670,7 +670,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        244,
+        245,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        297,
+        301,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -1389,7 +1389,7 @@ fn assert_quantized_matmul_shapes(n: &Node, n_in: usize) {
 
 #[test]
 fn block_quantized_matmul_uses_n_and_preserves_leading_dims() {
-    let n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt", 2, 4864);
+    let n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt._private", 2, 4864);
     assert_quantized_matmul_shapes(&n, 2);
 }
 
@@ -1401,7 +1401,7 @@ fn packed_activation_arithmetic_validates_the_explicit_abi_before_shape_work() {
             ("float32", 2, "integer 1"),
             ("auto", 1, "activation_arithmetic"),
         ] {
-            let mut n = with_domain(node(op, 0, 1), "pkg.nxrt");
+            let mut n = with_domain(node(op, 0, 1), "pkg.nxrt._private");
             n.attributes.insert(
                 "activation_arithmetic".into(),
                 Attribute::String(mode.as_bytes().to_vec()),
@@ -1411,7 +1411,7 @@ fn packed_activation_arithmetic_validates_the_explicit_abi_before_shape_work() {
             assert_invalid(try_run(&n, vec![], 1).unwrap_err(), op, detail);
         }
     }
-    let mut n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt", 2, 4864);
+    let mut n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt._private", 2, 4864);
     n.attributes.insert(
         "activation_arithmetic".into(),
         Attribute::String(b"q8_0".to_vec()),
@@ -3042,7 +3042,7 @@ fn depth_to_space_known_dims_and_modes_across_schema_versions() {
     assert_eq!(out_shape(&outs), vec![c(2), c(3), c(10), c(14)]);
     assert_eq!(out_dtype(&outs), DataType::Uint8);
 
-    for opset in [11, 13] {
+    for opset in [11, 13, 28] {
         for mode in ["DCR", "CRD"] {
             let n = with_attr(
                 with_attr(node("DepthToSpace", 1, 1), "blocksize", Attribute::Int(2)),
@@ -3080,8 +3080,17 @@ fn depth_to_space_rejects_non_divisible_channels() {
 
 #[test]
 fn space_to_depth_known_dims_across_schema_versions() {
-    for opset in [1, 13] {
-        let n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+    for (opset, mode) in [
+        (1, None),
+        (13, None),
+        (28, None),
+        (28, Some("DCR")),
+        (28, Some("CRD")),
+    ] {
+        let mut n = with_attr(node("SpaceToDepth", 1, 1), "blocksize", Attribute::Int(2));
+        if let Some(mode) = mode {
+            n = with_attr(n, "mode", Attribute::String(mode.as_bytes().to_vec()));
+        }
         let outs = run(
             &n,
             vec![tin(DataType::Int32, vec![c(2), c(3), c(10), c(14)])],
@@ -3089,6 +3098,27 @@ fn space_to_depth_known_dims_across_schema_versions() {
         );
         assert_eq!(out_shape(&outs), vec![c(2), c(12), c(5), c(7)]);
         assert_eq!(out_dtype(&outs), DataType::Int32);
+    }
+}
+
+#[test]
+fn spatial_rearrangements_validate_mode_at_effective_opset() {
+    for (op, first) in [("DepthToSpace", 11), ("SpaceToDepth", 28)] {
+        let mut n = with_attr(
+            with_attr(node(op, 1, 1), "blocksize", Attribute::Int(2)),
+            "mode",
+            Attribute::String(b"CRD".to_vec()),
+        );
+        let inputs = || vec![f32in(vec![c(1), c(8), c(4), c(6)])];
+        let err = try_run(&n, inputs(), first - 1).unwrap_err().to_string();
+        assert!(err.contains("'mode' is not defined"), "{err}");
+        n.version = Some(first as i64);
+        assert!(try_run(&n, inputs(), first - 1).is_ok());
+        for value in [Attribute::String(b"crd".to_vec()), Attribute::Int(1)] {
+            n.attributes.insert("mode".into(), value);
+            let err = try_run(&n, inputs(), first).unwrap_err().to_string();
+            assert!(err.contains("must be DCR or CRD"), "{err}");
+        }
     }
 }
 
@@ -3870,7 +3900,7 @@ fn moe_and_qmoe_preserve_activation_shape() {
         assert_eq!(out_dtype(&outs), DataType::Float32);
     }
 
-    let n = with_domain(node("BlockQuantizedMoE", 5, 1), "pkg.nxrt");
+    let n = with_domain(node("BlockQuantizedMoE", 5, 1), "pkg.nxrt._private");
     let inputs = vec![
         f32in(vec![sym(0), c(4), c(512)]),
         f32in(vec![c(4), c(8)]),
@@ -3885,7 +3915,7 @@ fn moe_and_qmoe_preserve_activation_shape() {
 
 #[test]
 fn sparse_kv_gather_emits_selected_kv_shape() {
-    let n = with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt");
+    let n = with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3902,7 +3932,7 @@ fn sparse_kv_gather_emits_selected_kv_shape() {
 fn index_share_mirrors_query_and_present_kv() {
     // Exporter emission: 6 inputs (q, key, value, past_key, past_value,
     // selected_indices), single attn_output that mirrors the query.
-    let n = with_domain(node("IndexShare", 6, 1), "pkg.nxrt");
+    let n = with_domain(node("IndexShare", 6, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3919,7 +3949,7 @@ fn index_share_mirrors_query_and_present_kv() {
     assert_eq!(out_dtype(&outs), DataType::Float32);
 
     // With 3 outputs, present K/V are `[B, kv, S_past + S_cur, H]`.
-    let n = with_domain(node("IndexShare", 6, 3), "pkg.nxrt");
+    let n = with_domain(node("IndexShare", 6, 3), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3949,7 +3979,7 @@ fn kv_cache_capacity_append_reports_past_capacity_not_a_grown_concat() {
     // output keeps `past`'s shape even though `current` contributes tokens.
     // The `Concat` this op replaces would report `S_past + S_cur` (7 + 1 = 8)
     // for the same inputs, so 7-not-8 is the whole contract.
-    let n = with_domain(node("KvCacheCapacityAppend", 3, 1), "pkg.nxrt");
+    let n = with_domain(node("KvCacheCapacityAppend", 3, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3981,7 +4011,7 @@ fn kv_cache_capacity_append_reports_past_capacity_not_a_grown_concat() {
 
 #[test]
 fn varlen_attention_preserves_packed_query_geometry() {
-    let n = with_domain(node("VarlenAttention", 5, 1), "pkg.nxrt");
+    let n = with_domain(node("VarlenAttention", 5, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -4009,7 +4039,7 @@ fn custom_ops_validate_arity_rank_and_compression_contracts() {
     );
     assert!(
         try_run(
-            &with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt"),
+            &with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt._private"),
             vec![
                 f32in(vec![c(2), c(3), c(4)]),
                 tin(DataType::Int32, vec![c(2), c(3), c(4), c(5)]),
@@ -4020,7 +4050,10 @@ fn custom_ops_validate_arity_rank_and_compression_contracts() {
     );
 
     let invalid_ratio = with_attr(
-        with_domain(node("CompressedSparseAttention", 10, 3), "pkg.nxrt"),
+        with_domain(
+            node("CompressedSparseAttention", 10, 3),
+            "pkg.nxrt._private",
+        ),
         "compression_ratio",
         Attribute::Int(8),
     );
@@ -4033,8 +4066,10 @@ fn custom_ops_validate_arity_rank_and_compression_contracts() {
         .is_err()
     );
 
-    let mut wrong_ratio128_arity =
-        with_domain(node("CompressedSparseAttention", 10, 2), "pkg.nxrt");
+    let mut wrong_ratio128_arity = with_domain(
+        node("CompressedSparseAttention", 10, 2),
+        "pkg.nxrt._private",
+    );
     for (name, value) in [
         ("num_heads", 1),
         ("head_dim", 64),
@@ -4076,7 +4111,7 @@ fn csa_ratio4_node(domain: &str) -> Node {
 
 #[test]
 fn compressed_sparse_attention_emits_all_ratio4_state_shapes() {
-    for domain in ["pkg.nxrt", "com.microsoft"] {
+    for domain in ["pkg.nxrt._private", "com.microsoft"] {
         let mut inputs = vec![NodeIo::default(); 19];
         inputs[0] = f32in(vec![sym(0), c(5), c(8), c(512)]);
         inputs[9] = sd_int_scalar(DataType::Int64, c(12));
@@ -4102,7 +4137,7 @@ fn compressed_sparse_attention_dynamic_total_resolves_every_output() {
     let mut inputs = vec![NodeIo::default(); 19];
     inputs[0] = f32in(vec![c(2), sym(0), c(8), c(512)]);
     inputs[9] = tin(DataType::Int64, vec![]);
-    let outs = run(&csa_ratio4_node("pkg.nxrt"), inputs, 1);
+    let outs = run(&csa_ratio4_node("pkg.nxrt._private"), inputs, 1);
     assert!(outs.iter().all(|output| output.type_info.is_some()));
     let cache_records = outs[1].type_info.as_ref().unwrap().shape[1].clone();
     let index_records = outs[3].type_info.as_ref().unwrap().shape[1].clone();
@@ -4117,7 +4152,10 @@ fn compressed_sparse_attention_dynamic_total_resolves_every_output() {
 
 #[test]
 fn compressed_sparse_attention_ratio128_emits_three_outputs() {
-    let mut n = with_domain(node("CompressedSparseAttention", 11, 3), "pkg.nxrt");
+    let mut n = with_domain(
+        node("CompressedSparseAttention", 11, 3),
+        "pkg.nxrt._private",
+    );
     for (name, value) in [
         ("num_heads", 8),
         ("head_dim", 512),
@@ -5343,6 +5381,60 @@ fn ints(values: &[i64]) -> Attribute {
 }
 
 #[test]
+fn max_roi_pool_preserves_symbolic_region_and_channel_dims() {
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[2, 3]));
+    assert_eq!(
+        out_shape(&run(
+            &n,
+            vec![
+                tin(DataType::BFloat16, vec![c(2), sym(0), c(8), c(9)]),
+                tin(DataType::BFloat16, vec![sym(1), c(5)]),
+            ],
+            22,
+        )),
+        vec![sym(1), sym(0), c(2), c(3)],
+    );
+}
+
+#[test]
+fn max_roi_pool_shape_and_versioned_type_contract() {
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[2, 3]));
+    let inputs = |x, rois, columns| {
+        vec![
+            tin(x, vec![c(2), c(5), c(8), c(9)]),
+            tin(rois, vec![c(7), c(columns)]),
+        ]
+    };
+    use DataType::{BFloat16, Float32, Float64};
+    assert_eq!(
+        out_shape(&run(&n, inputs(Float64, Float64, 5), 19)),
+        vec![c(7), c(5), c(2), c(3)]
+    );
+    assert_eq!(
+        out_shape(&run(&n, inputs(BFloat16, BFloat16, 5), 22)),
+        vec![c(7), c(5), c(2), c(3)]
+    );
+    for (x, rois, columns, opset, reason) in [
+        (BFloat16, BFloat16, 5, 21, "requires opset 22"),
+        (Float32, Float64, 5, 22, "must match"),
+        (Float32, Float32, 4, 22, "5 columns"),
+    ] {
+        let error = try_run(&n, inputs(x, rois, columns), opset).unwrap_err();
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    let wide = i64::from(i32::MAX) + 1;
+    let n = with_attr(node("MaxRoiPool", 2, 1), "pooled_shape", ints(&[1, wide]));
+    assert_eq!(
+        out_shape(&run(
+            &n,
+            vec![f32in(vec![c(1), c(5), c(8), c(9)]), f32in(vec![c(0), c(5)])],
+            22,
+        )),
+        vec![c(0), c(5), c(1), c(wide)],
+    );
+}
+
+#[test]
 fn deform_conv_shapes_follow_geometry_and_versioned_types() {
     let n = with_attr(node("DeformConv", 3, 1), "strides", ints(&[2]));
     let inputs = |dtype, offset_channels| {
@@ -6128,7 +6220,11 @@ fn max_unpool_uses_transpose_formula_or_explicit_output_shape() {
 
     // The optional output_shape input (slot 2) overrides the formula.
     let out = run(
-        &node("MaxUnpool", 3, 1),
+        &with_attr(
+            node("MaxUnpool", 3, 1),
+            "kernel_shape",
+            Attribute::Ints(vec![2, 2]),
+        ),
         vec![
             f32in(vec![c(1), c(1), c(2), c(2)]),
             tin(DataType::Int64, vec![c(1), c(1), c(2), c(2)]),
@@ -7471,6 +7567,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "DepthToSpace", 1),
     ("", "DepthToSpace", 11),
     ("", "DepthToSpace", 13),
+    ("", "DepthToSpace", 28),
     ("", "DequantizeLinear", 10),
     ("", "DequantizeLinear", 13),
     ("", "DequantizeLinear", 19),
@@ -7538,8 +7635,11 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "MatMul", 1),
     ("", "Max", 1),
     ("", "MaxPool", 1),
+    ("", "MaxRoiPool", 1),
+    ("", "MaxRoiPool", 22),
     ("", "MaxUnpool", 9),
     ("", "MaxUnpool", 11),
+    ("", "MaxUnpool", 22),
     ("", "Mean", 1),
     ("", "MeanVarianceNormalization", 9),
     ("", "MelWeightMatrix", 17),
@@ -7636,6 +7736,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Softsign", 1),
     ("", "SpaceToDepth", 1),
     ("", "SpaceToDepth", 13),
+    ("", "SpaceToDepth", 28),
     ("", "Split", 1),
     ("", "SplitToSequence", 11),
     ("", "Sqrt", 1),
@@ -7698,17 +7799,17 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("com.microsoft", "SimplifiedLayerNormalization", 1),
     ("com.microsoft", "SkipLayerNormalization", 1),
     ("com.microsoft", "SkipSimplifiedLayerNormalization", 1),
-    ("pkg.nxrt", "AffineQuantizedGather", 1),
-    ("pkg.nxrt", "AffineQuantizedGroupedMatMul", 1),
-    ("pkg.nxrt", "BlockQuantizedMatMul", 1),
-    ("pkg.nxrt", "BlockQuantizedMoE", 1),
-    ("pkg.nxrt", "CompressedSparseAttention", 1),
-    ("pkg.nxrt", "DequantizePackedGather", 1),
-    ("pkg.nxrt", "IndexShare", 1),
-    ("pkg.nxrt", "KvCacheCapacityAppend", 1),
-    ("pkg.nxrt", "PackedGroupedMatMul", 1),
-    ("pkg.nxrt", "SparseKvGather", 1),
-    ("pkg.nxrt", "VarlenAttention", 1),
+    ("pkg.nxrt._private", "AffineQuantizedGather", 1),
+    ("pkg.nxrt._private", "AffineQuantizedGroupedMatMul", 1),
+    ("pkg.nxrt._private", "BlockQuantizedMatMul", 1),
+    ("pkg.nxrt._private", "BlockQuantizedMoE", 1),
+    ("pkg.nxrt._private", "CompressedSparseAttention", 1),
+    ("pkg.nxrt._private", "DequantizePackedGather", 1),
+    ("pkg.nxrt._private", "IndexShare", 1),
+    ("pkg.nxrt._private", "KvCacheCapacityAppend", 1),
+    ("pkg.nxrt._private", "PackedGroupedMatMul", 1),
+    ("pkg.nxrt._private", "SparseKvGather", 1),
+    ("pkg.nxrt._private", "VarlenAttention", 1),
 ];
 
 /// `""` is the normalized spelling of the default ONNX domain (see

@@ -1085,7 +1085,7 @@ mod tests {
     #[test]
     fn placement_decline_names_unsupported_format_and_fix() {
         let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", vec![], vec![]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("format".into(), Attribute::String(b"q4_0".to_vec()));
         node.attributes.insert("K".into(), Attribute::Int(32));

@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
-fn packed_moe_borrows_contiguous_payloads_and_materializes_strided_sources() {
+fn packed_moe_inputs_borrow_or_convert_inside_admitted_regions() {
     let _guard = COUNTER_TEST_LOCK.lock().unwrap();
     const R: usize = 3;
     const H: usize = 96;
@@ -82,18 +82,16 @@ fn packed_moe_borrows_contiguous_payloads_and_materializes_strided_sources() {
                 kernel.set_constant_inputs(&[false,false,true,false,true,false,true,false,false]);
                 let mut y=Tensor::zeros(FloatDType::F32,&[R,H]);
                 let mut prepared=PreparedKernel::new(&cpu,kernel,&inputs,&[y.view_mut()]);
-                prepared.execute(&inputs,&mut [y.view_mut()]).unwrap();
-                assert!(y.f32s().iter().all(|&v|v==2.));
-                let expanded = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
-                assert_eq!(expanded-before.0, if arithmetic=="float32" && !streamed {3} else {0});
-                for (pair, expected) in sizes.into_iter().zip([[1,2],[2,1]]) {
+                for pair in sizes {
                     for _ in 0..3 {
                         let (result,counts)=watched(pair,||prepared.execute(&inputs,&mut [y.view_mut()]));
                         result.unwrap();
-                        assert_eq!(counts,if strided {expected}else{[0;2]},"{arithmetic} streamed={streamed} strided={strided} payload sizes={pair:?}");
+                        assert_eq!(counts,[0;2],"{arithmetic} streamed={streamed} strided={strided} payload sizes={pair:?}");
                         assert!(y.f32s().iter().all(|&v|v==2.));
                     }
                 }
+                let expanded = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
+                assert_eq!(expanded-before.0, if arithmetic=="float32" && !streamed {3} else {0});
                 if arithmetic=="float32" && !streamed { assert!(BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed)>before.1); }
             }
         }
@@ -250,6 +248,113 @@ fn packed_moe_strided_experts_use_admitted_lane_without_payload_allocations() {
                         BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed) - before,
                         if dense { 3 } else { 0 }
                     );
+                }
+            }
+        });
+}
+
+#[test]
+fn packed_moe_routing_uses_admitted_expert_and_route_storage() {
+    let _guard = COUNTER_TEST_LOCK.lock().unwrap();
+    const R: usize = 31;
+    const H: usize = 32;
+    const E: usize = 13;
+    const K: usize = 3;
+    let sizes = [
+        [E * std::mem::size_of::<usize>(), E * 4],
+        [
+            4 * std::mem::size_of::<(usize, f32)>(),
+            8 * std::mem::size_of::<(usize, f32)>(),
+        ],
+    ];
+    for pair in sizes {
+        let (_, control) = watched(pair, || {
+            black_box(vec![0u8; black_box(pair[0])]);
+            black_box(vec![0u8; black_box(pair[1])]);
+        });
+        assert_eq!(control, [1, 1]);
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap()
+        .install(|| {
+            let x = Tensor::floats(FloatDType::F32, &[R, H], &[127.; R * H]);
+            let logits = Tensor::floats(FloatDType::F32, &[R, E], &[0.; R * E]);
+            let mut codes = vec![0u8; E * H * 34];
+            for expert in 0..E {
+                for feature in 0..H {
+                    let block = &mut codes[(expert * H + feature) * 34..][..34];
+                    block[..2].copy_from_slice(&half::f16::ONE.to_le_bytes());
+                    block[2 + feature] = 1;
+                }
+            }
+            let w1 = Tensor::u8(&[E, H, 1, 34], &codes);
+            let w2 = Tensor::u8(&[E, H, 1, 34], &codes);
+            let inputs = [
+                x.view(),
+                logits.view(),
+                w1.view(),
+                onnx_runtime_ep_api::TensorView::absent(onnx_runtime_ir::DataType::Float32),
+                w2.view(),
+            ];
+            for arithmetic in ["float32", "q8_0"] {
+                let mut node = Node::new(
+                    NodeId(0),
+                    "BlockQuantizedMoE",
+                    vec![
+                        Some(ValueId(0)),
+                        Some(ValueId(1)),
+                        Some(ValueId(2)),
+                        None,
+                        Some(ValueId(4)),
+                    ],
+                    vec![ValueId(5)],
+                );
+                node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+                for (name, value) in [
+                    ("fc1_format", Attribute::String(b"q8_0".to_vec())),
+                    ("fc2_format", Attribute::String(b"q8_0".to_vec())),
+                    ("activation_type", Attribute::String(b"identity".to_vec())),
+                    ("k", Attribute::Int(K as i64)),
+                    ("normalize_routing_weights", Attribute::Int(1)),
+                    (
+                        "activation_arithmetic",
+                        Attribute::String(arithmetic.as_bytes().to_vec()),
+                    ),
+                    (
+                        "block_layout_version",
+                        Attribute::Int(if arithmetic == "q8_0" { 2 } else { 1 }),
+                    ),
+                ] {
+                    node.attributes.insert(name.into(), value);
+                }
+                let cpu = CpuExecutionProvider::with_resources(
+                    CpuMemoryResources::new(
+                        Default::default(),
+                        CpuWeightCacheLimits {
+                            dense_bytes: 0,
+                            expert_bytes: 0,
+                        },
+                    )
+                    .unwrap(),
+                );
+                let kernel = cpu.get_kernel(&node, &[], 1).unwrap();
+                let mut y = Tensor::zeros(FloatDType::F32, &[R, H]);
+                let mut prepared = PreparedKernel::new(&cpu, kernel, &inputs, &[y.view_mut()]);
+                prepared.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                let mut expected = 0f32;
+                for _ in 0..K {
+                    expected += (1f32 / K as f32) * 127.;
+                }
+                for pair in sizes {
+                    for _ in 0..3 {
+                        let (result, counts) =
+                            watched(pair, || prepared.execute(&inputs, &mut [y.view_mut()]));
+                        result.unwrap();
+                        assert_eq!(counts, [0, 0], "{arithmetic} sizes={pair:?}");
+                        assert_eq!(y.f32s(), &[expected; R * H]);
+                    }
                 }
             }
         });

@@ -170,6 +170,15 @@ into its own reclaimable pool, whereas that capability requires actual backing
 retirement. The executor's generic pressure-parked lane must not be mistaken for
 an enabled CPU fast path. Each fitting CPU checkout/return still locks the pool,
 and each kernel still performs live execution refinement and backing validation.
+The provider-context transaction gate uses one atomic word for lifecycle and
+in-flight count. Normal Active entry/exit takes no context wait mutex; closure
+updates the same word to reject new entrants while preserving admitted guards.
+Only a closing context's last guard and quiescence waiters coordinate through a
+mutex/condition variable. This removes the two context-gate mutex acquisitions
+from a fitting checkout, not the pool mutex, atomic contention, owner validation
+or execution refinement. It is a structural cost reduction, not a measured
+latency claim. Completed CPU storage remains globally reclaimable in its pool;
+no new cross-run lease or untracked retained owner is introduced.
 
 The `cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant`
 regression wraps the real CPU provider only to count boundary calls. After one
@@ -206,6 +215,23 @@ contiguous/strided packed input layouts through the same compiled kernel and
 cached Deferred answer, and checks the precise changed staging demand each time.
 These counts establish avoided queries, not a measured latency improvement.
 
+CPU `BlockQuantizedMatMul` likewise admits projection scratch, final output staging
+and strided compressed-weight staging as one composite, together with any
+activation/bias conversion storage. Contiguous aligned F32 inputs need no
+conversion region; half, strided or unaligned inputs convert directly into
+separate admitted f32 regions while preserving bulk conversion implementations.
+Nonempty metadata is Deferred; live refinement resolves actual source layouts
+on every launch. The
+packed region is zero for contiguous weights and otherwise one logical packed
+payload rounded to f32 alignment. Dense-cache hits do not copy or initialize
+that region; retaining its admitted capacity permits a streamed fallback without
+another request. Hashing walks the source directly and payload copying starts
+only after complete backing binding. Input conversion has the same full-binding
+guard. Empty output validates source descriptors without reading any payload.
+This removes the former execution-time packed and input payload Vecs without
+adding pool or issuer
+calls; it establishes ownership/accounting, not a latency improvement.
+
 CPU `BlockQuantizedMoE` includes strided compressed-weight staging in the
 same whole-operation workspace as decode scratch, FC activation banks and the
 output accumulator. One serial byte lane holds the maximum non-borrowable FC
@@ -213,6 +239,70 @@ payload for a single expert, rounded to f32 storage alignment. It is additive to
 the other live regions, never the sum of FC payloads or an expert/top-k multiple.
 Contiguous expert tails borrow their original bytes even when the outer expert
 stride has padding or is negative; these layouts require no packed copy lane.
+
+The same composite includes conversion regions for input, router logits,
+optional router weights and the three optional FC biases. Their actual views
+select direct aligned F32 borrowing or an exact logical f32 snapshot. All six
+can remain live across experts; capacity is the sum of non-borrowable present
+sources, without a top-k multiplier. Absent optional sources use no region.
+A shared private descriptor serves MatMul and MoE storage validation/borrowing;
+MoE still rejects non-F32 sources. Full binding precedes conversion, routing,
+hashing and compute. A twelfth outer region contains the private typed routing
+arena, so internal partitioning adds no independent owner, pool or quota call.
+
+The routing arena holds `rows * min(k, experts)` decisions and stable bucket
+indices, expert cursors/prefixes, TopK indices/selected weights, and softmax
+storage only without aggregation weights. Checked typed layouts preserve their
+maximum alignment, including padding in whole-operation admission. Decisions and
+bucket indices stay uninitialized until every logical entry is written; a
+published plan borrows immutable typed slices through the dispatch. Counts and
+prefixes group routes in O(experts + routes), preserving expert order and each
+expert's token order. TopK comparisons, special float handling and normalization
+retain one shared slice-based numerical implementation; grouping starts only
+after score-order denominators are complete. The existing owned routing helper
+for other CPU MoE paths delegates to that same checked implementation.
+
+BlockQuantizedMoE no longer creates routing payload Vecs or per-expert task Vecs.
+Rank/index conversion metadata and the plain MoE operator's owned grouping plan
+remain.
+Counts/prefix initialization and index indirection have costs; this proves
+ownership and accounting, not zero mallocs or a measured latency improvement.
+
+Plain floating `MoE` includes eight named source regions beside its two FC
+banks and output accumulator in one eleven-region operation workspace. Aligned
+contiguous F32 sources borrow their original storage; half, strided and unaligned
+sources snapshot to exact f32 regions, including expert weights and optional
+biases. Shape-only nonempty preparation is Deferred because strides and addresses
+are not metadata facts; live refinement computes the current bound without
+repeating the metadata hook. Complete binding precedes every floating payload
+read, including bias conversion. All source snapshots remain live until final
+output publication, preserving input/output overlap. Empty output still validates
+source descriptors and shapes but reads no payload and reserves no conversions.
+Plain MoE's owned routing/grouping plan and optional MLAS batch metadata remain;
+this change removes floating source payload Vecs, not every allocation.
+
+ONNX integer `QMoE` now uses the same arena and immutable task views. Its two FC
+banks, score-order contribution storage, decoder scratch and routing arena form
+one five-region operation workspace. Shape-only bounds include FC2's expert axis
+and aggregation presence; the existing Ready memo path remains reusable. X/router
+copies and routing follow complete binding. Other quantized input materialization
+and weight-admission metadata retain their existing paths.
+
+Routing decisions preserve original score order and retain that decision index
+as the contribution slot. Stable expert bucketing never renumbers slots; QMoE's
+final +0, row-major, score-order `+=` scatter remains unchanged. After routing,
+dead TopK index storage becomes the ascending active-expert list. After bucket
+writes complete, dead cursors become counts derived from immutable prefixes.
+A private-field `ExpertGroupCounts` view publishes unique membership and counts
+without another map, mapping closure or raw-iterator uniqueness contract. Metrics
+retain their zero-count membership semantics in checked fixtures and preserve
+lock order, atomics and saturated accumulated fields.
+
+Prefetch still checks eligibility before consuming selected IDs, taking payload
+locks, pinning entries or requesting grants. Only expert IDs and weight loading
+cross to the worker; borrowed task views and workspace remain on the main thread
+through scope join, including failures. Zero-row execution uses an empty immutable
+plan and retains the prior metrics path without reserving routing storage.
 
 For nonempty output, shape-only preparation returns `Deferred`: it cannot know
 strides, and a conservative reservation would retain unused high-water capacity.
@@ -514,10 +604,10 @@ checks missing-pin refusal and overwrites all warmup contents before replay.
 Compilation of that regression does not establish CUDA numerical, NVRTC, replay,
 asynchronous-release or throughput correctness; these still require a device.
 
-### CUDA MHA and shared Phase-2a temporary storage
+### CUDA MHA and shared cuBLASLt/softmax temporary storage
 
 MultiHeadAttention borrows one SessionPersistent composite for query/output BNSH
-staging, temporary hidden K/V, additive mask, padding upload, and Phase-2a
+staging, temporary hidden K/V, additive mask, padding upload, and cuBLASLt/softmax
 scores/BLAS. Regions are offsets in one allocation. Declared optional output
 positions and supplied output metadata must agree before present K/V replace
 temporary buffers; known output shapes/dtypes are validated identically during
@@ -530,7 +620,7 @@ is not a completion receipt. Provider fences and settlement still govern growth
 and release; uncertain backing remains charged. Capture stays unsupported, and
 the host padding mask remains an owned Vec outside device workspace accounting.
 
-All three shared Phase-2a callers now pass checked, borrowed scratch. The engine
+All three shared cuBLASLt/softmax callers now pass checked, borrowed scratch. The engine
 validates score capacity against actual invocation geometry before its first
 launch; no raw allocation/free fallback or runtime-private shared BLAS allocation
 remains. A failed synchronous legacy upload latches an additional legacy-stream
@@ -1991,7 +2081,7 @@ route-submission mutex interval still needs device validation.
 
 ### Variable-length attention borrows one exact caller composite
 
-`pkg.nxrt::VarlenAttention` and `PackedVarlenAttention` register
+`pkg.nxrt._private::VarlenAttention` and `PackedVarlenAttention` register
 `WorkspacePlanning::Metadata`. Metadata-only planning returns Deferred because
 actual valid KV lengths determine scores. Execution-time preparation first
 clears any old invocation and rejects real stream capture, then reads each
@@ -2425,7 +2515,7 @@ call; it owns the governed workspace preparation path
 
 | file/line | owner | byte formula | size source | lifetime class | status |
 |---|---|---|---|---|---|
-| `kernels/attention.rs:830-831` | legacy `Attention` Phase-2a scores + cuBLASLt workspace | `align256(batch * num_heads * sq * sk * elem_size) + WORKSPACE_BYTES` | prompt/cache dependent score matrix + static cuBLASLt ceiling | step-scoped | **governed by #753** inside one composite workspace; direct-execute compatibility/opt-out fallback remains raw |
+| `kernels/attention.rs` (`blas_softmax_scratch_layout`) | `Attention` cuBLASLt/softmax scratch | `align256(batch * num_heads * sq * sk * elem_size) + WORKSPACE_BYTES` | prompt/cache dependent score matrix + static cuBLASLt ceiling | step-scoped | **governed by #753** inside one prepared workspace; execution without that workspace is rejected |
 | `kernels/csa_checkpoint.rs` | CSA main/index checkpoint snapshots | checked dedicated native composite | declared carry capacities | journal lifetime | native owner and structured retirement |
 | `kernels/compressed_sparse_attention.rs` | CSA computational scratch | checked caller composite | live query rows / declared and physical record capacity | SessionPersistent caller peak | private manager and charge removed; native owner settlement |
 | `kernels/elementwise.rs:699` | elementwise scalar/shape metadata upload | `metadata_bytes.len()` | op arity/rank | step-scoped | raw bypass |
@@ -2435,7 +2525,7 @@ call; it owns the governed workspace preparation path
 | `kernels/group_query_attention.rs` `workspace_requirement` (packed Q/K/V staging region) | `GroupQueryAttention` packed QKV-projection staging | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)`, only when a packed QKV tensor is split | prompt-dependent (`sq`), elem = `dtype.byte_size()` (f32=4, f16/bf16=2) | session-persistent | **governed by #736** via `workspace_requirement` + prepared composite workspace, sized through the shared `gqa_workspace_layout`/`gqa_packed_staging_bytes` helpers; reserved only on the packed-input split route, `NONE` when Q/K/V arrive separately |
 | `kernels/group_query_attention.rs` `gqa_transpose_scratch` + `gqa_workspace_layout` (`WS_Q_BNSH` / `WS_OUT_BNSH`) | `GroupQueryAttention` Q/output BNSH transpose scratch | Q: `align256(B·sq·num_heads·head_dim·elem)` when `sq>1`, packed input, or RoPE; output: the same aligned bytes only when `sq>1` | prompt/dtype/route dependent | session-persistent | **governed by #736** in the existing GQA composite; unpacked non-RoPE `sq==1` uses Q/output directly and charges `NONE` absent another region; packed `sq==1` overlays Q extraction with packed-Q staging |
 | `kernels/group_query_attention.rs` `GqaWorkspace::reserve` | `GroupQueryAttention` remaining pooled slots (present K/V / metadata) | slot-specific `bytes.max(1)` | cache/batch dependent, then reused | session-persistent growable state | raw bypass; scores, packed Q/K/V staging, and BNSH transpose slots are excluded — carved from the prepared composite on governed execution |
-| `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
+| `kernels/index_share.rs:708` | `pkg.nxrt._private::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
 | `kernels/einsum.rs`, `einsum/plan.rs` | direct and multilinear arithmetic/BLAS temporary regions | exact direct plan or checked arithmetic prefix plus max serial BLAS tail | shape/dtype/actual-address algorithm | SessionPersistent shared caller peak | Ready or one bound prefix phase; actual used-span capture pin; no private scratch owner |
 | `kernels/einsum/plan.rs` | immutable final-address launch metadata | exact encoded generic-step program | complete I/O identity and final used-span binding | independently pinned immutable device artifact | fresh candidate published only after successful execution; installed graphs retain older metadata |
 | `kernels/index_transform.rs` | CenterCropPad/Col2Im descriptors | respectively `4 * rank * 8` and `6 * control_elements * 8` | input rank / checked image-shape control length | SessionPersistent caller peak | complete bind before existing D2H; exact borrowed upload |
@@ -2484,7 +2574,7 @@ helper: the three-output path reserves only scores (and optional frontier
 metadata), while the one-output path retains staging because execution uses it
 (`kernels/index_share.rs:603-631`, `:867-910`). In decode `q_seq == 1` with a
 sparse `selected_width`, so the live bytes are small. `IndexShare` is also a
-`pkg.nxrt` custom op used only by GLM/DSA sparse-attention families, so it is not
+`pkg.nxrt._private` custom op used only by GLM/DSA sparse-attention families, so it is not
 on the hot path for dense models (#751).
 
 The **`GroupQueryAttention` `WS_SCORES` slot** is governed by #795: the f32
@@ -2502,33 +2592,24 @@ as the pre-header **429** typed path (`TierExhausted` / `CapacityUnavailable`,
 #743) rather than a late 500/OOM. The compatibility/opt-out path (no
 executor-prepared workspace) keeps its self-owned pooled scratch.
 
-**Lifetime, and why it differs from Attention Phase-2a (#753).** GQA's slot
+**Lifetime, and why it differs from Attention cuBLASLt/softmax (#753).** GQA's slot
 allocator grows each slot to the largest geometry seen and **retains** it across
 decode/prefill steps — a standing claim held for the whole session — so
 `WS_SCORES` is charged as `WorkspaceLifetime::SessionPersistent`, not the
-`StepScoped` lifetime Phase-2a's per-call scratch used. A graph mixing QMoE,
-IndexShare, Attention Phase-2a (step-scoped) and GQA (session-persistent) now
+`StepScoped` lifetime cuBLASLt/softmax's per-call scratch used. A graph mixing QMoE,
+IndexShare, Attention cuBLASLt/softmax (step-scoped) and GQA (session-persistent) now
 exercises both per-lifetime-class peaks; the two classes are reserved into
 separate executor slots so neither peak stands in for the other.
 
-**Over-reservation finding (the #751 defect class).** `WS_SCORES` is materialized
-on **exactly one** GQA route: the f32 *reference* path, reached only when
-`!use_fused && query dtype == f32 && !gqa_decode::supported(q_seq, head_dim)`
-(i.e. f32 prefill `Sq > 1`, or f32 `head_dim > 128`). The fused-flash path, the
-capture-safe f32/fp16 split-K decode kernels, and the phase-2a path **never
-allocate a device score matrix** — they stream softmax through registers/shared
-memory, and phase-2a owns its own scratch. Reserving `WS_SCORES`
-unconditionally would therefore charge the device authority for bytes the common
-fp16 decode path never touches — the same defect #751 found in IndexShare's
-present K/V staging. The governed reservation threads that static signal (query
-dtype + `gqa_decode::supported`) through the shared helper and reports
-`WorkspaceRequirement::NONE` on every fp16/bf16 path and every f32 *decode* path,
-so those charge **zero**. The only residual conservative reservation is f32
-prefill that dynamically fuses on a short (`valid_seq ≤ 128`) sequence: the fused
-win is a runtime measurement, so planning reserves to never under-allocate, and
-that path (a fallback of a fallback) idles the buffer rather than corrupting.
-Derived bytes: `B=1, H=32, Sq=1024, present_capacity=1024, f32` ≈ **128 MiB** on
-the reference path; **0 bytes** on fp16 decode/prefill and f32 decode.
+**Route-specific attention scratch.** GQA's f32 reference route reserves a
+score matrix. The fp16/bf16 cuBLASLt/softmax route also reserves a score matrix,
+plus cuBLASLt workspace, in its own region of the prepared composite. Flash
+prefill does not reserve attention scratch; split-K decode reserves partial
+states rather than a score matrix. This is separate from the composite's
+staging and metadata regions. In Auto mode, planning uses the input-derived
+length bound: if that bound selects flash prefill, shorter valid lengths do
+too; otherwise the composite reserves the fallback scratch even if the actual
+length selects flash prefill.
 
 #799 governs the cuBLASLt GEMM follow-up. The initial hypothesis — one fixed
 32 MiB session-persistent allocation — was conservative but still
@@ -2544,7 +2625,7 @@ deterministic error if execution ever selects more than the prepared slot.
 The four newly governed kernel families share one **session-persistent peak**,
 not four node reservations: on the measured shapes that is 96 bytes instead of
 `4 * 32 MiB` (saving **134,217,632 bytes**, ≈128 MiB). Including the already
-governed Attention Phase-2a workspace, the five-site naive accounting would be
+governed Attention cuBLASLt/softmax workspace, the five-site naive accounting would be
 160 MiB; measured planned cuBLASLt scratch is `32 MiB + 96 bytes`, the same
 **134,217,632-byte logical-reservation saving**. Under the managed VMM's 2 MiB
 physical granule, the 96-byte peak commits one granule, so the five-site physical
@@ -2565,7 +2646,7 @@ Every default-domain `Attention` dispatch materializes
 (`attention_row` stages the row scores in global memory for softcap/mask/softmax/
 `probs·V`, in fp32 regardless of the f32/f16/bf16 operand dtype). At
 `B=1, H=32, q_seq=total_seq=2048` that is **512 MiB** — larger than the
-already-governed Phase-2a range (#753). It now routes through
+already-governed cuBLASLt/softmax range (#753). It now routes through
 `Kernel::workspace_requirement`, prepare-only planning, and a prepared workspace
 consumed by `execute_with_workspace`; planning and execution size the reservation
 through the **same** `std_attention_scores_bytes` helper, so they cannot drift,
@@ -2605,7 +2686,7 @@ tracked as the next candidate below.
 
 #### Governed by #736: `GroupQueryAttention` QKV-projection staging
 
-With the three quadratic score matrices governed (Phase-2a #753, GQA `WS_SCORES`
+With the three quadratic score matrices governed (cuBLASLt/softmax #753, GQA `WS_SCORES`
 #795, default-domain `Attention` #736), the largest remaining evidenced non-QMoE
 workspace bypass — the **`GroupQueryAttention` packed QKV-projection staging** —
 is now governed. When Q/K/V arrive **packed** (both key/value inputs absent), the
@@ -4544,7 +4625,7 @@ concurrency on the multi-request-serving axis measured by #750 and #777.
 **Implemented today.** The executor has one central
 `is_planned_workspace_node` predicate
 (`crates/onnx-runtime-session/src/executor/bindings.rs`) covering QMoE,
-IndexShare, Attention Phase-2a, GQA (`WS_SCORES`, packed QKV-projection staging,
+IndexShare, Attention cuBLASLt/softmax, GQA (`WS_SCORES`, packed QKV-projection staging,
 and BNSH-transpose scratch folded into one composite
 reservation), the
 default-domain `Attention` score + route-required staged-K/V composite, and the
@@ -4559,8 +4640,8 @@ without summing sequential users of the same slot (#753).
 | kernel / node | file · site | byte formula | size class | lifetime | mechanism |
 |---|---|---|---|---|---|
 | `BlockQuantizedMoE` (QMoE) | `block_quantized_moe.rs` `workspace_requirement` | routing + dequant + GEMM staging over `tokens × experts × hidden` | config-derived (static per model) | session-persistent | #747 prepare-only + #748 grant |
-| `pkg.nxrt::IndexShare` | `index_share.rs` `workspace_requirement` | selected-token scores plus only the staging actually reachable for the path | prompt/cache dependent | session-persistent | #751 + prepared workspace |
-| `com.microsoft::Attention` Phase-2a | `attention.rs` `run_attention_phase2a` (governed branch) | `align256(batch·num_heads·sq·sk·elem) + 32 MiB` cuBLASLt workspace | prompt-dependent; score matrix is ~256–512 MiB at B=1/H=32/S=2048 | step-scoped | #753 + prepared workspace |
+| `pkg.nxrt._private::IndexShare` | `index_share.rs` `workspace_requirement` | selected-token scores plus only the staging actually reachable for the path | prompt/cache dependent | session-persistent | #751 + prepared workspace |
+| `com.microsoft::Attention` cuBLASLt/softmax | `attention.rs` `run_attention_blas_softmax` | `align256(batch·num_heads·sq·sk·elem) + 32 MiB` cuBLASLt workspace | prompt-dependent; score matrix is ~256–512 MiB at B=1/H=32/S=2048 | step-scoped | #753 + prepared workspace |
 | `com.microsoft::GroupQueryAttention` f32 reference scores | `group_query_attention.rs` `workspace_requirement` | `batch·heads·sq·present_capacity·sizeof(f32)` only on the path that materializes scores | prompt/cache dependent | session-persistent | #795 + prepared workspace |
 | `com.microsoft::GroupQueryAttention` packed QKV staging | `group_query_attention.rs` `workspace_requirement` | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)` only when a packed QKV tensor is split | prompt-dependent; ~24 MiB (f32) / 12 MiB (fp16) at B=1/H=32/hd=128/Hkv=8/sq=1024; `NONE` on unpacked/fused-decode routes | session-persistent | #736 + prepared composite workspace (shares the `WS_SCORES` slot) |
 | `com.microsoft::GroupQueryAttention` BNSH transpose scratch | `group_query_attention.rs` `gqa_transpose_scratch` / `gqa_workspace_layout` | Q: `align256(B·sq·num_heads·head_dim·elem)` for `sq>1`, packed Q, or RoPE; output: same only for `sq>1`; packed `sq==1` Q overlays packed-Q staging | prompt/route dependent; derived 32 MiB f32 / 16 MiB fp16 at B=1/H=32/hd=128/sq=1024; unpacked non-RoPE decode charges 0, RoPE decode Q-only | session-persistent | #736 + existing prepared GQA composite |
@@ -4578,8 +4659,8 @@ route-conditional: fixed-capacity append/no-past/no-present-output routes add
 zero, while dense aliased growth adds disjoint key/value regions in the same
 prepared composite. `attention.rs` remains outside #799's
 shared cuBLASLt slot because its workspace is concurrent with the score matrix
-inside the StepScoped Phase-2a composite; direct `execute` keeps the documented
-self-owned compatibility/opt-out fallback (#753, #799).
+inside the StepScoped cuBLASLt/softmax composite. The cuBLASLt/softmax route
+rejects execution without caller-prepared workspace.
 
 KV layout and residency are a separate contract; use
 [KV layout and residency](#kv-layout-and-residency) rather than restating them

@@ -1,5 +1,5 @@
 //! Native eager-decode regression for the deterministic tiny GLM-5.2
-//! DSA-MoE fixture emitted with two `pkg.nxrt::IndexShare` nodes and fused QMoE.
+//! DSA-MoE fixture emitted with two `pkg.nxrt._private::IndexShare` nodes and fused QMoE.
 //!
 //! This native-CUDA regression requires both `cuda` and `native-backend`:
 //!
@@ -104,10 +104,10 @@ fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
         graph
             .nodes
             .values()
-            .filter(|node| node.domain == "pkg.nxrt" && node.op_type == "IndexShare")
+            .filter(|node| node.domain == "pkg.nxrt._private" && node.op_type == "IndexShare")
             .count(),
         2,
-        "{} must contain exactly two pkg.nxrt::IndexShare nodes",
+        "{} must contain exactly two pkg.nxrt._private::IndexShare nodes",
         model.display(),
     );
     assert!(

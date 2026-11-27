@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU correctness tests for `pkg.nxrt::PackedVarlenAttention` v1.
+//! GPU correctness tests for `pkg.nxrt._private::PackedVarlenAttention` v1.
 //!
 //! The packed (unpadded) varlen kernel must reproduce, sequence for sequence,
 //! what the standard `ai.onnx::Attention` kernel computes for the SAME logical
@@ -48,7 +48,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const PACKED_DOMAIN: &str = "pkg.nxrt";
+const PACKED_DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct Tensor {

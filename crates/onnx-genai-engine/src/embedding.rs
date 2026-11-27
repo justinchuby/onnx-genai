@@ -411,7 +411,7 @@ mod tests {
     fn engine(name: &str) -> anyhow::Result<Engine> {
         Engine::from_dir_with_session_options(
             &fixture(name)?,
-            EngineConfig::default(),
+            crate::fixture_engine_config(),
             SessionOptions::default().with_intra_op_threads(1),
         )
     }

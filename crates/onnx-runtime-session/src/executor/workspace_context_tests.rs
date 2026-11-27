@@ -226,7 +226,17 @@ fn qmoe_context_graph() -> Graph {
 
 #[test]
 fn same_shapes_reprepare_workspace_when_selected_pool_changes() {
-    check_context_repreparation(qmoe_context_graph(), &[3, 16], 512., Some((1408, 1664)));
+    let index = std::mem::size_of::<usize>();
+    let selection = std::mem::size_of::<(usize, f32)>();
+    let routing = (6 * (selection + index) + 13 * index + 16)
+        .next_multiple_of(std::mem::align_of::<(usize, f32)>())
+        + 2 * selection;
+    check_context_repreparation(
+        qmoe_context_graph(),
+        &[3, 16],
+        512.,
+        Some((1408 + routing as u64, 1664 + routing as u64)),
+    );
 }
 
 fn check_context_repreparation(
@@ -331,7 +341,7 @@ fn check_context_repreparation(
 fn block_context_graph(experts: bool) -> Graph {
     use onnx_runtime_ir::TensorData;
     let mut graph = Graph::new();
-    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
     let x = graph.create_named_value("x", DataType::Float32, static_shape([3, 32]));
     let router = graph.create_named_value("router", DataType::Float32, static_shape([3, 4]));
     let y = graph.create_named_value(
@@ -373,7 +383,7 @@ fn block_context_graph(experts: bool) -> Graph {
             vec![y],
         )
     };
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
     if experts {
@@ -407,10 +417,14 @@ fn block_context_graph(experts: bool) -> Graph {
 
 #[test]
 fn block_matmul_same_shapes_reprepare_when_selected_pool_changes() {
-    check_context_repreparation(block_context_graph(false), &[3, 32], 32., None);
+    check_block_live_context(false, 32.);
 }
 #[test]
 fn block_moe_same_shapes_reprepare_when_selected_pool_changes() {
+    check_block_live_context(true, 2048.);
+}
+
+fn check_block_live_context(experts: bool, expected: f32) {
     let calls = Arc::new(WorkspaceCallCounts::default());
     let ep = Arc::new(ContextCountingCpu {
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
@@ -418,7 +432,7 @@ fn block_moe_same_shapes_reprepare_when_selected_pool_changes() {
         workspace_calls: calls.clone(),
     });
     let mut executor = Executor::build(
-        block_context_graph(true),
+        block_context_graph(experts),
         Arc::new(WeightStore::new()),
         ep,
         None,
@@ -456,7 +470,10 @@ fn block_moe_same_shapes_reprepare_when_selected_pool_changes() {
             let mut requirement = None;
             for iteration in 1..=2 {
                 let result = executor.run(&inputs).unwrap();
-                assert_eq!(result[0].to_vec_f32(), [2048.; 96]);
+                assert_eq!(
+                    result[0].to_vec_f32(),
+                    vec![expected; 3 * if experts { 32 } else { 64 }]
+                );
                 assert_eq!(
                     calls.snapshot(),
                     (

@@ -1522,11 +1522,54 @@ pub struct SamplingOverrides {
     pub top_k: Option<usize>,
 }
 
+/// A request's processor configuration failed compilation before execution.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid generation processor configuration: {source:#}")]
+pub struct ProcessorConfigurationError {
+    #[source]
+    source: anyhow::Error,
+}
+impl ProcessorConfigurationError {
+    pub(crate) fn classify(source: anyhow::Error) -> anyhow::Error {
+        // Preserve allocator/governor failures for serving resource policy; a
+        // valid configuration does not become invalid when capacity is scarce.
+        if source.chain().any(|cause| {
+            cause.is::<std::collections::TryReserveError>()
+                || cause.is::<onnx_runtime_memory_api::MemoryError>()
+                || cause.is::<crate::byte_stream::ProbeError>()
+        }) {
+            source
+        } else {
+            Self { source }.into()
+        }
+    }
+}
+
+/// Whether compilation owns contextual decoder state which a real serving
+/// worker must reserve before acknowledging stream admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessorAdmissionRequirement {
+    RequestLocal,
+    OwnedContextualDecoder,
+}
+
 impl GenerateOptions {
+    pub fn processor_admission_requirement(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> anyhow::Result<ProcessorAdmissionRequirement> {
+        Ok(
+            if crate::byte_stream::ByteStreamContract::requests_literal_stream(tokenizer)? {
+                ProcessorAdmissionRequirement::OwnedContextualDecoder
+            } else {
+                ProcessorAdmissionRequirement::RequestLocal
+            },
+        )
+    }
     /// Resolve request-local processor capabilities before admitting generation.
     /// The decoder builds its own mutable chain when execution starts.
     pub fn validate_processors(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
-        crate::processors::build_processor_chain(self, Some(tokenizer), false).map(drop)
+        crate::processors::build_processor_chain(self, Some(tokenizer), false, None).map(drop)
     }
 
     /// Validate explicit token biases against the admitted model vocabulary.
@@ -2655,5 +2698,30 @@ mod generation_contract_tests {
             )
             .expect("no contract to violate");
         assert_eq!(options.temperature, 0.9);
+    }
+}
+
+#[cfg(test)]
+mod processor_error_classification_tests {
+    #[test]
+    fn allocation_failure_retains_its_type_instead_of_becoming_invalid_configuration() {
+        let error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        let classified = super::ProcessorConfigurationError::classify(
+            anyhow::Error::new(error).context("allocate valid compiled processor storage"),
+        );
+        assert!(
+            classified
+                .downcast_ref::<std::collections::TryReserveError>()
+                .is_some()
+        );
+        assert!(
+            classified
+                .downcast_ref::<super::ProcessorConfigurationError>()
+                .is_none()
+        );
+        let configuration = super::ProcessorConfigurationError::classify(anyhow::anyhow!(
+            "unsupported declared pattern"
+        ));
+        assert!(configuration.is::<super::ProcessorConfigurationError>());
     }
 }

@@ -64,6 +64,7 @@ pub trait KernelFactory: Send + Sync {
 pub struct OpRegistry {
     entries: HashMap<OpKey, (WorkspacePlanning, Box<dyn KernelFactory>)>,
     end_versions: HashMap<OpKey, u64>,
+    native_only: std::collections::HashSet<OpKey>,
     /// Normalized domain → op type → sorted registered `since_version`s.
     by_op: HashMap<String, HashMap<String, Vec<u64>>>,
 }
@@ -80,6 +81,19 @@ impl OpRegistry {
         planning: WorkspacePlanning,
         factory: Box<dyn KernelFactory>,
     ) {
+        self.register_through(key, u64::MAX, planning, factory);
+    }
+
+    /// Register a native-only schema revision that must not be advertised
+    /// through the shipped ORT kernel-registry ABI.
+    pub fn register_native_only(
+        &mut self,
+        mut key: OpKey,
+        planning: WorkspacePlanning,
+        factory: Box<dyn KernelFactory>,
+    ) {
+        key.domain = norm_domain(&key.domain).to_owned();
+        self.native_only.insert(key.clone());
         self.register_through(key, u64::MAX, planning, factory);
     }
 
@@ -171,6 +185,13 @@ impl OpRegistry {
         self.entries.keys()
     }
 
+    /// Registrations eligible for the shipped ORT plugin ABI.
+    pub fn plugin_keys(&self) -> impl Iterator<Item = &OpKey> {
+        self.entries
+            .keys()
+            .filter(|key| !self.native_only.contains(*key))
+    }
+
     /// Number of registered entries.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -200,7 +221,7 @@ mod tests {
         let mut registry = OpRegistry::new();
         let mut state = 0x9e37_79b9_u64;
         let ops = ["Add", "Mul", "Gemm", "Attention"];
-        let domains = ["", "ai.onnx", "com.microsoft", "pkg.nxrt"];
+        let domains = ["", "ai.onnx", "com.microsoft", "pkg.nxrt._private"];
 
         for factory_id in 0..256 {
             state = state
@@ -273,44 +294,79 @@ mod tests {
     fn schema_resolution_selects_latest_registered_since_version() {
         let mut registry = OpRegistry::new();
         registry.register(
-            OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+            OpKey::new("DsaIndexSelect", "pkg.nxrt._private", 1),
             WorkspacePlanning::None,
             Box::new(DummyFactory(1)),
         );
         registry.register(
-            OpKey::new("DsaIndexSelect", "pkg.nxrt", 3),
+            OpKey::new("DsaIndexSelect", "pkg.nxrt._private", 3),
             WorkspacePlanning::Metadata,
             Box::new(DummyFactory(3)),
         );
 
         let resolved_v1 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 1)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 1)
             .expect("opset 1 resolves schema v1");
         let resolved_v2 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 2)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 2)
             .expect("opset 2 still resolves schema v1");
         let resolved_v3 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 3)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 3)
             .expect("opset 3 resolves the newly registered schema");
         let resolved_v4 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 4)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 4)
             .expect("opset 4 keeps using the newest schema");
 
         assert!(std::ptr::eq(resolved_v1, resolved_v2));
         assert!(!std::ptr::eq(resolved_v1, resolved_v3));
         assert!(std::ptr::eq(resolved_v3, resolved_v4));
-        assert!(registry.lookup("DsaIndexSelect", "pkg.nxrt", 0).is_none());
+        assert!(
+            registry
+                .lookup("DsaIndexSelect", "pkg.nxrt._private", 0)
+                .is_none()
+        );
         assert_eq!(
-            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 0),
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt._private", 0),
             None
         );
         assert_eq!(
-            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 2),
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt._private", 2),
             Some(WorkspacePlanning::None)
         );
         assert_eq!(
-            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 3),
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt._private", 3),
             Some(WorkspacePlanning::Metadata)
+        );
+    }
+
+    #[test]
+    fn native_only_revisions_dispatch_without_entering_plugin_advertisement() {
+        let mut registry = OpRegistry::new();
+        registry.register(
+            OpKey::new("Cast", "ai.onnx", 1),
+            WorkspacePlanning::None,
+            Box::new(DummyFactory(1)),
+        );
+        registry.register_native_only(
+            OpKey::new("Cast", "ai.onnx", 21),
+            WorkspacePlanning::None,
+            Box::new(DummyFactory(21)),
+        );
+
+        assert!(registry.supports("Cast", "", 21));
+        assert_eq!(
+            registry
+                .keys()
+                .map(|key| key.since_version)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1, 21].into_iter().collect()
+        );
+        assert_eq!(
+            registry
+                .plugin_keys()
+                .map(|key| key.since_version)
+                .collect::<Vec<_>>(),
+            vec![1]
         );
     }
 }

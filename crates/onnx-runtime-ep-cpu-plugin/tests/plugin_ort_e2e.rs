@@ -911,7 +911,7 @@ enum ConformanceSchema {
 impl ConformanceSchema {
     fn descriptor(self) -> (&'static std::ffi::CStr, Box<ort::OrtCustomOp>) {
         match self {
-            Self::DsaIndexSelect(dtype) => (c"pkg.nxrt", dsa_schema_op(dtype)),
+            Self::DsaIndexSelect(dtype) => (c"pkg.nxrt._private", dsa_schema_op(dtype)),
             Self::MeanVarianceNormalization29 => (c"", mvn_schema_op()),
         }
     }
@@ -4956,7 +4956,7 @@ fn conformance_matmul_initializer_weights() {
 // on `CPUExecutionProvider`, if a claimed node arrives fragmented rather than
 // whole, or if the resulting partition produces wrong numbers.
 
-/// Importing `pkg.nxrt` at opset 2 must resolve the sole since-version-1
+/// Importing `pkg.nxrt._private` at opset 2 must resolve the sole since-version-1
 /// `DsaIndexSelect` implementation through ORT's model import, plugin
 /// `GetCapability`, assignment, Compile, and Compute paths.
 #[test]
@@ -5004,7 +5004,7 @@ fn dsa_index_select_later_opset_import_assigns_and_runs_v1() {
         assert_eq!(
             info.ops_on_our_ep(),
             vec!["DsaIndexSelect"],
-            "pkg.nxrt opset 2 must resolve and assign the sole since-version-1 kernel; got {:?}",
+            "pkg.nxrt._private opset 2 must resolve and assign the sole since-version-1 kernel; got {:?}",
             info.assignments
         );
         assert_eq!(

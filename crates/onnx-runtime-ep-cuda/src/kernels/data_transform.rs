@@ -51,29 +51,52 @@ extern "C" __global__ void compress_bytes(
   }
 }
 
-__device__ __forceinline__ float load_grid_value(
+template <typename T>
+__device__ __forceinline__ T load_grid_value(
+    const void* values, int dtype, unsigned long long index);
+
+template <>
+__device__ __forceinline__ float load_grid_value<float>(
     const void* values, int dtype, unsigned long long index) {
   if (dtype == 0) return ((const float*)values)[index];
   if (dtype == 1) return __half2float(((const __half*)values)[index]);
   return __bfloat162float(((const __nv_bfloat16*)values)[index]);
 }
 
+template <>
+__device__ __forceinline__ double load_grid_value<double>(
+    const void* values, int, unsigned long long index) {
+  return ((const double*)values)[index];
+}
+
+template <typename T>
 __device__ __forceinline__ void store_grid_value(
+    void* values, int dtype, unsigned long long index, T value);
+
+template <>
+__device__ __forceinline__ void store_grid_value<float>(
     void* values, int dtype, unsigned long long index, float value) {
   if (dtype == 0) ((float*)values)[index] = value;
   else if (dtype == 1) ((__half*)values)[index] = __float2half_rn(value);
   else ((__nv_bfloat16*)values)[index] = __float2bfloat16_rn(value);
 }
 
-__device__ __forceinline__ float grid_coordinate(
-    unsigned long long index, unsigned long long extent, int align_corners) {
-  if (align_corners)
-    return extent <= 1 ? 0.0f
-                       : 2.0f * (float)index / (float)(extent - 1) - 1.0f;
-  return (2.0f * (float)index + 1.0f) / (float)extent - 1.0f;
+template <>
+__device__ __forceinline__ void store_grid_value<double>(
+    void* values, int, unsigned long long index, double value) {
+  ((double*)values)[index] = value;
 }
 
-extern "C" __global__ void affine_grid_2d(
+template <typename T>
+__device__ __forceinline__ T grid_coordinate(
+    unsigned long long index, unsigned long long extent, int align_corners) {
+  if (align_corners)
+    return extent <= 1 ? T(0) : T(2) * T(index) / T(extent - 1) - T(1);
+  return (T(2) * T(index) + T(1)) / T(extent) - T(1);
+}
+
+template <typename T>
+__device__ __forceinline__ void affine_grid_2d_impl(
     const void* theta, void* output, unsigned long long points,
     unsigned long long height, unsigned long long width,
     int dtype, int align_corners) {
@@ -81,21 +104,22 @@ extern "C" __global__ void affine_grid_2d(
        point < points; point += (unsigned long long)gridDim.x * blockDim.x) {
     const unsigned long long batch_index = point / (height * width);
     const unsigned long long spatial = point % (height * width);
-    const float y = grid_coordinate(spatial / width, height, align_corners);
-    const float x = grid_coordinate(spatial % width, width, align_corners);
+    const T y = grid_coordinate<T>(spatial / width, height, align_corners);
+    const T x = grid_coordinate<T>(spatial % width, width, align_corners);
     const unsigned long long theta_base = batch_index * 6;
     store_grid_value(output, dtype, point * 2,
-        load_grid_value(theta, dtype, theta_base) * x
-      + load_grid_value(theta, dtype, theta_base + 1) * y
-      + load_grid_value(theta, dtype, theta_base + 2));
+        load_grid_value<T>(theta, dtype, theta_base) * x
+      + load_grid_value<T>(theta, dtype, theta_base + 1) * y
+      + load_grid_value<T>(theta, dtype, theta_base + 2));
     store_grid_value(output, dtype, point * 2 + 1,
-        load_grid_value(theta, dtype, theta_base + 3) * x
-      + load_grid_value(theta, dtype, theta_base + 4) * y
-      + load_grid_value(theta, dtype, theta_base + 5));
+        load_grid_value<T>(theta, dtype, theta_base + 3) * x
+      + load_grid_value<T>(theta, dtype, theta_base + 4) * y
+      + load_grid_value<T>(theta, dtype, theta_base + 5));
   }
 }
 
-extern "C" __global__ void affine_grid_3d(
+template <typename T>
+__device__ __forceinline__ void affine_grid_3d_impl(
     const void* theta, void* output, unsigned long long points,
     unsigned long long depth, unsigned long long height,
     unsigned long long width, int dtype, int align_corners) {
@@ -105,20 +129,47 @@ extern "C" __global__ void affine_grid_3d(
     const unsigned long long batch_index = point / spatial_size;
     const unsigned long long spatial = point % spatial_size;
     const unsigned long long plane = height * width;
-    const float z = grid_coordinate(spatial / plane, depth, align_corners);
+    const T z = grid_coordinate<T>(spatial / plane, depth, align_corners);
     const unsigned long long within_plane = spatial % plane;
-    const float y = grid_coordinate(within_plane / width, height, align_corners);
-    const float x = grid_coordinate(within_plane % width, width, align_corners);
+    const T y = grid_coordinate<T>(within_plane / width, height, align_corners);
+    const T x = grid_coordinate<T>(within_plane % width, width, align_corners);
     const unsigned long long theta_base = batch_index * 12;
     for (unsigned long long component = 0; component < 3; ++component) {
       const unsigned long long base = theta_base + component * 4;
       store_grid_value(output, dtype, point * 3 + component,
-          load_grid_value(theta, dtype, base) * x
-        + load_grid_value(theta, dtype, base + 1) * y
-        + load_grid_value(theta, dtype, base + 2) * z
-        + load_grid_value(theta, dtype, base + 3));
+          load_grid_value<T>(theta, dtype, base) * x
+        + load_grid_value<T>(theta, dtype, base + 1) * y
+        + load_grid_value<T>(theta, dtype, base + 2) * z
+        + load_grid_value<T>(theta, dtype, base + 3));
     }
   }
+}
+
+extern "C" __global__ void affine_grid_2d(
+    const void* theta, void* output, unsigned long long points,
+    unsigned long long height, unsigned long long width,
+    int dtype, int align_corners) {
+  affine_grid_2d_impl<float>(theta, output, points, height, width, dtype, align_corners);
+}
+
+extern "C" __global__ void affine_grid_3d(
+    const void* theta, void* output, unsigned long long points,
+    unsigned long long depth, unsigned long long height,
+    unsigned long long width, int dtype, int align_corners) {
+  affine_grid_3d_impl<float>(theta, output, points, depth, height, width, dtype, align_corners);
+}
+
+extern "C" __global__ void affine_grid_2d_f64(
+    const void* theta, void* output, unsigned long long points,
+    unsigned long long height, unsigned long long width, int align_corners) {
+  affine_grid_2d_impl<double>(theta, output, points, height, width, 0, align_corners);
+}
+
+extern "C" __global__ void affine_grid_3d_f64(
+    const void* theta, void* output, unsigned long long points,
+    unsigned long long depth, unsigned long long height,
+    unsigned long long width, int align_corners) {
+  affine_grid_3d_impl<double>(theta, output, points, depth, height, width, 0, align_corners);
 }
 "#;
 
@@ -264,6 +315,32 @@ struct AffineGridKernel {
     runtime: Arc<CudaRuntime>,
 }
 
+pub(super) enum AffineGridDtype {
+    F32Accum(i32),
+    F64,
+}
+
+impl AffineGridDtype {
+    pub(super) fn from_theta(dtype: DataType) -> std::result::Result<Self, String> {
+        match dtype {
+            DataType::Float32 => Ok(Self::F32Accum(0)),
+            DataType::Float16 => Ok(Self::F32Accum(1)),
+            DataType::BFloat16 => Ok(Self::F32Accum(2)),
+            DataType::Float64 => Ok(Self::F64),
+            other => Err(format!(
+                "AffineGrid theta dtype {other:?} unsupported; expected Float32, Float16, BFloat16, or Float64"
+            )),
+        }
+    }
+
+    fn symbols(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::F32Accum(_) => ("affine_grid_2d", "affine_grid_3d"),
+            Self::F64 => ("affine_grid_2d_f64", "affine_grid_3d_f64"),
+        }
+    }
+}
+
 impl Kernel for AffineGridKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         if inputs.len() != 2 || outputs.len() != 1 {
@@ -294,19 +371,11 @@ impl Kernel for AffineGridKernel {
                 "AffineGrid requires contiguous theta/size/output, Int64 size, and matching float dtypes",
             ));
         }
-        let dtype = match theta.dtype {
-            DataType::Float32 => 0i32,
-            DataType::Float16 => 1,
-            DataType::BFloat16 => 2,
-            other => {
-                return Err(not_implemented(format!(
-                    "AffineGrid theta dtype {other:?} (supported: Float32, Float16, BFloat16)"
-                )));
-            }
-        };
-        if dtype != 0 {
+        let dtype = AffineGridDtype::from_theta(theta.dtype).map_err(not_implemented)?;
+        if matches!(dtype, AffineGridDtype::F32Accum(1 | 2)) {
             self.runtime.require_nvrtc_half_headers("AffineGrid")?;
         }
+        let (stem_2d, stem_3d) = dtype.symbols();
         let batch = theta.shape[0];
         let expected = if spatial_rank == 2 {
             output.shape.len() == 4 && output.shape[0] == batch && output.shape[3] == 2
@@ -327,7 +396,7 @@ impl Kernel for AffineGridKernel {
                 batch
                     .saturating_mul(output.shape[1])
                     .saturating_mul(output.shape[2]) as u64,
-                "affine_grid_2d",
+                stem_2d,
             )
         } else {
             (
@@ -338,7 +407,7 @@ impl Kernel for AffineGridKernel {
                     .saturating_mul(output.shape[1])
                     .saturating_mul(output.shape[2])
                     .saturating_mul(output.shape[3]) as u64,
-                "affine_grid_3d",
+                stem_3d,
             )
         };
         if points == 0 {
@@ -358,11 +427,11 @@ impl Kernel for AffineGridKernel {
         if spatial_rank == 3 {
             builder.arg(&depth);
         }
-        builder
-            .arg(&height)
-            .arg(&width)
-            .arg(&dtype)
-            .arg(&align_corners);
+        builder.arg(&height).arg(&width);
+        if let AffineGridDtype::F32Accum(ref storage) = dtype {
+            builder.arg(storage);
+        }
+        builder.arg(&align_corners);
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (points.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32, 1, 1),

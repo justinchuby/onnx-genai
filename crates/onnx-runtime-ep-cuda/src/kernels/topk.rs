@@ -11,19 +11,13 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
-const SOURCE: &str = r#"
+const SOURCE: &str = concat!(
+    r#"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-
-__device__ bool before(float a, float b, long long ia, long long ib, int largest) {
-  int ka = __float_as_int(a);
-  int kb = __float_as_int(b);
-  ka ^= (int)(((unsigned int)(ka >> 31)) >> 1);
-  kb ^= (int)(((unsigned int)(kb >> 31)) >> 1);
-  if (ka == kb) return ia < ib;
-  return largest ? ka > kb : ka < kb;
-}
-
+"#,
+    include_str!("topk_order.cuh"),
+    r#"
 template <typename T>
 __device__ void topk_float(
     const T* input, T* values, long long* indices,
@@ -166,7 +160,8 @@ extern "C" __global__ void topk_bf16(
     unsigned long long inner, unsigned long long k, int largest) {
   topk_float(input, values, indices, slices, width, inner, k, largest);
 }
-"#;
+"#
+);
 
 pub struct TopKFactory {
     pub runtime: Arc<CudaRuntime>,

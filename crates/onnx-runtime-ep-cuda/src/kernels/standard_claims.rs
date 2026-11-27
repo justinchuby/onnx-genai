@@ -14,12 +14,24 @@ pub(crate) fn unsupported_reason_at_opset(
     input_dtypes: &[DataType],
     conv_transpose_contract: super::conv_transpose::Contract,
 ) -> Option<String> {
+    if node.op_type == "MaxUnpool" {
+        return onnx_runtime_ir::max_unpool::validate_claim(node, opset, input_dtypes).err();
+    }
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "GridSample" => match conv_transpose_contract {
+            super::conv_transpose::Contract::Standalone => {
+                super::grid_sample::validate_claim(node, opset, input_shapes, input_dtypes)
+            }
+            super::conv_transpose::Contract::OrtPlugin => {
+                grid_sample(node, input_shapes, input_dtypes)
+            }
+        },
         "Dropout" => {
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
         }
+        "LpPool" => lp_pool(node, opset, input_dtypes),
         "AveragePool" => {
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
                 .err()
@@ -32,6 +44,19 @@ pub(crate) fn unsupported_reason_at_opset(
             input_dtypes,
             conv_transpose_contract,
         ),
+        "DepthToSpace" | "SpaceToDepth"
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) =>
+        {
+            onnx_runtime_ir::space_depth::SpaceDepth::validate_claim(
+                node,
+                opset,
+                input_shapes,
+                input_dtypes,
+            )
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -58,7 +83,7 @@ pub(crate) fn unsupported_reason(
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
         "Gelu" => gelu(node, input_dtypes),
         "OneHot" => one_hot(node, input_dtypes),
-        "SpaceToDepth" => space_to_depth(node, input_dtypes),
+        "SpaceToDepth" => legacy_space_to_depth(node, input_dtypes),
         "EyeLike" => eye_like(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
         | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
@@ -79,12 +104,10 @@ pub(crate) fn unsupported_reason(
         "GlobalLpPool" => global_lp_pool(node, input_dtypes),
         "LpNormalization" => lp_normalization(node, input_dtypes),
         "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
-        "LpPool" => lp_pool(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
-        "GridSample" => grid_sample(node, input_shapes, input_dtypes),
         _ => return None,
     };
     result
@@ -96,7 +119,7 @@ const CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, D
 
 fn affine_grid(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "theta")?;
+    super::data_transform::AffineGridDtype::from_theta(input_dtypes[0])?;
     require_dtype(input_dtypes, 1, DataType::Int64, "size")?;
     bool_attribute(node, "align_corners")
 }
@@ -165,9 +188,9 @@ fn normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     Ok(())
 }
 
-fn lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn lp_pool(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 1, 1, 1)?;
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")
+    onnx_runtime_ir::lp_pool::validate_dtype(opset, input_dtypes[0])
 }
 
 fn center_crop_pad(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
@@ -641,7 +664,7 @@ fn gather_nd(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), S
     Ok(())
 }
 
-fn space_to_depth(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn legacy_space_to_depth(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 1, 1, 1)?;
     require_fixed_width(input_dtypes, 0, "input")?;
     if !matches!(node.attr("blocksize").and_then(Attribute::as_int), Some(value) if value > 0) {

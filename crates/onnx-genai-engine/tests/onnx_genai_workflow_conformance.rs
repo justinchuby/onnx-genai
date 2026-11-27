@@ -286,6 +286,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         .expect("batch-one decoder must emit tokens")
         .to_vec_i64()?;
 
+    let invocations_before_rejection = engine.component_invocations();
     let multi_row_error = engine
         .generate_with_pipeline_request(decoder_batch_request(
             &[4, 5, 6, 0],
@@ -301,6 +302,28 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
             .to_string()
             .contains("multi-row ragged output"),
         "{multi_row_error:#}"
+    );
+    assert_eq!(
+        engine.component_invocations(),
+        invocations_before_rejection,
+        "single-stream generation must reject multiple semantic rows before executing them"
+    );
+    let one_active_row = engine.generate_with_pipeline_request(decoder_batch_request(
+        &[4, 5, 6, 0],
+        2,
+        2,
+        &[2, 1],
+        &[true, false],
+        3,
+    )?)?;
+    assert_eq!(
+        one_active_row
+            .token_ids
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>(),
+        first_tokens,
+        "single-stream generation must admit one active row from a wider canonical batch"
     );
 
     let batched = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, true], 3)?;

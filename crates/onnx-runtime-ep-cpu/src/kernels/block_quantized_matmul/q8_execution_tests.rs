@@ -125,10 +125,10 @@ fn q8_rejects_missing_short_or_misaligned_workspace_before_payload_and_can_retry
     let b = Owned::u8(&[2, 1, 34], &packed_for_format(BlockFormat::Q8_0, 1, 2, 32));
     let mut y = Owned::f32(&[1, 2], &[37.; 2]);
     let mut backing = [91u128; 8];
-    // Valid owning buffers but impossible byte origins: any materialization
-    // would fail the source bounds guard. Scratch must win before that read.
+    // A representable descriptor with inaccessible payload: planning may
+    // validate geometry, but full workspace binding must precede any read.
     let mut bad_a = a.view();
-    bad_a.byte_offset = usize::MAX;
+    bad_a.data = onnx_runtime_ep_api::DevicePtr(std::ptr::without_provenance(4096));
     let views = [bad_a, b.view()];
     let metadata = [
         TensorMetadata::new(DataType::Float32, &[1, 32], true),

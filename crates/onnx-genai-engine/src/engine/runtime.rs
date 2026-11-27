@@ -649,8 +649,8 @@ struct NativeSessionsRef<'a>(&'a Engine);
 /// A target at or beyond the decoder cursor removes only unmaterialized logical
 /// tokens, so capability checks for a physical CSA/HCA rewind do not apply.
 #[cfg(feature = "native-backend")]
-fn apply_native_rewind<T>(
-    logical_tokens: Option<&mut Vec<T>>,
+fn apply_native_rewind(
+    truncate_logical: impl FnOnce(usize),
     logical_target: usize,
     materialized_len: Option<usize>,
     rewind_materialized: impl FnOnce(usize) -> anyhow::Result<()>,
@@ -661,9 +661,7 @@ fn apply_native_rewind<T>(
             rewind_materialized(target)?;
         }
     }
-    if let Some(tokens) = logical_tokens {
-        tokens.truncate(logical_target);
-    }
+    truncate_logical(logical_target);
     Ok(())
 }
 
@@ -750,7 +748,11 @@ impl SessionStore for NativeSessions<'_> {
             .get_mut(&id)
             .map(|state| &mut state.tokens);
         apply_native_rewind(
-            logical_tokens,
+            |target| {
+                if let Some(tokens) = logical_tokens {
+                    tokens.truncate(target);
+                }
+            },
             position,
             materialized_len,
             |physical_target| {
@@ -1035,6 +1037,31 @@ impl Engine {
         }))
     }
 
+    pub(crate) fn reserve_literal_decoder_workspace(
+        &self,
+        tokenizer: &Tokenizer,
+        options: &GenerateOptions,
+    ) -> anyhow::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        crate::byte_stream::reserve_workspace(tokenizer, options, self.governor.memory())
+    }
+    fn build_governed_processor_chain(
+        &self,
+        options: &GenerateOptions,
+        custom_sampler: bool,
+    ) -> anyhow::Result<crate::ProcessorChain> {
+        let tokenizer = self.require_tokenizer()?;
+        let lease = self.reserve_literal_decoder_workspace(tokenizer, options)?;
+        let decoder = crate::byte_stream::prepare_literal_output(
+            tokenizer,
+            &options.effective_preserved_tokens(),
+        )
+        .map_err(crate::ProcessorConfigurationError::classify)?;
+        let mut chain = build_processor_chain(options, Some(tokenizer), custom_sampler, decoder)
+            .map_err(crate::ProcessorConfigurationError::classify)?;
+        chain.retain_decoder_workspace(lease);
+        Ok(chain)
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         self.max_context_for_request(options)
     }
@@ -1070,7 +1097,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         // Speculation is an optimization. Until its accepted-token callback can
         // carry a normal host stop, tool-aware requests use the ordinary
@@ -1248,19 +1275,19 @@ impl Engine {
                 if let Some(control) = control {
                     control.require_commit()?;
                 }
-                Ok(result)
+                let history = self.admit_native_token_history(&prompt_tokens, &result.token_ids)?;
+                Ok((result, history))
             }),
             EngineDecodeBackend::Native,
         );
         let result = match result {
-            Ok(mut result) => {
+            Ok((mut result, history)) => {
                 let stamp = self.touch_native_session();
                 let state = self
                     .native_sessions
                     .get_mut(&retained)
                     .expect("admitted default cache remains until commit");
-                state.tokens.clone_from(&prompt_tokens);
-                state.tokens.extend_from_slice(&result.token_ids);
+                state.tokens = history;
                 state.last_access = stamp;
                 let _outcome = turn.commit()?;
                 self.native_active_session = Some(retained);
@@ -1368,7 +1395,7 @@ impl Engine {
         self.native_sessions.insert(
             id,
             NativeSessionState {
-                tokens: Vec::new(),
+                tokens: NativeTokenHistory::default(),
                 last_access,
                 generation: 1,
                 poison: None,
@@ -1765,14 +1792,16 @@ impl Engine {
                     retained_cache_tokens: native.current_len(),
                 })
             })();
+            let result = result
+                .and_then(|result| Ok((result, self.admit_native_token_history(tokens, &[])?)));
             match result {
-                Ok(result) => {
+                Ok((result, history)) => {
                     let last_access = self.touch_native_session();
                     let state = self
                         .native_sessions
                         .get_mut(&session)
                         .context("admitted native prefill session disappeared")?;
-                    state.tokens = tokens.to_vec();
+                    state.tokens = history;
                     state.last_access = last_access;
                     turn.commit()?;
                     if let Some(control) = control {
@@ -2594,11 +2623,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(
-            &options,
-            Some(self.require_tokenizer()?),
-            custom_sampler.is_some(),
-        )?;
+        let chain = self.build_governed_processor_chain(&options, custom_sampler.is_some())?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -3751,7 +3776,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         crate::pipeline::WorkflowGenerationCursor::validate_per_token_capability(&self.workflow)?;
         let mut state = self
             .sessions
@@ -4293,7 +4318,7 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
         &self.state.tokens
     }
 
-    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+    fn next_logits(&mut self) -> anyhow::Result<crate::LogitsRow> {
         next_session_token_logits(
             self.session,
             self.kv_model,
@@ -4382,7 +4407,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
@@ -4654,10 +4679,11 @@ impl Engine {
             if let Some(control) = control {
                 control.require_commit()?;
             }
-            Ok(result)
+            let history = self.admit_native_token_history(&prompt_tokens, &result.token_ids)?;
+            Ok((result, history))
         });
         let result = match result {
-            Ok(mut result) => {
+            Ok((mut result, history)) => {
                 // Staging validation and cancellation must finish before any
                 // durable history or retention policy changes. The exclusive
                 // engine borrow keeps this admitted session present until here.
@@ -4666,8 +4692,7 @@ impl Engine {
                     .native_sessions
                     .get_mut(&session_id)
                     .expect("admitted native session remains until turn resolution");
-                state.tokens.clone_from(&prompt_tokens);
-                state.tokens.extend_from_slice(&result.token_ids);
+                state.tokens = history;
                 state.last_access = last_access;
                 let _outcome = turn.commit()?;
                 if let Some((boundary, snapshot)) = pending_semantic_snapshot.take() {
@@ -4726,10 +4751,15 @@ mod tests {
     fn native_zero_count_rewind_does_not_touch_materialized_state() {
         let mut tokens = (0..10).collect::<Vec<_>>();
         let mut physical_called = false;
-        apply_native_rewind(Some(&mut tokens), 10, Some(8), |_| {
-            physical_called = true;
-            Ok(())
-        })
+        apply_native_rewind(
+            |target| tokens.truncate(target),
+            10,
+            Some(8),
+            |_| {
+                physical_called = true;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(tokens.len(), 10);
         assert!(!physical_called);
@@ -4740,10 +4770,15 @@ mod tests {
     fn native_logical_tail_can_shrink_without_rewinding_materialized_state() {
         let mut tokens = (0..10).collect::<Vec<_>>();
         let mut physical_called = false;
-        apply_native_rewind(Some(&mut tokens), 9, Some(8), |_| {
-            physical_called = true;
-            Ok(())
-        })
+        apply_native_rewind(
+            |target| tokens.truncate(target),
+            9,
+            Some(8),
+            |_| {
+                physical_called = true;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(tokens.len(), 9);
         assert!(!physical_called);
@@ -4755,18 +4790,28 @@ mod tests {
         let mut tokens = (0..10).collect::<Vec<_>>();
         let before = tokens.clone();
         let mut attempts = Vec::new();
-        let error = apply_native_rewind(Some(&mut tokens), 7, Some(8), |target| {
-            attempts.push(target);
-            anyhow::bail!("synthetic physical refusal")
-        })
+        let error = apply_native_rewind(
+            |target| tokens.truncate(target),
+            7,
+            Some(8),
+            |target| {
+                attempts.push(target);
+                anyhow::bail!("synthetic physical refusal")
+            },
+        )
         .unwrap_err();
         assert_eq!(error.to_string(), "synthetic physical refusal");
         assert_eq!(tokens, before);
 
-        apply_native_rewind(Some(&mut tokens), 7, Some(8), |target| {
-            attempts.push(target);
-            Ok(())
-        })
+        apply_native_rewind(
+            |target| tokens.truncate(target),
+            7,
+            Some(8),
+            |target| {
+                attempts.push(target);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(attempts, [7, 7]);
         assert_eq!(tokens, (0..7).collect::<Vec<_>>());
@@ -4891,7 +4936,7 @@ mod tests {
                     Engine::from_dir(
                         &Path::new(env!("CARGO_MANIFEST_DIR"))
                             .join("../../tests/fixtures/tiny-llm"),
-                        EngineConfig::default(),
+                        crate::fixture_engine_config(),
                     )
                 },
                 cancel_before_commit,
@@ -5354,7 +5399,7 @@ mod tests {
             )
         };
         let before = used();
-        let mut append = engine.native_sessions[&session].tokens.clone();
+        let mut append = engine.native_sessions[&session].tokens.to_vec();
         append.push(0);
         let append_turn = NativeDecoderTurnParticipant::admit(
             &mut engine,
@@ -5515,7 +5560,10 @@ mod tests {
             "{error:#}"
         );
         assert!(published.is_empty());
-        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(tokens)[..]
+        );
         let restored = engine.native_session.as_mut().unwrap().snapshot_past()?;
         assert_eq!(restored.len(), baseline.len());
         assert_eq!(
@@ -5605,7 +5653,10 @@ mod tests {
             engine.native_session.as_ref().unwrap().current_len(),
             materialized
         );
-        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(tokens)[..]
+        );
         assert_eq!(engine.native_sessions[&session].last_access, stamp);
         assert_eq!(engine.scheduler.running_count(), 0);
         replacement.options.max_new_tokens = 1;
@@ -6459,7 +6510,10 @@ mod tests {
             "poison refusal must name the exact repair: {refusal}"
         );
         assert_eq!(engine.native_active_session, Some(sibling));
-        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&sibling].tokens)[..],
+            &(sibling_tokens)[..]
+        );
         assert_eq!(engine.native_sessions[&sibling].last_access, sibling_access);
         assert_eq!(engine.native_access_counter, access_counter);
         assert_eq!(engine.last_speculative_stats, speculative_stats);
@@ -6470,7 +6524,10 @@ mod tests {
         assert_eq!(reset.generation, 2);
         assert!(reset.poison.is_none());
         assert!(reset.tokens.is_empty());
-        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&sibling].tokens)[..],
+            &(sibling_tokens)[..]
+        );
         let recovered = engine.generate_in_session(poisoned, request)?;
         assert!(!recovered.token_ids.is_empty());
         assert_eq!(engine.native_active_session, Some(poisoned));
@@ -6518,7 +6575,7 @@ mod tests {
         assert_eq!(engine.native_active_session, Some(failed));
 
         let mut append = tiny_native_cold_request(false);
-        let mut prompt = engine.native_sessions[&failed].tokens.clone();
+        let mut prompt = engine.native_sessions[&failed].tokens.as_slice().to_vec();
         prompt.push(0);
         append.prompt = GeneratePrompt::TokenIds(prompt);
         engine
@@ -6560,7 +6617,10 @@ mod tests {
             "native logical session {failed} generation 1 is poisoned"
         )));
         assert_eq!(engine.native_active_session, Some(sibling));
-        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&sibling].tokens)[..],
+            &(sibling_tokens)[..]
+        );
         assert_eq!(engine.native_sessions[&sibling].last_access, sibling_access);
         assert_eq!(engine.native_access_counter, access_counter);
 
@@ -6597,7 +6657,10 @@ mod tests {
             format!("{reset:#}").contains("injected native decoder reset failure"),
             "reset error must retain its physical cause: {reset:#}"
         );
-        assert_eq!(engine.native_sessions[&session].tokens, before_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(before_tokens)[..]
+        );
         assert_eq!(
             engine.native_sessions[&session].generation,
             before_generation
@@ -6639,7 +6702,10 @@ mod tests {
             format!("{close:#}").contains("injected native decoder reset failure"),
             "close error must retain its physical cause: {close:#}"
         );
-        assert_eq!(engine.native_sessions[&session].tokens, before_close_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(before_close_tokens)[..]
+        );
         assert_eq!(
             engine.native_sessions[&session].generation,
             before_close_generation
@@ -7219,7 +7285,10 @@ mod tests {
             0,
             "matching logical tokens owned by another physical session cannot count as reuse"
         );
-        assert_eq!(engine.native_sessions[&other].tokens, other_history);
+        assert_eq!(
+            &(engine.native_sessions[&other].tokens)[..],
+            &(other_history)[..]
+        );
         assert_eq!(
             engine
                 .prefill(prefill_request(&[4, 5, 6]))?
@@ -7237,7 +7306,10 @@ mod tests {
         let result = engine.prefill(prefill_request(&prompt))?;
         assert_eq!(result.prompt_tokens, prompt.len());
         let session = engine.native_default_session.unwrap();
-        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(prompt)[..]
+        );
         assert_eq!(
             engine.native_session.as_ref().unwrap().current_len(),
             prompt.len()
@@ -7258,7 +7330,10 @@ mod tests {
             error.downcast_ref::<crate::GenerationCancelled>().is_some(),
             "{error:#}"
         );
-        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(prompt)[..]
+        );
         assert_eq!(engine.native_sessions[&session].last_access, access);
         assert_eq!(engine.native_active_session, None);
         assert_eq!(engine.scheduler.running_count(), 0);
@@ -7281,7 +7356,7 @@ mod tests {
     fn prompt_only_prefill_refuses_empty_invalid_and_over_context_before_admission()
     -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         for (tokens, limit, field) in [
             (vec![], None, "at least one"),
             (vec![999999], None, "token id"),
@@ -7321,7 +7396,7 @@ mod tests {
                 chunk_size,
                 ..KvConnectorConfig::default()
             },
-            ..EngineConfig::default()
+            ..crate::fixture_engine_config()
         };
         let mut engine = Engine::from_dir(&fixture, config)?;
         let prompt = vec![10, 11, 12, 13, 14, 15];
@@ -7386,7 +7461,8 @@ mod tests {
         retry.options.temperature = 0.0;
         retry.options.stop_on_eos = false;
         let actual = engine.generate_in_session(target, retry.clone())?;
-        let expected = Engine::from_dir(&fixture, EngineConfig::default())?.generate(retry)?;
+        let expected =
+            Engine::from_dir(&fixture, crate::fixture_engine_config())?.generate(retry)?;
         assert_eq!(actual.token_ids, expected.token_ids);
         assert_eq!(engine.session_token_count(sibling)?, sibling_len);
         Ok(())
@@ -8285,10 +8361,10 @@ mod canonical_refusal_tests {
     #[test]
     fn every_constructor_presents_the_declared_workflow() -> anyhow::Result<()> {
         for engine in [
-            Engine::from_dir(&decoder_package(), EngineConfig::default())?,
+            Engine::from_dir(&decoder_package(), crate::fixture_engine_config())?,
             Engine::from_dir_with_session_options(
                 &decoder_package(),
-                EngineConfig::default(),
+                crate::fixture_engine_config(),
                 onnx_genai_ort::SessionOptions::default(),
             )?,
         ] {
@@ -8329,5 +8405,140 @@ mod end_token_policy_tests {
                 .contains("effective eos_token_id")
         );
         assert!(EndTokenPolicy::new(vec![3], Some(4)).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod literal_rollback_tests {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/build_literal_decoder.rs"
+        ));
+    }
+    #[test]
+    fn native_literal_active_budget_failure_restores_kv_and_same_session_retry()
+    -> anyhow::Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for (retained_run, short_source) in [(false, false), (false, true), (true, false)] {
+            let root = tempfile::tempdir()?;
+            let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+            if retained_run {
+                fixture::invalid_group(root.path(), &fixtures, false);
+            } else {
+                fixture::build(root.path(), &fixtures, false);
+            }
+            let path = root.path().join("tokenizer.json");
+            let mut tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            if short_source {
+                // Ensure the active failure is expansion, not the raw-input bound.
+                let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+                assert_eq!(vocab.remove("@source@"), Some(serde_json::json!(22)));
+                vocab.insert("a".into(), serde_json::json!(22));
+                tokenizer["decoder"]["decoders"][2]["pattern"] = serde_json::json!({"String":"a"});
+            }
+            tokenizer["decoder"]["decoders"][2]["content"] = serde_json::json!("12345678");
+            std::fs::write(path, serde_json::to_vec(&tokenizer)?)?;
+            let config = EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            };
+            let mut engine = Engine::from_dir(root.path(), config.clone())?;
+            let session = engine.create_session()?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+            request.options.max_new_tokens = if retained_run { 3 } else { 1 };
+            request.options.greedy = true;
+            request.options.temperature = 0.;
+            request.options.stop_on_eos = false;
+            request.options.max_constraint_bytes = 4096;
+            if !retained_run {
+                request
+                    .options
+                    .logit_bias
+                    .insert(22, crate::logits::LogitBias::Add(1000.));
+            }
+            assert_eq!(
+                engine.generate_in_session(session, request.clone())?.text,
+                "12345678"
+            );
+            let before = engine.native_session.as_mut().unwrap().snapshot_past()?;
+            let length = engine.native_session.as_ref().unwrap().current_len();
+            let tokens = engine.native_sessions[&session].tokens.clone();
+            let host = engine.resource_snapshot().host_ram.used;
+            assert!(
+                !before.host_contents().is_empty() || before.cpu_kv_snapshot().is_some(),
+                "oracle must contain actual materialized Native KV"
+            );
+            let forwards = Arc::new(AtomicUsize::new(0));
+            let observed = forwards.clone();
+            let control = crate::GenerationControl::new().with_checkpoint(move |boundary| {
+                if boundary == crate::GenerationBoundary::AfterDecoderForward {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            let mut visible = String::new();
+            let mut callback = |token: crate::GenerateToken| {
+                visible.push_str(&token.text);
+                Ok(())
+            };
+            let mut failing = request.clone();
+            failing.options.max_constraint_bytes = 7;
+            let error = engine
+                .generate_in_session_with_control_callbacks(
+                    session,
+                    failing,
+                    control,
+                    None,
+                    Some(&mut callback),
+                )
+                .expect_err("active decoder expansion/run must exceed its explicit buffer");
+            if retained_run || short_source {
+                assert!(format!("{error:#}").contains("budget"), "{error:#}");
+            } else {
+                assert!(
+                    error.is::<crate::byte_stream::ByteStreamBufferExceeded>(),
+                    "raw input delta must retain its typed budget error: {error:#}"
+                );
+            }
+            assert!(
+                forwards.load(Ordering::SeqCst) > 0,
+                "failure must follow real Native execution/KV advance"
+            );
+            assert!(
+                visible.is_empty(),
+                "failed transform must not publish a partial response"
+            );
+            let after = engine.native_session.as_mut().unwrap().snapshot_past()?;
+            assert_eq!(after.host_contents(), before.host_contents());
+            assert_eq!(after.cpu_kv_snapshot(), before.cpu_kv_snapshot());
+            assert_eq!(
+                engine.native_session.as_ref().unwrap().current_len(),
+                length
+            );
+            assert_eq!(
+                &(engine.native_sessions[&session].tokens)[..],
+                &(tokens)[..]
+            );
+            assert_eq!(engine.scheduler.running_count(), 0);
+            assert_eq!(
+                engine.resource_snapshot().host_ram.used,
+                host,
+                "failed active turn releases decoder workspace/snapshot leases"
+            );
+            let recovered = engine.generate_in_session(session, request.clone())?;
+            let mut fresh = Engine::from_dir(root.path(), config)?;
+            let fresh_session = fresh.create_session()?;
+            let expected = fresh.generate_in_session(fresh_session, request)?;
+            assert_eq!(recovered.token_ids, expected.token_ids);
+            assert_eq!(recovered.text, expected.text);
+            assert_eq!(recovered.text, "12345678");
+        }
+        Ok(())
     }
 }

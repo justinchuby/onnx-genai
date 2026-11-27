@@ -13,7 +13,10 @@ use crate::text_projection::{ProjectionKind, TextProjection, TextView};
 use crate::tokenization::{NonMonotonicText, TokenTextDecoder};
 use anyhow::{Context, ensure};
 use onnx_genai_ort::Tokenizer;
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -26,7 +29,7 @@ struct ResponseConstraintRecovery {
 }
 
 enum Codec {
-    Bytes(ByteStreamContract),
+    Bytes(Arc<ByteStreamContract>),
     Canonical(Box<Tokenizer>),
 }
 
@@ -143,10 +146,28 @@ struct State {
     ended: bool,
 }
 
-struct ConstraintTokens {
-    raw: Option<ByteStreamContract>,
-    endings: Vec<TokenId>,
-    preserved: std::collections::BTreeSet<u32>,
+/// Token endings, preserved specials and the prepared decoded vocabulary are
+/// one resolved set of facts. Raw grammar cannot also carry decoded transforms.
+pub(crate) enum ConstraintTokens {
+    Raw(ByteStreamContract),
+    Decoded {
+        contract: Option<Arc<ByteStreamContract>>,
+        endings: Vec<TokenId>,
+        preserved: std::collections::BTreeSet<u32>,
+    },
+}
+impl ConstraintTokens {
+    pub(crate) fn decoded(
+        endings: Vec<TokenId>,
+        preserved: &std::collections::BTreeSet<u32>,
+        contract: Option<Arc<ByteStreamContract>>,
+    ) -> Self {
+        Self::Decoded {
+            contract,
+            endings,
+            preserved: preserved.clone(),
+        }
+    }
 }
 
 pub(crate) struct ContentConstraint {
@@ -169,8 +190,7 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         Self::new(
             tokenizer,
@@ -179,11 +199,7 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                raw: None,
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
     pub(crate) fn raw_json_schema(
@@ -199,11 +215,7 @@ impl ContentConstraint {
             ProjectionKind::Plain,
             "",
             max_bytes,
-            ConstraintTokens {
-                raw: Some(contract.into_raw()),
-                endings: Vec::new(),
-                preserved: Default::default(),
-            },
+            ConstraintTokens::Raw(contract.into_raw()),
         )
     }
 
@@ -213,8 +225,7 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         Self::new(
             tokenizer,
@@ -223,11 +234,7 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                raw: None,
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
 
@@ -237,8 +244,7 @@ impl ContentConstraint {
         projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
-        endings: Vec<TokenId>,
-        preserved: &std::collections::BTreeSet<u32>,
+        tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
         let cursor = match grammar {
             crate::config::TextGrammar::Regex(pattern) => {
@@ -253,11 +259,7 @@ impl ContentConstraint {
             projection_kind,
             prefix,
             max_bytes,
-            ConstraintTokens {
-                raw: None,
-                endings,
-                preserved: preserved.clone(),
-            },
+            tokens,
         )
     }
     fn new(
@@ -269,11 +271,16 @@ impl ContentConstraint {
         max_bytes: usize,
         tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
-        let ConstraintTokens {
-            endings,
-            preserved,
-            raw,
-        } = tokens;
+        let (raw, decoded, endings, preserved) = match tokens {
+            ConstraintTokens::Raw(contract) => {
+                (Some(contract), None, Vec::new(), Default::default())
+            }
+            ConstraintTokens::Decoded {
+                contract,
+                endings,
+                preserved,
+            } => (None, contract, endings, preserved),
+        };
         let vocabulary = tokenizer
             .inner()
             .get_vocab(true)
@@ -281,8 +288,11 @@ impl ContentConstraint {
             .copied()
             .collect::<HashSet<_>>();
         let contract = match raw {
-            Some(contract) => Some(contract),
-            None => ByteStreamContract::resolve_output(tokenizer, &preserved)?,
+            Some(contract) => Some(Arc::new(contract)),
+            None => match decoded {
+                Some(contract) => Some(contract),
+                None => ByteStreamContract::resolve_output(tokenizer, &preserved)?.map(Arc::new),
+            },
         };
         let codec = match contract {
             Some(contract) => Codec::Bytes(contract),
@@ -301,7 +311,8 @@ impl ContentConstraint {
         })().map_err(|source| ConstraintPrefixError { source })?;
         let plain_vocabulary = match (&projection_kind, &codec) {
             (ProjectionKind::Plain, Codec::Bytes(contract))
-                if !matches!(normalization, Normalization::CanonicalXml) =>
+                if !matches!(normalization, Normalization::CanonicalXml)
+                    && !contract.has_literal_replace() =>
             {
                 Some(GrammarTokenVocabulary::new(&contract.pieces)?)
             }
@@ -455,9 +466,16 @@ impl ContentConstraint {
             }
             .into());
         }
+        if !terminal
+            && let DecoderState::Bytes(decoder) = &fork
+            && decoder.has_literal_replace()
+            && decoder.retained_bytes() > 0
+        {
+            return self.literal_can_continue(state, bytes, decoder.clone());
+        }
         let suffix = match &fork {
             DecoderState::Bytes(decoder) if !terminal => {
-                Some((decoder.provisional_tail(), decoder.clone()))
+                Some((decoder.provisional_tail(self.max_bytes)?, decoder.clone()))
             }
             _ => None,
         };
@@ -499,6 +517,190 @@ impl ContentConstraint {
         })
     }
 
+    /// Explore actual eligible token continuations of delayed literal output.
+    /// A held pattern prefix is not an unconditional provisional text suffix.
+    fn literal_can_continue(
+        &self,
+        state: &mut State,
+        bytes: Vec<u8>,
+        decoder: ByteStreamState,
+    ) -> anyhow::Result<bool> {
+        use std::collections::VecDeque;
+        const MAX_STATES: usize = 4096;
+        const MAX_WORK: usize = 262144;
+        let memory_limit = self
+            .max_bytes
+            .saturating_mul(4)
+            .clamp(4096, 16 * 1024 * 1024);
+        let Codec::Bytes(contract) = &self.codec else {
+            unreachable!("literal state owns byte codec")
+        };
+        let mut ids = self.vocabulary.iter().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut catalogue_work = 0usize;
+        for id in &ids {
+            catalogue_work = catalogue_work
+                .checked_add(contract.pieces[*id as usize].len())
+                .and_then(|n| n.checked_add(64))
+                .context("literal continuation catalogue work overflow")?;
+        }
+        ensure!(
+            catalogue_work <= 256 * 1024 * 1024,
+            "literal continuation catalogue exceeds its 256 MiB work budget; reduce tokenizer vocabulary"
+        );
+        let mut pieces = HashSet::new();
+        ids.retain(|id| {
+            pieces.insert((
+                contract.kinds[*id as usize],
+                contract.pieces[*id as usize].as_slice(),
+                self.endings.contains(id),
+            ))
+        });
+        let mut queue = VecDeque::from([(bytes, decoder)]);
+        let mut visited = HashSet::new();
+        let mut memory = 0usize;
+        let mut work = 0usize;
+        let mut byte_work = 0usize;
+        let mut transform_work = crate::byte_stream::StreamWork::new(256 * 1024 * 1024);
+        while let Some((output, decoder)) = queue.pop_front() {
+            transform_work.charge(
+                output.len() + decoder.storage_bytes(),
+                "literal continuation EOF clone",
+            )?;
+            let mut terminal = output.clone();
+            terminal.extend(decoder.clone().finish_with_work(
+                self.max_bytes.saturating_sub(terminal.len()),
+                &mut transform_work,
+            )?);
+            if Self::admit_preview(state.projection.with_preview(&terminal, true, |view| {
+                Self::inspect_grammar(
+                    view,
+                    &mut state.json,
+                    &state.raw,
+                    state.normalized.canonical(),
+                    true,
+                    self.normalization,
+                )
+            }))? {
+                return Ok(true);
+            }
+            let mut effects = HashSet::new();
+            let mut effect_memory = 0usize;
+            for &id in &ids {
+                work = work
+                    .checked_add(1)
+                    .context("literal decoder viability work overflow")?;
+                ensure!(
+                    work <= MAX_WORK,
+                    "literal Replace continuation viability exceeds its {MAX_WORK}-transition budget; simplify decoder stages/patterns or use a tokenizer with fewer distinct continuations"
+                );
+                let piece = contract
+                    .pieces
+                    .get(id as usize)
+                    .context("literal continuation token is absent from byte vocabulary")?;
+                if piece.is_empty() && !self.endings.contains(&id) {
+                    continue;
+                }
+                byte_work = byte_work
+                    .checked_add(piece.len())
+                    .and_then(|n| n.checked_add(decoder.storage_bytes()))
+                    .and_then(|n| n.checked_add(output.len()))
+                    .context("literal decoder byte-work overflow")?;
+                ensure!(
+                    byte_work <= 256 * 1024 * 1024,
+                    "literal Replace continuation viability exceeds its 256 MiB byte-work budget; simplify decoder state or vocabulary continuations"
+                );
+                let mut next = decoder.clone();
+                let mut emitted = output.clone();
+                emitted.extend_from_slice(&next.step_with_work(
+                    piece,
+                    contract.kinds[id as usize],
+                    self.max_bytes.saturating_sub(emitted.len()),
+                    &mut transform_work,
+                )?);
+                let terminal = self.endings.contains(&id);
+                if terminal {
+                    emitted.extend(next.finish_with_work(
+                        self.max_bytes.saturating_sub(emitted.len()),
+                        &mut transform_work,
+                    )?);
+                }
+                if state
+                    .projection
+                    .retained_bytes()
+                    .checked_add(emitted.len())
+                    .and_then(|n| n.checked_add(next.retained_bytes()))
+                    .is_none_or(|n| n > self.max_bytes)
+                {
+                    continue;
+                }
+                if !Self::admit_preview(state.projection.with_preview(
+                    &emitted,
+                    terminal,
+                    |view| {
+                        Self::inspect_grammar(
+                            view,
+                            &mut state.json,
+                            &state.raw,
+                            state.normalized.canonical(),
+                            terminal,
+                            self.normalization,
+                        )
+                    },
+                ))? {
+                    continue;
+                }
+                if terminal || next.retained_bytes() == 0 {
+                    return Ok(true);
+                }
+                let effect = (emitted, next);
+                if effects.contains(&effect) {
+                    continue;
+                }
+                let effect_bytes = effect
+                    .0
+                    .len()
+                    .checked_add(effect.1.storage_bytes())
+                    .and_then(|n| n.checked_mul(4))
+                    .and_then(|n| n.checked_add(128))
+                    .context("literal decoder effect memory overflow")?;
+                effect_memory = effect_memory
+                    .checked_add(effect_bytes)
+                    .context("literal effect memory overflow")?;
+                ensure!(
+                    memory
+                        .checked_add(effect_memory)
+                        .is_some_and(|n| n <= memory_limit),
+                    "literal Replace continuation effects exceed {memory_limit}-byte search budget; simplify decoder composition"
+                );
+                effects.insert(effect.clone());
+                let (emitted, next) = effect;
+
+                if emitted == output && next == decoder {
+                    continue;
+                }
+                let key = (emitted, next);
+                if visited.contains(&key) {
+                    continue;
+                }
+                memory = memory
+                    .checked_add(
+                        4usize.saturating_mul(
+                            key.0.len() + key.1.storage_bytes() + size_of_val(&key),
+                        ) + 128,
+                    )
+                    .context("literal decoder viability memory overflow")?;
+                ensure!(
+                    visited.len() < MAX_STATES && memory <= memory_limit,
+                    "literal Replace continuation viability exceeds its {MAX_STATES}-state/{memory_limit}-byte budget; simplify decoder composition or retained patterns"
+                );
+                visited.insert(key.clone());
+                queue.push_back(key);
+            }
+        }
+        Ok(false)
+    }
+
     /// When the full delayed tail is invalid, release only those prefixes which
     /// an actual continuation of this decoder can expose before ending.
     fn suffix_can_end(
@@ -518,7 +720,7 @@ impl ContentConstraint {
         let mut queue = VecDeque::from([(bytes, decoder)]);
         while let Some((bytes, decoder)) = queue.pop_front() {
             let mut terminal = bytes.clone();
-            terminal.extend(decoder.clone().finish());
+            terminal.extend(decoder.clone().finish(self.max_bytes)?);
             if Self::admit_preview(state.projection.with_preview(&terminal, true, |view| {
                 Self::inspect_grammar(
                     view,
@@ -534,7 +736,11 @@ impl ContentConstraint {
             for continuation in decoder.suffix_continuations() {
                 let mut next = decoder.clone();
                 let mut output = bytes.clone();
-                output.extend_from_slice(&next.step(&continuation));
+                output.extend_from_slice(&next.step(
+                    &continuation,
+                    crate::byte_stream::BytePieceKind::Text,
+                    self.max_bytes,
+                )?);
                 if state
                     .projection
                     .retained_bytes()
@@ -608,7 +814,7 @@ impl ContentConstraint {
         }
         let mut decoder = state.decoder.clone();
         let pending = match (&self.codec, &mut decoder) {
-            (Codec::Bytes(_), DecoderState::Bytes(state)) => state.finish(),
+            (Codec::Bytes(_), DecoderState::Bytes(state)) => state.finish(self.max_bytes)?,
             (Codec::Canonical(tokenizer), DecoderState::Canonical(state)) => {
                 state.finish(tokenizer)?.into_bytes()
             }
@@ -648,10 +854,12 @@ impl ContentConstraint {
                     .pieces
                     .get(id as usize)
                     .context("content grammar token has no declared byte piece")?;
-                let mut bytes = state.step(piece).into_owned();
+                let mut bytes = state
+                    .step(piece, contract.kinds[id as usize], self.max_bytes)?
+                    .into_owned();
                 state.check_buffer(self.max_bytes)?;
                 if terminal {
-                    bytes.extend(state.finish());
+                    bytes.extend(state.finish(self.max_bytes.saturating_sub(bytes.len()))?);
                 }
                 Ok(bytes)
             }
@@ -889,8 +1097,7 @@ mod tests {
             ProjectionKind::Plain,
             "",
             128,
-            vec![],
-            &preserved,
+            crate::response_constraint::ConstraintTokens::decoded(vec![], &preserved, None),
         )
         .unwrap();
         constraint.seed_raw_bytes(b"\"\xc3").unwrap();
@@ -929,8 +1136,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let eos = [TokenCandidate {
@@ -954,8 +1164,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let context = ProcessorContext {
@@ -998,13 +1211,13 @@ mod tests {
                     *prefix = "unowned prefix".to_owned();
                 }
                 assert!(
-                    build_processor_chain(&ambiguous, Some(&tokenizer), false)
+                    build_processor_chain(&ambiguous, Some(&tokenizer), false, None,)
                         .err()
                         .unwrap()
                         .to_string()
                         .contains("response_projection")
                 );
-                let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+                let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
                 let initial = mask(&chain, &[]);
                 assert!(initial[22].is_finite());
                 assert!(!initial[23].is_finite());
@@ -1145,8 +1358,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     4096,
-                    vec![3],
-                    &Default::default(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 let mut reference = ContentConstraint::json_schema(
@@ -1155,8 +1371,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     4096,
-                    vec![3],
-                    &Default::default(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 assert!(fast.plain_vocabulary.is_some());
@@ -1218,8 +1437,11 @@ mod tests {
                 ProjectionKind::Plain,
                 "",
                 1024,
-                vec![3],
-                &Default::default(),
+                crate::response_constraint::ConstraintTokens::decoded(
+                    vec![3],
+                    &Default::default(),
+                    None,
+                ),
             )
             .unwrap();
             let candidates = (0..32)
@@ -1264,8 +1486,11 @@ mod tests {
                     ProjectionKind::Plain,
                     "",
                     3,
-                    vec![3],
-                    &Default::default(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        vec![3],
+                        &Default::default(),
+                        None,
+                    ),
                 )
                 .unwrap();
                 let mask = bounded
@@ -1336,8 +1561,11 @@ mod tests {
                 ProjectionKind::Plain,
                 "",
                 4096,
-                vec![3],
-                &Default::default(),
+                crate::response_constraint::ConstraintTokens::decoded(
+                    vec![3],
+                    &Default::default(),
+                    None,
+                ),
             )
             .unwrap();
             let candidates = (0..32)
@@ -1409,7 +1637,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let error = build_processor_chain(&options, Some(&tokenizer), false)
+        let error = build_processor_chain(&options, Some(&tokenizer), false, None)
             .err()
             .unwrap();
         let message = format!("{error:#}");
@@ -1476,7 +1704,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         for opening in [22u32, 23] {
             assert!(mask(&chain, &[])[opening as usize].is_finite());
             assert!(mask(&chain, &[opening])[4].is_finite());
@@ -1505,7 +1733,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let chain = build_processor_chain(&declared_options, Some(&tokenizer), false).unwrap();
+        let chain =
+            build_processor_chain(&declared_options, Some(&tokenizer), false, None).unwrap();
         for opening in [22u32, 23] {
             assert!(mask(&chain, &[])[opening as usize].is_finite());
             assert!(mask(&chain, &[opening])[4].is_finite());
@@ -1549,8 +1778,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         let mut reference = ContentConstraint::json_schema(
@@ -1559,8 +1791,11 @@ mod tests {
             ProjectionKind::Plain,
             "",
             4096,
-            vec![3],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         assert!(fast.plain_vocabulary.is_some());
@@ -1627,7 +1862,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(mask(&chain, &[])[4].is_finite());
         let pending = mask(&chain, &[4, 5, 6, 6, 7]);
         assert!(pending[8].is_finite() && !pending[9].is_finite() && !pending[3].is_finite());
@@ -1639,7 +1874,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { prefix, .. }) = &mut options.constraint {
             *prefix = "\"A".into();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(
             mask(&chain, &[])[16].is_finite(),
             "ordinary EOS quote finishes the actual JSON text"
@@ -1647,7 +1882,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { prefix, .. }) = &mut options.constraint {
             *prefix = "\"A\"".into();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(
             !mask(&chain, &[])[16].is_finite(),
             "EOS roles do not erase ordinary quote bytes"
@@ -1674,7 +1909,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
             *schema = json!({"const":"A"}).to_string();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         for history in [
             vec![22],
             vec![22, 4],
@@ -1711,7 +1946,7 @@ mod tests {
                 &format!("A[r]old[/r]{}", &spelling[..split]),
                 &tokenizer,
             );
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             let mut history = Vec::new();
             for &id in &ids[split..] {
                 assert!(
@@ -1734,7 +1969,7 @@ mod tests {
         if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
             *schema = json!({"const":"é"}).to_string();
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         let first = mask(&chain, &[22]);
         assert!(first[4].is_finite());
         assert!(
@@ -1771,7 +2006,7 @@ mod tests {
             let prefix: String = "A[r]old[/r]".into();
             project(&mut options, template, &prefix, &tokenizer);
         }
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(mask(&chain, &[22])[4].is_finite());
         assert!(!mask(&chain, &[22])[16].is_finite());
         assert!(mask(&chain, &[22, 4])[5].is_finite());
@@ -1786,7 +2021,7 @@ mod tests {
             if let Some(GenerateConstraint::JsonSchema { schema, .. }) = &mut options.constraint {
                 *schema = json!({"const":value}).to_string();
             }
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             assert_eq!(mask(&chain, &[22])[6].is_finite(), space_allowed);
             if space_allowed {
                 assert!(mask(&chain, &[22, 6])[23].is_finite());
@@ -1813,7 +2048,7 @@ mod tests {
                 let prefix: String = "A<c>".into();
                 project(&mut options, template, &prefix, &tokenizer);
             }
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             // C3 cannot extend X終, so the complete X closes content before it.
             assert!(mask(&chain, &[22, 23])[4].is_finite());
             assert!(mask(&chain, &[22, 23, 4])[5].is_finite());
@@ -1844,7 +2079,7 @@ mod tests {
             });
         }
         options.max_constraint_bytes = 64;
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         let initial = mask(&chain, &[]);
         assert!(
             !initial[3].is_finite(),
@@ -1874,7 +2109,7 @@ mod tests {
                         .to_owned();
                     project(&mut options, template, &prefix, &tokenizer);
                 }
-                let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+                let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
                 let mut logits = vec![0.0; 34];
                 chain
                     .process(&mut logits, &ProcessorContext::default())
@@ -1902,7 +2137,7 @@ mod tests {
     fn response_json_processor_replays_history_replacements_and_recovers_rejections() {
         let tokenizer = tokenizer(false);
         let options = options(&tokenizer);
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         for ids in [vec![], vec![25], vec![22], vec![25], vec![], vec![22]] {
             let context = ProcessorContext {
                 generated_tokens: ids,
@@ -1911,7 +2146,7 @@ mod tests {
             let mut actual = vec![0.0; 32];
             let mut expected = actual.clone();
             chain.process(&mut actual, &context).unwrap();
-            build_processor_chain(&options, Some(&tokenizer), false)
+            build_processor_chain(&options, Some(&tokenizer), false, None)
                 .unwrap()
                 .process(&mut expected, &context)
                 .unwrap();
@@ -1941,6 +2176,71 @@ mod tests {
             )
             .unwrap();
         assert!(logits[3].is_finite());
+    }
+    #[test]
+    fn literal_frontier_deduplicates_large_equivalent_vocab_without_losing_distinct_tokens() {
+        let base = byte_tokenizer(true, &[(4, "a"), (5, "b"), (6, "z")]);
+        let mut value: Value =
+            serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        let start = vocab.len();
+        for id in start..start + 50000 {
+            assert!(vocab.insert(format!("noise_{id}"), json!(id)).is_none());
+        }
+        value["decoder"] = json!({"type":"Sequence","decoders":[{"type":"Replace","pattern":{"Regex":"noise_[0-9]+"},"content":"!"},{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"ab"},"content":"7"}]});
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let constraint = ContentConstraint::json_schema(
+            &tokenizer,
+            &json!({"const":7}),
+            ProjectionKind::Plain,
+            "",
+            4096,
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![3],
+                &Default::default(),
+                None,
+            ),
+        )
+        .unwrap();
+        let candidates = [3u32, 4, 5, 6]
+            .into_iter()
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        let allows = |mask: &[bool], token_id| {
+            mask[candidates
+                .iter()
+                .position(|candidate| candidate.token_id == token_id)
+                .unwrap()]
+        };
+        let mask = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
+        assert!(allows(&mask, 4));
+        assert!(!allows(&mask, 3));
+        assert!(!allows(&mask, 6));
+        let context = ProcessorContext {
+            generated_tokens: vec![4],
+            ..Default::default()
+        };
+        let mask = constraint
+            .allowed_next_tokens(&context, &candidates)
+            .unwrap();
+        assert!(allows(&mask, 5));
+        assert!(!allows(&mask, 3));
+        assert!(!allows(&mask, 4));
+        assert!(!allows(&mask, 6));
+        let context = ProcessorContext {
+            generated_tokens: vec![4, 5],
+            ..Default::default()
+        };
+        assert!(constraint.can_finish(&context).unwrap());
     }
 }
 

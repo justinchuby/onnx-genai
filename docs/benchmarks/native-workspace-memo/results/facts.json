@@ -1,0 +1,116 @@
+{
+  "all_other_frozen_controls_passed": true,
+  "cases": [
+    {
+      "case": [
+        "relu",
+        12,
+        1,
+        "run"
+      ],
+      "failed_gate": "foreign process-average CPU",
+      "foreign_cores_range": [
+        1.6841783169672881,
+        2.7757576372356554
+      ],
+      "funded_bytes": [
+        0
+      ],
+      "status": "diagnostic"
+    },
+    {
+      "case": [
+        "q8",
+        1,
+        1,
+        "run"
+      ],
+      "failed_gate": "foreign process-average CPU",
+      "foreign_cores_range": [
+        1.1504529286549094,
+        2.531029130569276
+      ],
+      "funded_bytes": [
+        164
+      ],
+      "status": "diagnostic"
+    },
+    {
+      "case": [
+        "q8",
+        3,
+        1,
+        "run"
+      ],
+      "failed_gate": "foreign process-average CPU",
+      "foreign_cores_range": [
+        1.0561055669243422,
+        2.771241529272776
+      ],
+      "funded_bytes": [
+        164
+      ],
+      "status": "diagnostic"
+    },
+    {
+      "case": [
+        "q8",
+        12,
+        1,
+        "run"
+      ],
+      "failed_gate": "foreign process-average CPU",
+      "foreign_cores_range": [
+        1.2390801448914053,
+        3.3090879148793784
+      ],
+      "funded_bytes": [
+        164
+      ],
+      "status": "diagnostic"
+    },
+    {
+      "case": [
+        "q8",
+        3,
+        8,
+        "run"
+      ],
+      "failed_gate": "foreign process-average CPU",
+      "foreign_cores_range": [
+        1.2201092330941603,
+        1.8025797978154543
+      ],
+      "funded_bytes": [
+        2320
+      ],
+      "status": "diagnostic"
+    },
+    {
+      "case": [
+        "q8",
+        3,
+        1,
+        "prepare_run"
+      ],
+      "failed_gate": "foreign process-average CPU",
+      "foreign_cores_range": [
+        1.2003299479800948,
+        2.5379270306386896
+      ],
+      "funded_bytes": [
+        164
+      ],
+      "status": "diagnostic"
+    }
+  ],
+  "excluded_calibration_processes": 12,
+  "formal_full_output_validation_requests": 1080,
+  "formal_processes": 54,
+  "minimum_timed_window_cpu_s": 0.1442619999999999,
+  "no_latency_or_throughput_claim": true,
+  "qualified_cells": 0,
+  "timed_node_dispatches": 126815868,
+  "timed_public_session_calls": 34675614,
+  "timed_windows": 972
+}

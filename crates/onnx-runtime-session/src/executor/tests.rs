@@ -3544,7 +3544,7 @@ fn csa_cache_record_symbol_keeps_consuming_ops_eager() {
         vec![Some(embeds)],
         vec![attn_out, cache_out],
     );
-    csa.domain = "pkg.nxrt".to_string();
+    csa.domain = "pkg.nxrt._private".to_string();
     graph.insert_node(csa);
 
     let growing = compute_capture_growing_symbols(&graph);
@@ -3644,7 +3644,7 @@ fn csa_output5_selections_symbol_keeps_consuming_ops_eager() {
         vec![Some(embeds)],
         vec![out0, out1, out2, out3, out4, out5],
     );
-    csa.domain = "pkg.nxrt".to_string();
+    csa.domain = "pkg.nxrt._private".to_string();
     graph.insert_node(csa);
 
     let growing = compute_capture_growing_symbols(&graph);
@@ -4722,7 +4722,7 @@ fn kv_capacity_eligible_concats_is_empty_when_mask_cone_is_rejected() {
 /// `CpuExecutionProvider` for everything (so `supports_op` still gives
 /// truthful answers for ordinary ops, `Graph::validate()`-adjacent behavior
 /// stays realistic, etc.), and overrides only the one decision this pass
-/// actually asks of an EP — whether `pkg.nxrt::KvCacheCapacityAppend` is
+/// actually asks of an EP — whether `pkg.nxrt._private::KvCacheCapacityAppend` is
 /// supported — via a constructor flag. This directly models the real
 /// contract: CPU (accept = false) leaves every candidate Concat untouched;
 /// CUDA (accept = true) is the only EP that has ever registered the kernel.
@@ -4771,7 +4771,7 @@ impl ExecutionProvider for KvCapacityAppendTestEp {
         input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> KernelMatch {
-        if op.domain == "pkg.nxrt" && op.op_type == "KvCacheCapacityAppend" {
+        if op.domain == "pkg.nxrt._private" && op.op_type == "KvCacheCapacityAppend" {
             return if self.accept_capacity_append {
                 KernelMatch::Supported {
                     workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -4781,7 +4781,7 @@ impl ExecutionProvider for KvCapacityAppendTestEp {
                 }
             } else {
                 KernelMatch::unsupported(
-                    "test EP does not register pkg.nxrt::KvCacheCapacityAppend",
+                    "test EP does not register pkg.nxrt._private::KvCacheCapacityAppend",
                 )
             };
         }
@@ -4875,9 +4875,9 @@ fn decomposed_kv_growth_cone_with_position_ids() -> (Graph, NodeId, NodeId, Valu
 /// The core positive case: given a cone with both a K-role and a V-role
 /// KV-cache-growth `Concat` (both proven eligible by the classifier), a
 /// `position_ids` input, and an EP that accepts the new op, both Concats must
-/// be rewritten in place into `pkg.nxrt::KvCacheCapacityAppend` — same
+/// be rewritten in place into `pkg.nxrt._private::KvCacheCapacityAppend` — same
 /// `NodeId`, inputs `[past, current, position_ids]`, output unchanged — and
-/// the `pkg.nxrt` opset-import must be recorded.
+/// the `pkg.nxrt._private` opset-import must be recorded.
 #[test]
 fn rewrite_kv_capacity_appends_rewrites_every_eligible_concat_when_ep_supports_the_op() {
     let (mut graph, key_concat_id, value_concat_id, position_ids) =
@@ -4892,7 +4892,10 @@ fn rewrite_kv_capacity_appends_rewrites_every_eligible_concat_when_ep_supports_t
         (value_concat_id, "past_value", "current_value"),
     ] {
         let node = graph.node(id);
-        assert_eq!(node.domain, "pkg.nxrt", "node {id:?} must be re-domained");
+        assert_eq!(
+            node.domain, "pkg.nxrt._private",
+            "node {id:?} must be re-domained"
+        );
         assert_eq!(
             node.op_type, "KvCacheCapacityAppend",
             "node {id:?} must be re-typed"
@@ -4918,9 +4921,9 @@ fn rewrite_kv_capacity_appends_rewrites_every_eligible_concat_when_ep_supports_t
         assert_eq!(node.outputs.len(), 1);
     }
     assert_eq!(
-        graph.opset_imports.get("pkg.nxrt"),
+        graph.opset_imports.get("pkg.nxrt._private"),
         Some(&1),
-        "the pkg.nxrt opset-import must be recorded once a rewrite fires"
+        "the pkg.nxrt._private opset-import must be recorded once a rewrite fires"
     );
     assert!(
         graph.validate().is_ok(),
@@ -4933,7 +4936,7 @@ fn rewrite_kv_capacity_appends_rewrites_every_eligible_concat_when_ep_supports_t
 /// *provenance* is safe — it never inspects which axis the concatenation
 /// grows on. A `Concat` that structurally matched but grows on an axis other
 /// than 2 (of a rank-4 `[batch, heads, seq, head_dim]` layout) is not one
-/// `pkg.nxrt::KvCacheCapacityAppend`'s kernel understands (it hardcodes axis
+/// `pkg.nxrt._private::KvCacheCapacityAppend`'s kernel understands (it hardcodes axis
 /// 2), so the rewrite must decline it and leave the original, axis-generic
 /// `Concat` completely untouched — never silently write into the wrong
 /// physical dimension. Covers both an explicit non-2 axis and a negative
@@ -5004,7 +5007,7 @@ fn rewrite_kv_capacity_appends_is_a_no_op_when_past_is_not_rank4() {
 
 /// The capability gate: the exact same eligible cone, but the EP does not
 /// support the new op (modeling every EP except CUDA today, e.g. CPU). Every
-/// candidate Concat must be left completely untouched, and no `pkg.nxrt`
+/// candidate Concat must be left completely untouched, and no `pkg.nxrt._private`
 /// opset-import may be introduced — this is what makes the pass a
 /// capability-gated rewrite instead of a model/op allowlist that assumes the
 /// kernel always exists.
@@ -5032,8 +5035,8 @@ fn rewrite_kv_capacity_appends_is_a_no_op_when_ep_does_not_support_the_op() {
         );
     }
     assert!(
-        !graph.opset_imports.contains_key("pkg.nxrt"),
-        "no pkg.nxrt opset-import may be introduced when nothing was rewritten"
+        !graph.opset_imports.contains_key("pkg.nxrt._private"),
+        "no pkg.nxrt._private opset-import may be introduced when nothing was rewritten"
     );
 }
 
@@ -5984,7 +5987,7 @@ fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
     std::fs::write(&path, [1u8, 2, 3, 4]).unwrap();
 
     let mut graph = Graph::new();
-    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
     let weight = graph.create_named_value("weight", DataType::Uint8, static_shape([4]));
     graph.set_initializer(
         weight,
@@ -6003,7 +6006,7 @@ fn weight_delivery_fixture() -> (Graph, Arc<WeightStore>, std::path::PathBuf) {
         vec![Some(weight)],
         vec![output],
     );
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     graph.insert_node(node);
     graph.add_output(output);
 
@@ -7047,7 +7050,7 @@ fn sealed_bqmoe_session_graph() -> Graph {
     }
 
     let mut graph = Graph::new();
-    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
     let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 32]));
     graph.add_input(x);
     let router = graph.create_named_value("router", DataType::Float32, static_shape([1, 2]));
@@ -7093,7 +7096,7 @@ fn sealed_bqmoe_session_graph() -> Graph {
         ],
         vec![output],
     );
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     node.attributes.insert("k".into(), Attribute::Int(2));
     node.attributes.insert(
         "activation_type".into(),
@@ -8315,7 +8318,7 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
 
     fn real_graph(path: &std::path::Path, case: &Case) -> (Graph, [ValueId; 3]) {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let rows = graph.intern_symbol("rows");
         let x = graph.create_named_value(
             "x",
@@ -8373,7 +8376,7 @@ fn glm52_real_gated_top8_runs_through_production_session_with_f64_oracle() {
             ],
             vec![output],
         );
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes.insert("k".into(), Attribute::Int(K as i64));
         node.attributes.insert(
             "activation_type".into(),
@@ -16848,7 +16851,7 @@ fn zero_retention_cpu() -> CpuExecutionProvider {
 }
 
 #[test]
-fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() {
+fn streamed_projection_deferred_prepare_and_run_use_the_declared_step_workspace() {
     use onnx_runtime_memory_api::{DeviceKey, Tier};
     use onnx_runtime_memory_governor::{
         HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
@@ -16900,14 +16903,13 @@ fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() 
             &[0.25f32.to_le_bytes(); 35].repeat(rows).concat(),
         )
         .unwrap();
-        let requirement = executor
+        let report = executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
-            .unwrap()
-            .require_complete()
             .unwrap();
-        assert!(requirement.step().bytes > 0);
-        assert_eq!(requirement.step().lifetime, WorkspaceLifetime::StepScoped);
-        assert!(manager.process_used(Tier::Host) >= requirement.step().bytes);
+        assert!(
+            report.require_complete().is_err(),
+            "packed strides require live refinement"
+        );
         let output = executor.run(&[("a", &input)]).unwrap();
         assert_eq!(output[0].shape, [rows, 13]);
         assert_eq!(
@@ -16918,6 +16920,10 @@ fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() 
             books.used(Tier::Host),
             manager.process_used(Tier::Host),
             "zero retention must fund only physical workspace backing"
+        );
+        assert!(
+            manager.process_used(Tier::Host) > 0,
+            "live refinement must admit real workspace"
         );
     }
     drop(executor);
@@ -17214,15 +17220,12 @@ fn symbolic_capability_decline_cannot_become_a_no_workspace_promise() {
         &[0.25f32.to_le_bytes(); 105].concat(),
     )
     .unwrap();
+    let report = executor
+        .prepare_with_device_bindings(&[("a", &input)], &mut [])
+        .unwrap();
     assert!(
-        executor
-            .prepare_with_device_bindings(&[("a", &input)], &mut [])
-            .unwrap()
-            .require_complete()
-            .unwrap()
-            .step()
-            .bytes
-            > 0
+        report.require_complete().is_err(),
+        "a metadata declaration may defer live demand, never promise zero workspace"
     );
     assert_eq!(
         executor.run(&[("a", &input)]).unwrap()[0].to_vec_f32(),

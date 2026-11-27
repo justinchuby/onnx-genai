@@ -386,6 +386,10 @@ broaden an operator schema.
 
 ### String-semantic and tokenizer-adjacent operations
 
+- String operands of `Equal` (opset 19 or later) execute through the native host
+  kernel boundary and produce a broadcast BOOL tensor. Strict CUDA declines
+  managed strings; heterogeneous placement can run String `Equal` on CPU and
+  transfer its BOOL result to a CUDA consumer.
 - Standard opset-20 `StringConcat`, `StringSplit`, and `RegexFullMatch` execute
   through the native host kernel boundary. Rust callers use `Tensor::from_strings`
   and `Tensor::as_strings`; Python session feeds accept NumPy string or object

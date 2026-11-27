@@ -38,6 +38,7 @@ use crate::optimizer::cpu_optimization_passes;
 /// registry is also exposed to the session (Track D) so placement and kernel
 /// instantiation share one source of truth.
 pub struct CpuExecutionProvider {
+    standalone: bool,
     device: DeviceId,
     initialized: bool,
     registry: OpRegistry,
@@ -113,7 +114,7 @@ impl CpuExecutionProvider {
 
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
-        let mut ep = Self::shared_kernels(resources);
+        let mut ep = Self::shared_kernels(resources, true);
         ep.registry.register(
             onnx_runtime_ep_api::OpKey::new(
                 onnx_runtime_optimizer::affine_moe::OP,
@@ -128,14 +129,15 @@ impl CpuExecutionProvider {
 
     /// CPU provider for the ORT plugin: exclude standalone-only registry entries and passes.
     pub fn for_ort_plugin() -> Self {
-        Self::shared_kernels(CpuMemoryResources::default())
+        Self::shared_kernels(CpuMemoryResources::default(), false)
     }
 
-    fn shared_kernels(resources: CpuMemoryResources) -> Self {
+    fn shared_kernels(resources: CpuMemoryResources, standalone: bool) -> Self {
         Self {
+            standalone,
             device: DeviceId::cpu(),
             initialized: false,
-            registry: build_cpu_registry_with_resources(resources.clone()),
+            registry: build_cpu_registry_with_resources(resources.clone(), standalone),
             resources,
             local_workspace: std::sync::OnceLock::new(),
             memory: default_cpu_memory(),
@@ -517,6 +519,29 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.is_default_domain()
+            && op.op_type == "MaxUnpool"
+            && let Err(reason) =
+                onnx_runtime_ir::max_unpool::validate_claim(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "Equal"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && input_dtypes.contains(&DataType::String)
+        {
+            let since = crate::kernels::logical::EQUAL_STRING_SINCE;
+            if opset < since {
+                deny!(
+                    "Equal does not accept tensor(string) at opset {opset}; export at opset {since} or later, or supply matching non-string operands"
+                );
+            }
+            if input_dtypes != [DataType::String, DataType::String] {
+                deny!(
+                    "Equal requires two tensor(string) operands when either operand is String; got {input_dtypes:?}"
+                );
+            }
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
         {
@@ -573,11 +598,29 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type
             );
         }
+        if op.op_type == "LpPool"
+            && domain == "ai.onnx"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::lp_pool::validate_dtype(opset, dtype)
+        {
+            return KernelMatch::unsupported(format!("LpPool: {reason}"));
+        }
         // Structural kernel limits belong to the versioned factory selected
         // above, alongside the parser that creation uses. No operator-name
         // dispatch table is needed here to keep those two boundaries aligned.
         if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
             return KernelMatch::unsupported(reason);
+        }
+        if self.standalone
+            && onnx_runtime_ir::space_depth::Direction::from_node(op).is_some()
+            && let Err(reason) = onnx_runtime_ir::space_depth::SpaceDepth::validate_claim(
+                op,
+                opset,
+                shapes,
+                input_dtypes,
+            )
+        {
+            return KernelMatch::unsupported(format!("{}: {reason}", op.op_type));
         }
         if op.op_type == "GatherND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
@@ -651,6 +694,12 @@ impl ExecutionProvider for CpuExecutionProvider {
             ));
         }
         passes
+    }
+
+    fn host_payload_funding(&self) -> Option<onnx_runtime_ep_api::HostPayloadFunding> {
+        self.resources
+            .buffer_memory()
+            .map(crate::CpuBufferMemory::host_payload_funding)
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
@@ -1178,7 +1227,7 @@ mod tests {
             })
             .collect();
         let mut node = Node::new(NodeId(0), "CompressedSparseAttention", inputs, outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(1));
         node.attributes
@@ -2242,7 +2291,7 @@ mod tests {
         }
     }
 
-    /// Builds a `pkg.nxrt::DsaIndexSelect` node plus the `(shapes, dtypes)`
+    /// Builds a `pkg.nxrt._private::DsaIndexSelect` node plus the `(shapes, dtypes)`
     /// claim metadata for a compatible baseline: batch=1, q_seq=2, heads=2,
     /// head_dim=4, key_seq=3, top_k=2. Each shape/dtype axis matches
     /// `DsaIndexSelectKernel::derive_dims`'s cross-input contract exactly, so
@@ -2264,7 +2313,7 @@ mod tests {
             static_shape([]),
         );
         let mut node = Node::new(NodeId(0), "DsaIndexSelect", inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes.insert("top_k".into(), Attribute::Int(2));
         node.attributes
             .insert("scale".into(), Attribute::Float(1.0));

@@ -28,6 +28,12 @@ mod keyed_weights_tests;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
+pub mod logits_batch;
+pub mod processor_memory;
+pub use logits_batch::{LogitsBatch, LogitsRow};
+pub use processor_memory::{
+    ProcessorAllocationRole, ProcessorAllocationScope, ProcessorArray, ProcessorElement,
+};
 mod memory_authority;
 #[cfg(feature = "native-backend")]
 pub mod native_decode;
@@ -61,7 +67,9 @@ pub use engine::{
 #[cfg(feature = "native-backend")]
 pub use native_decode::NativeStateFileLimits;
 
-pub use config::NativeStateFilePolicy;
+pub use config::{
+    NativeStateFilePolicy, ProcessorAdmissionRequirement, ProcessorConfigurationError,
+};
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{
@@ -223,3 +231,16 @@ pub use speculative::{
     SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
     SpeculativeStats, TokenEmbedder, argmax,
 };
+
+/// Test fixtures run Native when compiled in, and explicitly select ORT in the
+/// reference-only build. Production defaults and backend refusal are unchanged.
+#[cfg(test)]
+pub(crate) fn fixture_engine_config() -> EngineConfig {
+    EngineConfig {
+        #[cfg(feature = "native-backend")]
+        decode_backend: EngineDecodeBackend::Native,
+        #[cfg(not(feature = "native-backend"))]
+        decode_backend: EngineDecodeBackend::Ort,
+        ..EngineConfig::default()
+    }
+}
