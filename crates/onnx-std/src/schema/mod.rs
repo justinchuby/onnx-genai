@@ -429,6 +429,8 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/average_pool_19.yaml"),
     include_str!("../../schemas/standard/average_pool.yaml"),
     include_str!("../../schemas/standard/global_average_pool.yaml"),
+    include_str!("../../schemas/standard/global_lp_pool_v2.yaml"),
+    include_str!("../../schemas/standard/global_lp_pool.yaml"),
     include_str!("../../schemas/standard/global_max_pool.yaml"),
     include_str!("../../schemas/standard/resize.yaml"),
     include_str!("../../schemas/standard/quantize_linear.yaml"),
@@ -765,8 +767,8 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 119);
-        assert_eq!(registry.iter().count(), 147);
+        assert_eq!(registry.schemas.len(), 120);
+        assert_eq!(registry.iter().count(), 149);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
@@ -1037,13 +1039,64 @@ type_constraints:
     }
 
     #[test]
+    fn global_pool_v22_schemas_match_upstream() {
+        // ONNX 622adf94d4e720142950aa8178f7357d52e63db0, onnx/defs/nn/{defs,old}.cc:
+        // v22 adds BF16 to the preceding float16/float32/float64 constraints.
+        let registry = SchemaRegistry::builtins();
+        for opset in [2, 21] {
+            let schema = registry.lookup("GlobalLpPool", "", opset).unwrap();
+            assert_eq!(schema.since_version, 2, "opset {opset}");
+            assert_eq!(
+                schema.type_constraints[0].allowed,
+                [DataType::Float16, DataType::Float32, DataType::Float64],
+                "opset {opset}"
+            );
+        }
+        for name in ["GlobalAveragePool", "GlobalMaxPool", "GlobalLpPool"] {
+            let schema = registry.lookup(name, "", 22).unwrap();
+            assert_eq!(schema.since_version, 22, "{name}");
+            let [input] = schema.inputs.as_slice() else {
+                panic!("{name} v22 must have one input");
+            };
+            let [output] = schema.outputs.as_slice() else {
+                panic!("{name} v22 must have one output");
+            };
+            assert_eq!(input.type_str, "T", "{name}");
+            assert_eq!(output.type_str, "T", "{name}");
+            let [constraint] = schema.type_constraints.as_slice() else {
+                panic!("{name} v22 must have one type constraint");
+            };
+            assert_eq!(constraint.type_param, "T", "{name}");
+            assert_eq!(
+                constraint.allowed,
+                [
+                    DataType::BFloat16,
+                    DataType::Float16,
+                    DataType::Float32,
+                    DataType::Float64,
+                ],
+                "{name}"
+            );
+            if name == "GlobalLpPool" {
+                let [p] = schema.attributes.as_slice() else {
+                    panic!("{name} v22 must have one attribute");
+                };
+                assert_eq!(p.name, "p");
+                assert_eq!(p.attr_type, AttributeType::Int);
+                assert!(!p.required);
+                assert_eq!(p.default, Some(AttributeDefault::Int(2)));
+            } else {
+                assert!(schema.attributes.is_empty(), "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn round_seven_schemas_match_official_signatures() {
         let registry = SchemaRegistry::builtins();
         for (name, since_version, inputs, outputs) in [
             ("MaxPool", 22, 1, 2),
             ("AveragePool", 22, 1, 1),
-            ("GlobalAveragePool", 22, 1, 1),
-            ("GlobalMaxPool", 22, 1, 1),
             ("Resize", 19, 4, 1),
             ("QuantizeLinear", 21, 3, 1),
             ("DequantizeLinear", 21, 3, 1),
