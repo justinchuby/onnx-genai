@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU regression coverage for `pkg.nxrt::KvCacheCapacityAppend` — the
+//! GPU regression coverage for `pkg.nxrt._private::KvCacheCapacityAppend` — the
 //! CUDA-graph-capture-safe replacement for a decomposed-attention KV-cache
 //! growth `Concat` (the "S3 capacity emission" gate).
 //!
@@ -38,7 +38,7 @@ use onnx_runtime_ep_cuda::{CudaExecutionProvider, KV_CAPACITY_APPEND_CAPTURE_ERR
 use onnx_runtime_ir::{Graph, Node, NodeId, compute_contiguous_strides, static_shape};
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 const OP: &str = "KvCacheCapacityAppend";
 
 const BATCH: usize = 1;
@@ -142,7 +142,7 @@ fn kv_capacity_append_kernel(ep: &CudaExecutionProvider) -> Box<dyn Kernel> {
         vec![BATCH, 1],
     ];
     ep.get_kernel(model.graph.node(node_id), &shapes, 1)
-        .expect("pkg.nxrt::KvCacheCapacityAppend must be supported on CUDA")
+        .expect("pkg.nxrt._private::KvCacheCapacityAppend must be supported on CUDA")
 }
 
 /// Executes one step, returning the kernel's raw `Result` instead of
@@ -158,9 +158,12 @@ fn try_execute_step(
     let past_shape = [BATCH, HEADS, CAPACITY, HEAD_DIM];
     let current_shape = [BATCH, HEADS, 1, HEAD_DIM];
     let position_shape = [BATCH, 1];
-    let past_strides = compute_contiguous_strides(&past_shape);
-    let current_strides = compute_contiguous_strides(&current_shape);
-    let position_strides = compute_contiguous_strides(&position_shape);
+    let past_strides = compute_contiguous_strides(&past_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let current_strides = compute_contiguous_strides(&current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let position_strides = compute_contiguous_strides(&position_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(past_present.as_ptr()),
@@ -607,7 +610,7 @@ fn kv_capacity_append_handles_multi_batch_multi_token_current_without_cross_talk
     ];
     let kernel = ep
         .get_kernel(model.graph.node(node_id), &shapes, 1)
-        .expect("pkg.nxrt::KvCacheCapacityAppend must be supported on CUDA");
+        .expect("pkg.nxrt._private::KvCacheCapacityAppend must be supported on CUDA");
 
     let past_present = upload(&ep, &bytes(&[SENTINEL; MB_TOTAL_ELEMS]));
     // batch 0 writes rows [0, 1]; batch 1 writes rows [2, 3] -- disjoint
@@ -633,9 +636,12 @@ fn kv_capacity_append_handles_multi_batch_multi_token_current_without_cross_talk
     let past_shape = [MB_BATCH, HEADS, CAPACITY, HEAD_DIM];
     let current_shape = [MB_BATCH, HEADS, MB_CURRENT_LEN, HEAD_DIM];
     let position_shape = [MB_BATCH, MB_CURRENT_LEN];
-    let past_strides = compute_contiguous_strides(&past_shape);
-    let current_strides = compute_contiguous_strides(&current_shape);
-    let position_strides = compute_contiguous_strides(&position_shape);
+    let past_strides = compute_contiguous_strides(&past_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let current_strides = compute_contiguous_strides(&current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let position_strides = compute_contiguous_strides(&position_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(past_present.as_ptr()),

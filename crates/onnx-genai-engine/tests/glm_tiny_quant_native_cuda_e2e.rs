@@ -1,6 +1,6 @@
 //! Native **CUDA** decode regression for the QUANTIZED tiny synthetic GLM-5.2
 //! (`glm_moe_dsa`) model — the standard-`ai.onnx::Attention` + `indexer` q4
-//! variant (as opposed to the `pkg.nxrt::IndexShare` QMoE fixture covered by
+//! variant (as opposed to the `pkg.nxrt._private::IndexShare` QMoE fixture covered by
 //! `glm_tiny_qmoe_native_cuda_e2e.rs`).
 //!
 //! ## What it locks

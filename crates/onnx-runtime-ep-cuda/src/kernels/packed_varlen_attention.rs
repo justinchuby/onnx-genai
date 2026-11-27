@@ -1,8 +1,8 @@
-//! Unpadded / packed variable-length attention (`pkg.nxrt::PackedVarlenAttention`
+//! Unpadded / packed variable-length attention (`pkg.nxrt._private::PackedVarlenAttention`
 //! v1).
 //!
 //! This is a runtime-invented op (registered in [`onnx_runtime_ir::RUNTIME_DOMAIN`]
-//! = `pkg.nxrt`, **not** `com.microsoft` or the default ONNX domain) that runs
+//! = `pkg.nxrt._private`, **not** `com.microsoft` or the default ONNX domain) that runs
 //! scaled dot-product attention directly over *packed* — i.e. padding-free —
 //! variable-length sequences. Where the standard `ai.onnx::Attention` kernel
 //! lays every sequence out at a common padded length and NEG_INF-masks the
@@ -258,7 +258,7 @@ fn error(message: impl Into<String>) -> EpError {
 }
 
 /// Claim-time denial for the packed-varlen positional/dtype contract. Mirrors
-/// the other `pkg.nxrt` ops: reject unsupported dtypes up front so the planner
+/// the other `pkg.nxrt._private` ops: reject unsupported dtypes up front so the planner
 /// falls back cleanly instead of failing at execute.
 pub(crate) fn unsupported_reason(
     node: &Node,

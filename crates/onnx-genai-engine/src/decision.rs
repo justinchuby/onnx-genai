@@ -592,7 +592,7 @@ mod tests {
     fn decision_runs_the_declared_head_and_changes_with_state_for_every_question_kind() {
         let root = root();
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config()).unwrap();
         let contract = std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
         for kind in [
             DecisionKind::Choice,
@@ -651,7 +651,7 @@ mod tests {
                     "score_confidence: maximum_probability",
                 )
         });
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config()).unwrap();
         let tokenizer = Tokenizer::from_file(package.path().join("tokenizer.json")).unwrap();
         let contract = std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
         for (state, level) in [("hello", 0.0), ("world", 1.0)] {
@@ -719,7 +719,7 @@ initializer {{ name: "option_axis" data_type: 7 dims: 1 int64_data: 1 }}
         for scalar in [false, true] {
             let package = dynamic_option_package(scalar, |_| {});
             let mut engine =
-                Engine::from_dir(package.path(), crate::EngineConfig::default()).unwrap();
+                Engine::from_dir(package.path(), crate::fixture_engine_config()).unwrap();
             let tokenizer = Tokenizer::from_file(package.path().join("tokenizer.json")).unwrap();
             let contract =
                 std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
@@ -766,7 +766,7 @@ initializer {{ name: "option_axis" data_type: 7 dims: 1 int64_data: 1 }}
                 "score":{"minimum":1,"maximum":16,"descriptions":"text","legend":"structured"}
             })).unwrap();
         });
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config()).unwrap();
         let tokenizer = Tokenizer::from_file(package.path().join("tokenizer.json")).unwrap();
         let contract = std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
         for count in [1, 11] {
@@ -825,7 +825,7 @@ node {{ input: "scaled.probabilities" output: "probabilities" op_type: "Cast" at
                 source.insert_str(source.rfind('}').unwrap(), &extra);
                 std::fs::write(path, source).unwrap();
                 let mut engine =
-                    Engine::from_dir(package.path(), crate::EngineConfig::default()).unwrap();
+                    Engine::from_dir(package.path(), crate::fixture_engine_config()).unwrap();
                 let tokenizer =
                     Tokenizer::from_file(package.path().join("tokenizer.json")).unwrap();
                 let contract =
@@ -862,7 +862,7 @@ node {{ input: "scaled.probabilities" output: "probabilities" op_type: "Cast" at
         );
         assert!(!graph.contains("Softmax"));
         std::fs::write(path, graph).unwrap();
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config()).unwrap();
         let tokenizer = Tokenizer::from_file(package.path().join("tokenizer.json")).unwrap();
         let contract = std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
         let prepared = PreparedDecision::prepare(
@@ -898,7 +898,7 @@ node {{ input: "scaled.probabilities" output: "probabilities" op_type: "Cast" at
         );
         assert_eq!(confidence(DecisionConfidence::UniformMargin, &[1.0]), 1.0);
         let root = root();
-        let engine = Engine::from_dir(&root, crate::EngineConfig::default()).unwrap();
+        let engine = Engine::from_dir(&root, crate::fixture_engine_config()).unwrap();
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
         let contract = std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
         assert!(

@@ -921,6 +921,8 @@ pub struct EngineConfig {
     pub kv_connector: KvConnectorConfig,
     /// Vendor-neutral hot, warm, and cold resource ceilings (DESIGN §26.11).
     pub limits: ResourceLimits,
+    /// Finite raw/resident PCM policy, intersected with live host headroom before audio decoding.
+    pub audio_decode_limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
     /// Permit programmatic resource-limit changes after engine initialization.
     pub allow_runtime_override: bool,
     /// Static device/host weight placement policy.
@@ -961,6 +963,8 @@ impl Default for EngineConfig {
             kv_cache_dtype: KvDType::F32,
             kv_connector: KvConnectorConfig::default(),
             limits: ResourceLimits::default(),
+            audio_decode_limits:
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
             allow_runtime_override: false,
             device_policy: DevicePolicy::Auto,
             // One encoder output for a handful of attachments. Big enough that
@@ -1518,11 +1522,54 @@ pub struct SamplingOverrides {
     pub top_k: Option<usize>,
 }
 
+/// A request's processor configuration failed compilation before execution.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid generation processor configuration: {source:#}")]
+pub struct ProcessorConfigurationError {
+    #[source]
+    source: anyhow::Error,
+}
+impl ProcessorConfigurationError {
+    pub(crate) fn classify(source: anyhow::Error) -> anyhow::Error {
+        // Preserve allocator/governor failures for serving resource policy; a
+        // valid configuration does not become invalid when capacity is scarce.
+        if source.chain().any(|cause| {
+            cause.is::<std::collections::TryReserveError>()
+                || cause.is::<onnx_runtime_memory_api::MemoryError>()
+                || cause.is::<crate::byte_stream::ProbeError>()
+        }) {
+            source
+        } else {
+            Self { source }.into()
+        }
+    }
+}
+
+/// Whether compilation owns contextual decoder state which a real serving
+/// worker must reserve before acknowledging stream admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessorAdmissionRequirement {
+    RequestLocal,
+    OwnedContextualDecoder,
+}
+
 impl GenerateOptions {
+    pub fn processor_admission_requirement(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> anyhow::Result<ProcessorAdmissionRequirement> {
+        Ok(
+            if crate::byte_stream::ByteStreamContract::requests_literal_stream(tokenizer)? {
+                ProcessorAdmissionRequirement::OwnedContextualDecoder
+            } else {
+                ProcessorAdmissionRequirement::RequestLocal
+            },
+        )
+    }
     /// Resolve request-local processor capabilities before admitting generation.
     /// The decoder builds its own mutable chain when execution starts.
     pub fn validate_processors(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
-        crate::processors::build_processor_chain(self, Some(tokenizer), false).map(drop)
+        crate::processors::build_processor_chain(self, Some(tokenizer), false, None).map(drop)
     }
 
     /// Validate explicit token biases against the admitted model vocabulary.
@@ -1817,6 +1864,9 @@ impl GrammarActivation {
 /// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
+    /// Generate one canonical JSON-valued Atem XML call. The grammar describes
+    /// its logical tagged-JSON projection, with standalone parameter schemas.
+    XmlToolCall { grammar: String, prefix: String },
     /// llama.cpp GBNF over the raw newly generated stream, including channel
     /// markers and model-token references. Assistant prefill is not consumed.
     Gbnf {
@@ -2648,5 +2698,30 @@ mod generation_contract_tests {
             )
             .expect("no contract to violate");
         assert_eq!(options.temperature, 0.9);
+    }
+}
+
+#[cfg(test)]
+mod processor_error_classification_tests {
+    #[test]
+    fn allocation_failure_retains_its_type_instead_of_becoming_invalid_configuration() {
+        let error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        let classified = super::ProcessorConfigurationError::classify(
+            anyhow::Error::new(error).context("allocate valid compiled processor storage"),
+        );
+        assert!(
+            classified
+                .downcast_ref::<std::collections::TryReserveError>()
+                .is_some()
+        );
+        assert!(
+            classified
+                .downcast_ref::<super::ProcessorConfigurationError>()
+                .is_none()
+        );
+        let configuration = super::ProcessorConfigurationError::classify(anyhow::anyhow!(
+            "unsupported declared pattern"
+        ));
+        assert!(configuration.is::<super::ProcessorConfigurationError>());
     }
 }

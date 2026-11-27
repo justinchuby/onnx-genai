@@ -25,7 +25,7 @@ use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
 use crate::runtime::{CudaRuntime, cuptr};
 
 use super::attention::{
-    AttentionDtype, Phase2aScratch, phase2a_scratch_layout, run_attention_phase2a,
+    AttentionDtype, BlasSoftmaxScratch, blas_softmax_scratch_layout, run_attention_blas_softmax,
 };
 use super::flash_attention;
 use super::gqa_decode;
@@ -840,7 +840,7 @@ enum GqaAttentionRoute {
     DecodeF16,
     DecodeBf16,
     ReferenceF32,
-    Phase2a,
+    BlasSoftmax,
 }
 
 fn gqa_attention_route(
@@ -860,7 +860,7 @@ fn gqa_attention_route(
     } else if dtype == DataType::Float32 {
         GqaAttentionRoute::ReferenceF32
     } else {
-        GqaAttentionRoute::Phase2a
+        GqaAttentionRoute::BlasSoftmax
     }
 }
 
@@ -884,7 +884,7 @@ fn gqa_selected_backend(
     {
         GroupQueryAttentionBackend::Fused
     } else {
-        GroupQueryAttentionBackend::Phase2a
+        GroupQueryAttentionBackend::NoFlashPrefill
     }
 }
 
@@ -892,7 +892,7 @@ fn gqa_selected_backend(
 enum GqaAttentionScratch {
     None,
     Reference { stride: usize },
-    Phase2a { layout: WorkspaceLayout<2> },
+    BlasSoftmax { layout: WorkspaceLayout<2> },
     Decode { layout: WorkspaceLayout<1> },
 }
 
@@ -913,7 +913,7 @@ fn gqa_attention_scratch(
     head_sink: bool,
 ) -> Result<GqaAttentionScratch> {
     let selected = if head_sink {
-        GroupQueryAttentionBackend::Phase2a
+        GroupQueryAttentionBackend::NoFlashPrefill
     } else {
         gqa_selected_backend(
             backend,
@@ -934,12 +934,18 @@ fn gqa_attention_scratch(
             | GqaAttentionRoute::DecodeBf16 => GqaAttentionScratch::Decode {
                 layout: gqa_decode::scratch_layout(batch, heads, q_seq, head_dim)?,
             },
-            GqaAttentionRoute::Phase2a => {
+            GqaAttentionRoute::BlasSoftmax => {
                 let dtype = AttentionDtype::from_onnx(dtype).map_err(|_| {
                 EpError::KernelFailed(format!("cuda_ep GroupQueryAttention: cannot plan attention scratch for unsupported dtype {dtype:?}; use Float32, Float16 or BFloat16"))
             })?;
-                GqaAttentionScratch::Phase2a {
-                    layout: phase2a_scratch_layout(dtype, batch, heads, q_seq, logical_capacity)?,
+                GqaAttentionScratch::BlasSoftmax {
+                    layout: blas_softmax_scratch_layout(
+                        dtype,
+                        batch,
+                        heads,
+                        q_seq,
+                        logical_capacity,
+                    )?,
                 }
             }
             _ => GqaAttentionScratch::None,
@@ -1054,8 +1060,8 @@ struct GqaWorkspaceLayout {
     out_bnsh_bytes: usize,
     scores_offset: usize,
     scores_bytes: usize,
-    phase2a_offset: usize,
-    phase2a_bytes: usize,
+    blas_softmax_offset: usize,
+    blas_softmax_bytes: usize,
     decode_offset: usize,
     decode_bytes: usize,
     present_k_offset: usize,
@@ -1190,12 +1196,15 @@ fn gqa_workspace_layout(
             EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace layout overflow".into())
         })?;
     }
-    if let GqaAttentionScratch::Phase2a { layout: phase2a } = attention_scratch {
-        offset = gqa_align_up(offset, phase2a.alignment())?;
-        layout.phase2a_offset = offset;
-        layout.phase2a_bytes = phase2a.bytes();
-        offset = offset.checked_add(phase2a.bytes()).ok_or_else(|| {
-            EpError::KernelFailed("cuda_ep GroupQueryAttention: Phase2a composite workspace size overflow; reduce the prepared geometry".into())
+    if let GqaAttentionScratch::BlasSoftmax {
+        layout: blas_softmax,
+    } = attention_scratch
+    {
+        offset = gqa_align_up(offset, blas_softmax.alignment())?;
+        layout.blas_softmax_offset = offset;
+        layout.blas_softmax_bytes = blas_softmax.bytes();
+        offset = offset.checked_add(blas_softmax.bytes()).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep GroupQueryAttention: cuBLASLt/softmax composite workspace size overflow; reduce the prepared geometry".into())
         })?;
     }
     if let GqaAttentionScratch::Decode { layout: decode } = attention_scratch {
@@ -1371,28 +1380,28 @@ fn gqa_carve(view: WorkspaceView, offset: usize, bytes: usize, what: &str) -> Re
     Ok(cuptr(base.wrapping_add(offset).cast_const().cast()))
 }
 
-fn bind_gqa_phase2a_scratch(
+fn bind_gqa_blas_softmax_scratch(
     scratch: GqaAttentionScratch,
     composite: &GqaWorkspaceLayout,
     prepared: Option<WorkspaceView>,
-) -> Result<Phase2aScratch> {
-    let GqaAttentionScratch::Phase2a { layout } = scratch else {
-        return Err(EpError::KernelFailed("cuda_ep GroupQueryAttention: Phase2a dispatch exceeds its planned attention scratch; reprepare this input geometry".into()));
+) -> Result<BlasSoftmaxScratch> {
+    let GqaAttentionScratch::BlasSoftmax { layout } = scratch else {
+        return Err(EpError::KernelFailed("cuda_ep GroupQueryAttention: cuBLASLt/softmax dispatch exceeds its planned attention scratch; reprepare this input geometry".into()));
     };
     let view = prepared.ok_or_else(|| EpError::KernelFailed(
         "cuda_ep GroupQueryAttention: general half/bf16 attention requires executor-prepared scores/cuBLASLt workspace; call workspace_requirement and execute_with_workspace".into()
     ))?;
     let pointer = gqa_carve(
         view,
-        composite.phase2a_offset,
-        composite.phase2a_bytes,
-        "Phase2a scores/cuBLASLt scratch",
+        composite.blas_softmax_offset,
+        composite.blas_softmax_bytes,
+        "cuBLASLt/softmax scratch",
     )?;
-    Phase2aScratch::bind(
+    BlasSoftmaxScratch::bind(
         &layout,
         Some(WorkspaceView::new(
             DevicePtrMut(pointer as *mut c_void),
-            composite.phase2a_bytes,
+            composite.blas_softmax_bytes,
         )),
     )
 }
@@ -1568,7 +1577,9 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
 pub enum GroupQueryAttentionBackend {
     Auto,
     Fused,
-    Phase2a,
+    /// Bypass flash prefill. Geometry and dtype still select among split-K
+    /// decode, f32 reference attention, and the cuBLASLt/softmax path.
+    NoFlashPrefill,
 }
 
 #[derive(Debug)]
@@ -2321,9 +2332,9 @@ impl GroupQueryAttentionKernel {
                 let backend =
                     self.selected_backend_for_shape(q.dtype, q_seq, present_capacity, dim);
                 let eligible = match backend {
-                    // Single-token device-KV decode (M=1): the existing Phase2a
-                    // split-K flash-decode kernels read the valid length on-device.
-                    GroupQueryAttentionBackend::Phase2a => {
+                    // Single-token device-KV split-K decode reads the valid
+                    // length on-device.
+                    GroupQueryAttentionBackend::NoFlashPrefill => {
                         (q.dtype == DataType::Float32
                             || (q.dtype == DataType::Float16
                                 && gqa_decode_fp16::supported(q_seq, dim))
@@ -2517,12 +2528,12 @@ impl GroupQueryAttentionKernel {
         let mut selected_backend =
             self.selected_backend_for_shape(q.dtype, q_seq, attention_sequence_length, dim);
         // A learned attention sink is implemented only on the f32 reference and
-        // f32 split-K decode paths (the fused-flash and phase-2a kernels have no
+        // f32 split-K decode paths (the fused-flash and cuBLASLt/softmax kernels have no
         // sink term). Route around fused flash whenever a sink is present so the
         // sink is never silently dropped; f32 decode/prefill then land on the
         // sink-aware kernels below.
         if head_sink.is_some() && selected_backend == GroupQueryAttentionBackend::Fused {
-            selected_backend = GroupQueryAttentionBackend::Phase2a;
+            selected_backend = GroupQueryAttentionBackend::NoFlashPrefill;
         }
         let use_fused = selected_backend == GroupQueryAttentionBackend::Fused;
         let head_sink_ptr = head_sink.unwrap_or(0);
@@ -2588,8 +2599,8 @@ impl GroupQueryAttentionKernel {
         .with_metadata(batch)?;
         let prepared_view = composite_layout.bind(prepared)?;
         let attention_route = gqa_attention_route(selected_backend, q.dtype, q_seq, dim);
-        let phase2a_scratch = if attention_route == GqaAttentionRoute::Phase2a {
-            Some(bind_gqa_phase2a_scratch(
+        let blas_softmax_scratch = if attention_route == GqaAttentionRoute::BlasSoftmax {
+            Some(bind_gqa_blas_softmax_scratch(
                 attention_scratch,
                 &composite_layout,
                 prepared,
@@ -3083,7 +3094,7 @@ impl GroupQueryAttentionKernel {
             GqaAttentionRoute::DecodeF16 => KvCachePath::Fp16DecodeRead,
             GqaAttentionRoute::DecodeBf16 => KvCachePath::Bf16DecodeRead,
             GqaAttentionRoute::ReferenceF32 => KvCachePath::ReferenceRead,
-            GqaAttentionRoute::Phase2a => KvCachePath::Phase2aRead,
+            GqaAttentionRoute::BlasSoftmax => KvCachePath::BlasSoftmaxRead,
         };
         self.kv_strides.require_converted_path_support(read_path)?;
         if attention_route == GqaAttentionRoute::Fused {
@@ -3171,8 +3182,8 @@ impl GroupQueryAttentionKernel {
             // device pointers for query/present-K/present-V/output. Reads the
             // valid length on-device from `totals_gpu` and allocates only
             // fixed-size dynamic shared memory, so it records/replays inside a
-            // CUDA graph. Unsupported fp16 shapes (e.g. prefill Sq>1) still fall
-            // through to the phase-2a path below.
+            // CUDA graph. Without flash prefill, unsupported split-K shapes
+            // use cuBLASLt/softmax.
             gqa_decode_fp16::run(
                 &self.runtime,
                 batch,
@@ -3208,11 +3219,7 @@ impl GroupQueryAttentionKernel {
             // the bf16 device pointers for query/present-K/present-V/output.
             // Reads the valid length on-device from `totals_gpu` and allocates
             // only fixed-size dynamic shared memory, so it records/replays inside
-            // a CUDA graph. This is the branch that makes bfloat16 decoders (e.g.
-            // Muse-Glimmer) capture-eligible: without it every bf16 GQA node
-            // declined at the kernel gate and forced an eager device seam that
-            // defeated whole-graph capture. Unsupported bf16 shapes (e.g. prefill
-            // Sq>1) still fall through to the phase-2a path below.
+            // a CUDA graph.
             gqa_decode_bf16::run(
                 &self.runtime,
                 batch,
@@ -3313,16 +3320,17 @@ impl GroupQueryAttentionKernel {
             }
             .map_err(|error| driver_err("launch GQA reference attention", error))?;
         } else {
+            // Keep the emitted variant ID stable for existing kernel traces.
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_phase2a",
-                "phase2a general attention: dtype={:?}, q_seq={}, valid_seq_len={}, head_dim={} \
-                 not selected for fused flash or a capture-safe dtype-specific decode kernel",
+                "cuBLASLt/softmax attention: dtype={:?}, q_seq={}, valid_seq_len={}, head_dim={}; \
+                 did not select flash prefill or a capture-safe split-K decode kernel",
                 q.dtype,
                 q_seq,
                 attention_sequence_length,
                 dim
             );
-            run_attention_phase2a(
+            run_attention_blas_softmax(
                 &self.runtime,
                 dtype,
                 self.num_heads,
@@ -3345,7 +3353,7 @@ impl GroupQueryAttentionKernel {
                 query_starts_gpu,
                 local_window_i,
                 self.softcap,
-                phase2a_scratch.ok_or_else(|| EpError::KernelFailed("cuda_ep GroupQueryAttention: Phase-2a route has no checked caller scratch; reprepare the composite workspace for the selected attention geometry".into()))?,
+                blas_softmax_scratch.ok_or_else(|| EpError::KernelFailed("cuda_ep GroupQueryAttention: cuBLASLt/softmax route has no checked caller scratch; reprepare the composite workspace for the selected attention geometry".into()))?,
             )?;
         }
 
@@ -3395,7 +3403,7 @@ impl GroupQueryAttentionKernel {
     ///   its device-KV aliasing, so it conservatively reserves the (tiny,
     ///   `q_seq==1`) staging; every packed *prefill* genuinely splits.
     /// - **Attention scratch** covers every route reachable under the logical
-    ///   length bound. Reference f32 reserves scores; general half/bf16 Phase2a
+    ///   length bound. Reference f32 reserves scores; general half/bf16 BlasSoftmax
     ///   reserves its scores and cuBLASLt workspace. Guaranteed fused and
     ///   dedicated decode routes reserve neither matrix nor BLAS scratch.
     /// - **BNSH transpose scratch** reserves Q for multi-token transpose, packed
@@ -3564,7 +3572,7 @@ impl Kernel for GroupQueryAttentionKernel {
         match self.capture_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed fixed-capacity aliased device-KV signature: either f32/fp16/bf16 q_seq==1 (Phase2a split-K decode) or fp16/bf16 q_seq>1 (fused flash verify/prefill); the current signature was not warmed as capture-safe",
+                "requires a warmed fixed-capacity aliased device-KV signature: either f32/fp16/bf16 q_seq==1 (split-K decode) or fp16/bf16 q_seq>1 (fused flash verify/prefill); the current signature was not warmed as capture-safe",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "GroupQueryAttention capture signature is unavailable because its state lock was poisoned",
@@ -4004,14 +4012,14 @@ mod tests {
                                     GqaAttentionRoute::ReferenceF32 => assert!(
                                         matches!(scratch, GqaAttentionScratch::Reference { stride } if stride >= length)
                                     ),
-                                    GqaAttentionRoute::Phase2a => {
-                                        let GqaAttentionScratch::Phase2a { layout } = scratch
+                                    GqaAttentionRoute::BlasSoftmax => {
+                                        let GqaAttentionScratch::BlasSoftmax { layout } = scratch
                                         else {
                                             panic!(
                                                 "unfunded half route: {dtype:?}/{compute_major}/{q_seq}/{dim}/{bound}/{length}"
                                             );
                                         };
-                                        let needed = phase2a_scratch_layout(
+                                        let needed = blas_softmax_scratch_layout(
                                             AttentionDtype::from_onnx(dtype).unwrap(),
                                             1,
                                             4,
@@ -4045,7 +4053,7 @@ mod tests {
             for backend in [
                 GroupQueryAttentionBackend::Auto,
                 GroupQueryAttentionBackend::Fused,
-                GroupQueryAttentionBackend::Phase2a,
+                GroupQueryAttentionBackend::NoFlashPrefill,
             ] {
                 assert!(matches!(
                     gqa_attention_scratch(backend, 7, dtype, 1, 4, 1, 64, 8192, false).unwrap(),
@@ -4097,7 +4105,7 @@ mod tests {
                 false
             )
             .unwrap(),
-            GqaAttentionScratch::Phase2a { .. }
+            GqaAttentionScratch::BlasSoftmax { .. }
         ));
         assert!(matches!(
             gqa_attention_scratch(
@@ -4120,7 +4128,7 @@ mod tests {
     fn general_half_scratch_reserves_and_binds_the_complete_core_layout() {
         for dtype in [DataType::Float16, DataType::BFloat16] {
             let scratch = gqa_attention_scratch(
-                GroupQueryAttentionBackend::Phase2a,
+                GroupQueryAttentionBackend::NoFlashPrefill,
                 7,
                 dtype,
                 2,
@@ -4131,7 +4139,10 @@ mod tests {
                 false,
             )
             .unwrap();
-            let GqaAttentionScratch::Phase2a { layout: phase2a } = scratch else {
+            let GqaAttentionScratch::BlasSoftmax {
+                layout: blas_softmax,
+            } = scratch
+            else {
                 panic!("general half scratch");
             };
             let composite =
@@ -4150,13 +4161,13 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                composite.phase2a_offset,
-                gqa_align_up(staging.total_bytes, phase2a.alignment()).unwrap()
+                composite.blas_softmax_offset,
+                gqa_align_up(staging.total_bytes, blas_softmax.alignment()).unwrap()
             );
-            assert_eq!(composite.phase2a_bytes, phase2a.bytes());
+            assert_eq!(composite.blas_softmax_bytes, blas_softmax.bytes());
             assert_eq!(
                 composite.total_bytes,
-                composite.phase2a_offset + phase2a.bytes()
+                composite.blas_softmax_offset + blas_softmax.bytes()
             );
             assert_eq!(
                 composite.scores_bytes, 0,
@@ -4165,7 +4176,7 @@ mod tests {
             let view =
                 |address, bytes| WorkspaceView::new(DevicePtrMut(address as *mut c_void), bytes);
             assert!(
-                bind_gqa_phase2a_scratch(
+                bind_gqa_blas_softmax_scratch(
                     scratch,
                     &composite,
                     Some(view(0x1000, composite.total_bytes))
@@ -4179,7 +4190,7 @@ mod tests {
                 Some(view(0x1000, composite.total_bytes - 1)),
                 Some(view(usize::MAX - 255, composite.total_bytes)),
             ] {
-                let error = bind_gqa_phase2a_scratch(scratch, &composite, backing)
+                let error = bind_gqa_blas_softmax_scratch(scratch, &composite, backing)
                     .err()
                     .expect("invalid prepared backing");
                 assert!(error.to_string().contains("workspace"), "{error}");
@@ -4187,7 +4198,7 @@ mod tests {
         }
         assert!(
             gqa_attention_scratch(
-                GroupQueryAttentionBackend::Phase2a,
+                GroupQueryAttentionBackend::NoFlashPrefill,
                 7,
                 DataType::Float16,
                 usize::MAX,
@@ -4240,7 +4251,12 @@ mod tests {
     fn attention_route_selects_matrix_scratch_only_for_reference_or_general_half() {
         use GqaAttentionRoute::*;
         let route = |dtype, q_seq, dim| {
-            gqa_attention_route(GroupQueryAttentionBackend::Phase2a, dtype, q_seq, dim)
+            gqa_attention_route(
+                GroupQueryAttentionBackend::NoFlashPrefill,
+                dtype,
+                q_seq,
+                dim,
+            )
         };
         assert_eq!(route(DataType::Float32, 8, 64), ReferenceF32);
         for dim in [64, 192, 512] {
@@ -4250,7 +4266,7 @@ mod tests {
             assert_eq!(route(DataType::Float32, 1, dim), ReferenceF32);
         }
         for dtype in [DataType::Float16, DataType::BFloat16] {
-            assert_eq!(route(dtype, 8, 64), Phase2a);
+            assert_eq!(route(dtype, 8, 64), BlasSoftmax);
         }
         assert_eq!(
             gqa_attention_route(GroupQueryAttentionBackend::Fused, DataType::Float16, 8, 64),
@@ -4371,13 +4387,18 @@ mod tests {
             num_heads,
             kv_heads,
             false,
-            GroupQueryAttentionBackend::Phase2a,
+            GroupQueryAttentionBackend::NoFlashPrefill,
             7,
         )
         .unwrap();
-        let core =
-            phase2a_scratch_layout(AttentionDtype::F16, batch, num_heads, q_seq, cache + q_seq)
-                .unwrap();
+        let core = blas_softmax_scratch_layout(
+            AttentionDtype::F16,
+            batch,
+            num_heads,
+            q_seq,
+            cache + q_seq,
+        )
+        .unwrap();
         assert_eq!(
             forced_half.bytes,
             (2 * gqa_align_up(f16_tensor, GQA_SCORES_ALIGN).unwrap() + core.bytes()).div_ceil(256)

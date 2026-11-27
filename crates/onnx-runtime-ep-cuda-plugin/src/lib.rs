@@ -65,7 +65,7 @@ mod cuda_impl {
         _context: *mut ort::OrtKernelContext,
     ) -> *mut ort::OrtStatus {
         onnx_runtime_ep_plugin::status::fail_status(
-            "pkg.nxrt::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
+            "pkg.nxrt._private::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
         )
     }
 
@@ -183,7 +183,7 @@ mod cuda_impl {
             );
         };
         let mut domain = ptr::null_mut();
-        let status = unsafe { create_domain(c"pkg.nxrt".as_ptr(), &mut domain) };
+        let status = unsafe { create_domain(c"pkg.nxrt._private".as_ptr(), &mut domain) };
         if !status.is_null() {
             return status;
         }
@@ -317,6 +317,42 @@ mod cuda_impl {
             ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
         )]
         #[test]
+        fn cast_keeps_shipped_ort_descriptors() {
+            use onnx_runtime_ir::DataType::*;
+
+            let (_, _, entries, _) = construct_ep_with_stream().expect("CUDA device 0");
+            let mut ranges = Vec::new();
+            for entry in entries
+                .iter()
+                .filter(|e| matches!(e.op_type, "Cast" | "CastLike"))
+            {
+                assert_eq!(entry.domain, "");
+                assert_eq!(
+                    entry.supported_dtypes,
+                    &[
+                        Float32, Float16, BFloat16, Int8, Int16, Int32, Int64, Uint8, Uint16,
+                        Uint32, Uint64, Bool
+                    ]
+                );
+                assert!(entry.input_dtype_constraints.is_empty());
+                assert!(entry.output_dtype_constraints.is_empty());
+                ranges.push((entry.op_type, entry.since_version, entry.end_version));
+            }
+            assert_eq!(
+                ranges,
+                [
+                    ("Cast", 1, 27),
+                    ("Cast", 28, i32::MAX),
+                    ("CastLike", 1, i32::MAX)
+                ]
+            );
+        }
+
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
+        #[test]
         fn conv_transpose_keeps_legacy_advertisement_and_compilation() {
             use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId};
 
@@ -378,9 +414,9 @@ mod cuda_impl {
         #[test]
         fn advertised_schema_ranges_end_before_the_next_registered_version() {
             let mut descriptors = vec![
-                descriptor("DsaIndexSelect", "pkg.nxrt", 1),
-                descriptor("DsaIndexSelect", "pkg.nxrt", 3),
-                descriptor("Other", "pkg.nxrt", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt._private", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt._private", 3),
+                descriptor("Other", "pkg.nxrt._private", 1),
             ];
 
             assert_eq!(schema_end_version(&descriptors, 0), 2);
@@ -485,8 +521,20 @@ pub unsafe extern "C" fn CreateEpFactories(
                     stream_handle,
                 )
             };
-            if status.is_null() && !out_factories.is_null() && max_factories != 0 {
+            if status.is_null()
+                && !out_factories.is_null()
+                && max_factories != 0
+                && !out_num_raw.is_null()
+                && unsafe { *out_num_raw } > 0
+            {
                 let factory = unsafe { *out_factories };
+                // SAFETY: the live factory has its registry and has not yet been exposed to ORT.
+                unsafe {
+                    onnx_runtime_ep_plugin::factory::exclude_operators(
+                        factory,
+                        onnx_runtime_ep_plugin::ep::SHIPPED_ORT_EXCLUSIONS,
+                    );
+                }
                 let api = unsafe {
                     (*api_base)
                         .GetApi
@@ -511,6 +559,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                 // release retain the provider's cross-stream settlement fences.
                 // Compute errors retire the lane. This does not grant external
                 // graph capture any workspace pin or bypass capture validation.
+                // The live factory has its registry and has not been returned to ORT.
                 return unsafe {
                     onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(
                         factory,
@@ -828,6 +877,55 @@ pub extern "C" fn nxrt_cuda_reset_dsa_launch_stats() {
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+    #[test]
+    fn cuda_factory_advertises_linear_attention_only_through_28() {
+        use onnx_genai_ort_sys as ort;
+        use std::ptr;
+
+        let host = onnx_runtime_ort_testkit::ort_test_process().expect("pinned ORT test host");
+        let get_api_base: libloading::Symbol<'_, unsafe extern "C" fn() -> *const ort::OrtApiBase> =
+            unsafe { host.library().get(b"OrtGetApiBase") }.expect("ORT exports OrtGetApiBase");
+        let mut factory = ptr::null_mut();
+        let mut count = 0;
+        let status = unsafe {
+            super::CreateEpFactories(
+                ptr::null(),
+                get_api_base(),
+                ptr::null(),
+                &mut factory,
+                1,
+                &mut count,
+            )
+        };
+        assert!(status.is_null(), "CUDA factory creation must succeed");
+        assert_eq!(count, 1, "the test requires a real CUDA factory");
+        assert!(!factory.is_null());
+        // The Rust-linked export returns this adapter's ExportedFactory.
+        let entries = unsafe {
+            &(*factory.cast::<onnx_runtime_ep_plugin::factory::ExportedFactory>())
+                .kernel_registry_entries
+        };
+        let ranges: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.domain.is_empty() && entry.op_type == "LinearAttention")
+            .map(|entry| (entry.since_version, entry.end_version))
+            .collect();
+        let mut causal_ranges: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.op_type == "CausalConvWithState")
+            .map(|entry| (entry.domain, entry.since_version, entry.end_version))
+            .collect();
+        let status = unsafe { super::ReleaseEpFactory(factory) };
+        assert!(status.is_null());
+        assert_eq!(ranges, [(27, 28)]);
+        causal_ranges.sort_unstable();
+        assert_eq!(
+            causal_ranges,
+            [("", 27, 28), ("com.microsoft", 1, i32::MAX)]
+        );
+    }
 
     /// Verify that a panicking constructor is caught at the macro guard boundary.
     #[test]

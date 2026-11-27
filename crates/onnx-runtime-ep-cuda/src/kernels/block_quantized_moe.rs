@@ -1,4 +1,4 @@
-//! CUDA implementation of the `pkg.nxrt::BlockQuantizedMoE` operator
+//! CUDA implementation of the `pkg.nxrt._private::BlockQuantizedMoE` operator
 //! (mixed-projection ABI).
 //!
 //! This is the CUDA counterpart to the CPU parity oracle
@@ -62,7 +62,6 @@ pub use onnx_runtime_ep_api::BlockQuantizedMoeTraffic;
 
 const OP: &str = "BlockQuantizedMoE";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
-const LAYOUT_VERSION: i64 = 1;
 
 const MODULE: &str = "block_quantized_moe_v2";
 const ROUTE_ENTRY: &str = "bqmoe_route";
@@ -450,6 +449,7 @@ impl MoeAttributes {
             if !matches!(
                 name.as_str(),
                 "k" | "activation_type"
+                    | "activation_arithmetic"
                     | "normalize_routing_weights"
                     | "swiglu_fusion"
                     | "activation_alpha"
@@ -513,16 +513,6 @@ impl MoeAttributes {
         (self.activation == Activation::Swiglu && self.swiglu_fusion == 0)
             || (self.activation == Activation::Silu && has_fc3)
     }
-}
-
-fn parse_layout_version(node: &Node) -> Result<()> {
-    let layout_version = int_attr(node, "block_layout_version", LAYOUT_VERSION)?;
-    if layout_version != LAYOUT_VERSION {
-        return Err(error(format!(
-            "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-        )));
-    }
-    Ok(())
 }
 
 /// Per-projection native formats for CUDA validation and dispatch.
@@ -1362,7 +1352,7 @@ impl BlockQuantizedMoEFactory {
         node: &Node,
         input_shapes: &[Vec<usize>],
     ) -> Result<BlockQuantizedMoEKernel> {
-        parse_layout_version(node)?;
+        super::packed_arithmetic::validate(node)?;
         let attributes = MoeAttributes::from_node(node)?;
         let formats = parse_projection_formats(node)?;
         let geometry = PreparedMoeGeometry::new(node, input_shapes, attributes, formats)?;
@@ -1408,6 +1398,9 @@ pub(crate) fn unsupported_reason(
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
+    if let Err(error) = super::packed_arithmetic::validate(node) {
+        return Some(Cow::Owned(error.to_string()));
+    }
     let formats = match claim_projection_formats(node) {
         Ok(formats) => formats,
         Err(reason) => return Some(reason),
@@ -1416,21 +1409,7 @@ pub(crate) fn unsupported_reason(
         Ok(attributes) => attributes,
         Err(reason) => return Some(Cow::Owned(reason.to_string())),
     };
-    if let Some(attribute) = node.attr("block_layout_version") {
-        match attribute.as_int() {
-            Some(version) if version == LAYOUT_VERSION => {}
-            Some(version) => {
-                return Some(Cow::Owned(format!(
-                    "BlockQuantizedMoE: CUDA requires block_layout_version={LAYOUT_VERSION}, got {version} — re-export the packed weights with the current layout"
-                )));
-            }
-            None => {
-                return Some(Cow::Borrowed(
-                    "BlockQuantizedMoE: block_layout_version must be an integer — re-export the packed weights with the current layout",
-                ));
-            }
-        }
-    }
+
     // The CUDA kernel is Phase-2 all-f32: activations, router logits/weights, and
     // the output are Float32; packed weights and the optional FC3 weights are
     // Uint8. Decline anything else so the CPU oracle keeps ownership.
@@ -3100,6 +3079,33 @@ mod claim_gate_tests {
         assert!(
             reason.contains("fp4_planar"),
             "unexpected rejection reason: {reason}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_claim_tests {
+    #[test]
+    fn claim_refuses_quantized_arithmetic_before_device_or_format_resolution() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "BlockQuantizedMoE",
+            vec![],
+            vec![],
+        );
+        node.attributes.insert(
+            "activation_arithmetic".into(),
+            onnx_runtime_ir::Attribute::String(b"q8_0".to_vec()),
+        );
+        node.attributes.insert(
+            "block_layout_version".into(),
+            onnx_runtime_ir::Attribute::Int(2),
+        );
+        let reason = super::unsupported_reason(&node, &[], &[])
+            .expect("CUDA must decline explicit q8 arithmetic");
+        assert!(
+            reason.contains("activation_arithmetic") && reason.contains("CUDA EP"),
+            "{reason}"
         );
     }
 }

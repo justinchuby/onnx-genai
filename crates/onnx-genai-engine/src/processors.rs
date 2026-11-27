@@ -46,12 +46,14 @@ pub(crate) fn build_processor_chain(
     options: &GenerateOptions,
     tokenizer: Option<&Tokenizer>,
     has_custom_sampler: bool,
+    decoder: Option<std::sync::Arc<crate::byte_stream::ByteStreamContract>>,
 ) -> anyhow::Result<ProcessorChain> {
     anyhow::ensure!(
         options.minimum_indent == 0 || tokenizer.is_some(),
         "minimum_indent requires the model tokenizer; declare a tokenizer before requesting indentation stopping"
     );
     let mut chain = ProcessorChain::new();
+    chain.bind_publication_decoder(decoder.clone());
     // A temperature-zero stage still runs at its requested position. Only an
     // explicit greedy policy bypasses stochastic warpers before terminal selection.
     let samples = !options.greedy || has_custom_sampler;
@@ -84,7 +86,8 @@ pub(crate) fn build_processor_chain(
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
+            | GenerateConstraint::Lark { prefix, .. }
+            | GenerateConstraint::XmlToolCall { prefix, .. } => prefix.as_str(),
             GenerateConstraint::Gbnf { .. }
             | GenerateConstraint::RawLark { .. }
             | GenerateConstraint::LazyJsonSchema { .. } => "",
@@ -158,7 +161,7 @@ pub(crate) fn build_processor_chain(
                             crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?
                         }
                     };
-                    let constraint = llguidance::panic_utils::catch_unwind(
+                    let constraint = onnx_genai_llguidance::panic_utils::catch_unwind(
                         std::panic::AssertUnwindSafe(|| {
                             LlguidanceConstraint::from_token_bytes(
                                 GrammarConstraintKind::Lark, &lark, contract.pieces, &endings, "",
@@ -191,8 +194,11 @@ pub(crate) fn build_processor_chain(
                     kind(),
                     &prefix(plain),
                     max_bytes,
-                    endings(),
-                    &options.effective_preserved_tokens(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )?)
             }
             GenerateConstraint::JsonSchema {
@@ -207,25 +213,32 @@ pub(crate) fn build_processor_chain(
                     kind(),
                     &prefix(plain),
                     max_bytes,
-                    endings(),
-                    &options.effective_preserved_tokens(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )?)
             }
             GenerateConstraint::Regex {
                 pattern,
                 prefix: plain,
             } => {
-                if let Some(projection) = projection {
+                if projection.is_some()
+                    || decoder.is_some()
+                    || crate::byte_stream::ByteStreamContract::requests_literal_stream(tokenizer)?
+                {
                     Box::new(crate::response_constraint::ContentConstraint::text(
                         tokenizer,
                         &crate::config::TextGrammar::Regex(pattern.clone()),
-                        crate::text_projection::ProjectionKind::Declared(
-                            projection.template().clone(),
-                        ),
-                        projection.prefix(),
+                        kind(),
+                        &prefix(plain),
                         max_bytes,
-                        endings(),
-                        &options.effective_preserved_tokens(),
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
                     )?)
                 } else {
                     build_llguidance_constraint(
@@ -239,21 +252,57 @@ pub(crate) fn build_processor_chain(
                     )?
                 }
             }
-            GenerateConstraint::Lark {
+            GenerateConstraint::XmlToolCall {
                 grammar,
                 prefix: plain,
             } => {
-                if let Some(projection) = projection {
-                    Box::new(crate::response_constraint::ContentConstraint::text(
-                        tokenizer,
-                        &crate::config::TextGrammar::Lark(grammar.clone()),
+                let (kind, prefix) = if let Some(projection) = projection {
+                    (
                         crate::text_projection::ProjectionKind::Declared(
                             projection.template().clone(),
                         ),
                         projection.prefix(),
+                    )
+                } else {
+                    (
+                        crate::text_projection::ProjectionKind::Plain,
+                        plain.as_str(),
+                    )
+                };
+                Box::new(
+                    crate::response_constraint::ContentConstraint::xml_tool_call(
+                        tokenizer,
+                        grammar,
+                        kind,
+                        prefix,
                         max_bytes,
-                        endings(),
-                        &options.effective_preserved_tokens(),
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
+                    )?,
+                )
+            }
+            GenerateConstraint::Lark {
+                grammar,
+                prefix: plain,
+            } => {
+                if projection.is_some()
+                    || decoder.is_some()
+                    || crate::byte_stream::ByteStreamContract::requests_literal_stream(tokenizer)?
+                {
+                    Box::new(crate::response_constraint::ContentConstraint::text(
+                        tokenizer,
+                        &crate::config::TextGrammar::Lark(grammar.clone()),
+                        kind(),
+                        &prefix(plain),
+                        max_bytes,
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
                     )?)
                 } else {
                     build_llguidance_constraint(
@@ -569,7 +618,47 @@ pub(crate) fn device_sampling_plan(
 
 pub(crate) fn load_fim_config_from_model_dir(
     model_dir: &Path,
+    metadata: &onnx_genai_metadata::InferenceMetadata,
+    tokenizer: &Tokenizer,
 ) -> anyhow::Result<Option<FimConfig>> {
+    if let Some(declaration) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.infill.as_ref())
+    {
+        for (role, spelling) in [
+            ("prefix_token", &declaration.prefix_token),
+            ("middle_token", &declaration.middle_token),
+            ("suffix_token", &declaration.suffix_token),
+        ]
+        .into_iter()
+        .chain(
+            declaration
+                .additional_stop_tokens
+                .iter()
+                .map(|spelling| ("additional_stop_tokens", spelling)),
+        ) {
+            let id = tokenizer.token_id(spelling).with_context(||format!("package.infill.{role} {spelling:?} is absent from the package tokenizer; declare an exact registered control token"))?;
+            anyhow::ensure!(
+                tokenizer.encode_with_options(
+                    spelling,
+                    onnx_genai_ort::TokenizationOptions {
+                        add_special: false,
+                        parse_special: true
+                    }
+                ).with_context(|| format!("encode package.infill.{role} {spelling:?}; repair the declared tokenizer control token"))? == [id],
+                "package.infill.{role} must encode to its one declared tokenizer ID; register the control token explicitly"
+            );
+        }
+        return Ok(Some(FimConfig {
+            prefix_token: declaration.prefix_token.clone(),
+            middle_token: declaration.middle_token.clone(),
+            suffix_token: declaration.suffix_token.clone(),
+            format: declaration.order,
+            additional_stop_tokens: declaration.additional_stop_tokens.clone(),
+            extra_context_template: declaration.extra_context_template.clone(),
+        }));
+    }
     let tokenizer_config = model_dir.join("tokenizer_config.json");
     if !tokenizer_config.is_file() {
         return Ok(None);
@@ -611,7 +700,10 @@ fn build_llguidance_constraint(
                 let piece = bytes
                     .get_mut(usize::try_from(id)?)
                     .context("special grammar token is outside the declared byte vocabulary")?;
-                piece.insert(0, llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER);
+                piece.insert(
+                    0,
+                    onnx_genai_llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER,
+                );
             }
         }
         return LlguidanceConstraint::from_token_bytes_with_prefix(
@@ -648,7 +740,7 @@ fn tokenizer_token_texts(tokenizer: &Tokenizer) -> anyhow::Result<Vec<Option<Str
     let mut token_texts = vec![None; max_id + 1];
     for &id in vocab.values() {
         token_texts[id as usize] = Some(
-            llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| tokenizer.decode(&[id]).map_err(anyhow::Error::from)))
+            onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| tokenizer.decode(&[id]).map_err(anyhow::Error::from)))
                 .with_context(|| format!("decode vocabulary token {id} for sampling; repair tokenizer.decoder or this vocabulary entry"))?
         );
     }
@@ -738,7 +830,7 @@ mod device_portability_tests {
             ..Default::default()
         };
         options.validate().unwrap();
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert_eq!(chain.names(), vec!["dynamic_temperature"]);
         assert!(!is_device_portable_chain(&chain));
         assert_eq!(
@@ -764,7 +856,7 @@ mod device_portability_tests {
     /// stages, preserving the standard device sampling configuration.
     #[test]
     fn a_top_k_top_p_chain_is_device_portable() {
-        let chain = build_processor_chain(&options_with(40, 0.95), None, false)
+        let chain = build_processor_chain(&options_with(40, 0.95), None, false, None)
             .expect("standard sampling options build a chain");
         assert!(
             chain.names().contains(&"top_k_top_p"),
@@ -833,7 +925,7 @@ mod device_portability_tests {
     /// calls `_get_logits_warper`.
     #[test]
     fn a_greedy_request_builds_no_sampling_warpers() {
-        let chain = build_processor_chain(&greedy_options(every_warper()), None, false)
+        let chain = build_processor_chain(&greedy_options(every_warper()), None, false, None)
             .expect("greedy options build a chain");
         assert!(
             chain.names().is_empty(),
@@ -853,7 +945,7 @@ mod device_portability_tests {
                 dynamic_temperature,
                 ..every_warper()
             };
-            let chain = build_processor_chain(&options, None, false)
+            let chain = build_processor_chain(&options, None, false, None)
                 .expect("sampling options build a chain");
             let names = chain.names();
             let temperature_stage = if dynamic_temperature.is_some() {
@@ -890,7 +982,8 @@ mod device_portability_tests {
             stop_sequences: vec![crate::logits::StopSequence::Text("<|end|>".into())],
             ..Default::default()
         });
-        let chain = build_processor_chain(&options, None, false).expect("options build a chain");
+        let chain =
+            build_processor_chain(&options, None, false, None).expect("options build a chain");
         assert_eq!(
             chain.names(),
             vec!["stop_sequence", "penalties"],
@@ -907,7 +1000,7 @@ mod device_portability_tests {
             penalty_window: Some(0),
             ..Default::default()
         });
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert!(chain.is_empty());
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
@@ -922,7 +1015,7 @@ mod device_portability_tests {
     fn a_custom_sampler_keeps_the_warpers_a_greedy_request_would_drop() {
         let options = greedy_options(every_warper());
         let chain =
-            build_processor_chain(&options, None, true).expect("custom-sampler chain builds");
+            build_processor_chain(&options, None, true, None).expect("custom-sampler chain builds");
         assert!(
             chain.names().contains(&"top_k") && chain.names().contains(&"top_p"),
             "a custom sampler samples; it needs the distribution, got {:?}",
@@ -943,7 +1036,7 @@ mod device_portability_tests {
             top_k: 2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert!(chain.names().contains(&"temperature"));
         assert!(options.selects_greedily());
         let mut logits = vec![3.0, 1.0, 2.0];
@@ -951,7 +1044,7 @@ mod device_portability_tests {
             .process(&mut logits, &ProcessorContext::default())
             .unwrap();
         assert_eq!(logits, vec![3.0, f32::NEG_INFINITY, f32::NEG_INFINITY]);
-        let raw = build_processor_chain(&greedy_options(options), None, false).unwrap();
+        let raw = build_processor_chain(&greedy_options(options), None, false, None).unwrap();
         assert!(raw.is_empty());
     }
 
@@ -969,7 +1062,8 @@ mod device_portability_tests {
             stop_sequences: vec![crate::logits::StopSequence::Text("<|end|>".into())],
             ..Default::default()
         });
-        let chain = build_processor_chain(&options, None, false).expect("options build a chain");
+        let chain =
+            build_processor_chain(&options, None, false, None).expect("options build a chain");
         assert_eq!(
             chain.names(),
             vec!["stop_sequence"],
@@ -997,7 +1091,7 @@ mod device_portability_tests {
             }),
         ] {
             let chain =
-                build_processor_chain(&options, None, false).expect("options build a chain");
+                build_processor_chain(&options, None, false, None).expect("options build a chain");
             assert!(!chain.is_empty(), "the penalty must survive greedy");
             assert_eq!(
                 device_sampling_plan(&chain, &options, false, true, true),
@@ -1012,7 +1106,7 @@ mod device_portability_tests {
     #[test]
     fn dropping_the_truncation_warpers_does_not_move_the_greedy_token() {
         let raw: Vec<f32> = vec![0.5, -3.0, 9.25, 1.0, 8.5, -1.0, 2.0, 0.0];
-        let sampling_chain = build_processor_chain(&options_with(4, 0.5), None, false)
+        let sampling_chain = build_processor_chain(&options_with(4, 0.5), None, false, None)
             .expect("sampling options build a chain");
         let mut processed = raw.clone();
         sampling_chain
@@ -1033,7 +1127,7 @@ mod device_portability_tests {
     #[test]
     fn top_k_alone_and_top_p_alone_stay_device_portable() {
         for (top_k, top_p, expected) in [(40usize, 1.0f32, "top_k"), (0, 0.95, "top_p")] {
-            let chain = build_processor_chain(&options_with(top_k, top_p), None, false)
+            let chain = build_processor_chain(&options_with(top_k, top_p), None, false, None)
                 .expect("chain builds");
             assert!(
                 chain.names().contains(&expected),
@@ -1055,7 +1149,8 @@ mod device_sampling_plan_tests {
     use crate::config::GenerateOptions;
 
     fn empty_chain() -> ProcessorChain {
-        build_processor_chain(&GenerateOptions::default(), None, false).expect("empty chain builds")
+        build_processor_chain(&GenerateOptions::default(), None, false, None)
+            .expect("empty chain builds")
     }
 
     fn history_chain() -> ProcessorChain {
@@ -1063,7 +1158,8 @@ mod device_sampling_plan_tests {
             repetition_penalty: 1.2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).expect("penalty chain builds");
+        let chain =
+            build_processor_chain(&options, None, false, None).expect("penalty chain builds");
         assert!(!chain.is_empty(), "repetition penalty must add a processor");
         assert!(
             !is_device_portable_chain(&chain),
@@ -1203,7 +1299,7 @@ mod logit_bias_tests {
             logit_bias: [(0, LogitBias::Ban), (2, LogitBias::Add(10.0))].into(),
             ..GenerateOptions::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert!(!is_device_portable_chain(&chain));
         let mut logits = vec![9.0, 3.0, 1.0];
         chain
@@ -1246,6 +1342,7 @@ mod ordered_sampler_tests {
             &options(vec![SamplerStage::Temperature, SamplerStage::TopP]),
             None,
             false,
+            None,
         )
         .unwrap()
         .process(&mut before, &ProcessorContext::default())
@@ -1254,6 +1351,7 @@ mod ordered_sampler_tests {
             &options(vec![SamplerStage::TopP, SamplerStage::Temperature]),
             None,
             false,
+            None,
         )
         .unwrap()
         .process(&mut after, &ProcessorContext::default())
@@ -1265,7 +1363,7 @@ mod ordered_sampler_tests {
     fn sampler_order_omissions_and_repetitions_are_load_bearing() {
         let mut options = options(vec![]);
         options.temperature = 0.0;
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert!(chain.is_empty());
         assert!(
             !options.selects_greedily(),
@@ -1278,7 +1376,7 @@ mod ordered_sampler_tests {
         options.temperature = 2.0;
         options.sampler_order =
             Some(SamplerSequence::new(vec![SamplerStage::Temperature; 2]).unwrap());
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let mut logits = vec![4.0, 0.0];
         chain
             .process(&mut logits, &ProcessorContext::default())
@@ -1292,13 +1390,13 @@ mod ordered_sampler_tests {
     #[test]
     fn sampler_device_capability_checks_order_parameters_and_real_implementation() {
         let ordered = options(vec![SamplerStage::Temperature, SamplerStage::TopP]);
-        let fixed = build_processor_chain(&ordered, None, false).unwrap();
+        let fixed = build_processor_chain(&ordered, None, false, None).unwrap();
         assert_eq!(
             device_sampling_plan(&fixed, &ordered, false, true, true),
             DeviceSamplingPlan::Sampled
         );
         let reverse = options(vec![SamplerStage::TopP, SamplerStage::Temperature]);
-        let chain = build_processor_chain(&reverse, None, false).unwrap();
+        let chain = build_processor_chain(&reverse, None, false, None).unwrap();
         assert_eq!(
             device_sampling_plan(&chain, &reverse, false, true, true),
             DeviceSamplingPlan::Host
@@ -1337,7 +1435,7 @@ mod ordered_sampler_tests {
             ),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert_eq!(chain.names(), vec!["top_k", "temperature"]);
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
@@ -1350,7 +1448,7 @@ mod ordered_sampler_tests {
         precision_options.temperature = f32::MAX;
         precision_options.top_k = 1;
         let mut ranked_first = vec![1e-30, 2e-30];
-        build_processor_chain(&precision_options, None, false)
+        build_processor_chain(&precision_options, None, false, None)
             .unwrap()
             .process(&mut ranked_first, &ProcessorContext::default())
             .unwrap();
@@ -1359,7 +1457,7 @@ mod ordered_sampler_tests {
             SamplerSequence::new(vec![SamplerStage::Temperature, SamplerStage::TopK]).unwrap(),
         );
         let mut scaled_first = vec![1e-30, 2e-30];
-        let chain = build_processor_chain(&precision_options, None, false).unwrap();
+        let chain = build_processor_chain(&precision_options, None, false, None).unwrap();
         chain
             .process(&mut scaled_first, &ProcessorContext::default())
             .unwrap();
@@ -1379,7 +1477,7 @@ mod ordered_sampler_tests {
             ])
             .unwrap(),
         );
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert_eq!(chain.names(), vec!["top_k_top_p", "temperature"]);
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
@@ -1402,7 +1500,7 @@ mod ordered_sampler_tests {
             ..Default::default()
         };
         let mut logits = vec![3.0, 3.0, -100.0, -100.0];
-        build_processor_chain(&options, None, false)
+        build_processor_chain(&options, None, false, None)
             .unwrap()
             .process(&mut logits, &ProcessorContext::default())
             .unwrap();
@@ -1412,7 +1510,7 @@ mod ordered_sampler_tests {
             SamplerSequence::new(vec![SamplerStage::TopNSigma, SamplerStage::Temperature]).unwrap(),
         );
         let mut logits = vec![3.0, 3.0, -100.0, -100.0];
-        build_processor_chain(&options, None, false)
+        build_processor_chain(&options, None, false, None)
             .unwrap()
             .process(&mut logits, &ProcessorContext::default())
             .unwrap();
@@ -1486,7 +1584,7 @@ mod ordered_sampler_tests {
             ),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert_eq!(chain.names(), ["temperature", "adaptive_p"]);
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
@@ -1494,7 +1592,7 @@ mod ordered_sampler_tests {
         );
         options.adaptive_p.target = -1.0;
         assert_eq!(
-            build_processor_chain(&options, None, false)
+            build_processor_chain(&options, None, false, None,)
                 .unwrap()
                 .names(),
             ["temperature"]
@@ -1502,7 +1600,7 @@ mod ordered_sampler_tests {
         options.adaptive_p.target = 0.2;
         options.sampler_order = None;
         assert!(
-            !build_processor_chain(&options, None, false)
+            !build_processor_chain(&options, None, false, None,)
                 .unwrap()
                 .names()
                 .contains(&"adaptive_p")
@@ -1514,7 +1612,7 @@ mod ordered_sampler_tests {
             version: crate::MirostatVersion::V2,
         });
         assert_eq!(
-            build_processor_chain(&options, None, false)
+            build_processor_chain(&options, None, false, None,)
                 .unwrap()
                 .names(),
             ["temperature", "mirostat_v2"]
@@ -1542,7 +1640,7 @@ mod ordered_sampler_tests {
             ..Default::default()
         };
         assert_eq!(
-            build_processor_chain(&options, None, false)
+            build_processor_chain(&options, None, false, None,)
                 .unwrap()
                 .names(),
             vec!["temperature", "mirostat_v2"]
@@ -1605,7 +1703,7 @@ mod ordered_sampler_tests {
             ),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert_eq!(
             device_sampling_plan(&chain, &options, false, true, true),
             DeviceSamplingPlan::Greedy
@@ -1765,7 +1863,7 @@ mod lark_prefill_tests {
                 greedy: true,
                 ..Default::default()
             };
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             let mut logits = vec![0.0; 32];
             chain
                 .process(
@@ -1790,7 +1888,7 @@ mod lark_prefill_tests {
             max_constraint_bytes: 2,
             ..Default::default()
         };
-        let error = match build_processor_chain(&options, Some(&tokenizer), false) {
+        let error = match build_processor_chain(&options, Some(&tokenizer), false, None) {
             Ok(_) => panic!("oversized raw Lark must be rejected"),
             Err(error) => error,
         };
@@ -1854,7 +1952,7 @@ mod lark_prefill_tests {
                     eos_token_id: Some(3),
                     ..Default::default()
                 };
-                let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+                let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
                 let mut logits = [0.0; 32];
                 chain
                     .process(&mut logits, &ProcessorContext::default())
@@ -1917,7 +2015,7 @@ mod lark_prefill_tests {
             greedy: true,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         for (history, expected) in [
             (vec![], Some(31)),
             (vec![31], None),
@@ -1964,7 +2062,7 @@ mod lark_prefill_tests {
                 grammar: format!("root ::= {literal:?}"),
             });
             let literal_chain =
-                build_processor_chain(&literal_options, Some(&tokenizer), false).unwrap();
+                build_processor_chain(&literal_options, Some(&tokenizer), false, None).unwrap();
             let mut logits = [0.0; 32];
             literal_chain
                 .process(&mut logits, &ProcessorContext::default())
@@ -1990,7 +2088,7 @@ mod lark_prefill_tests {
             let invalid_path = scratch.path().join(format!("{case}.json"));
             std::fs::write(&invalid_path, serde_json::to_vec(&invalid_vocab).unwrap()).unwrap();
             let invalid_tokenizer = Tokenizer::from_file(invalid_path).unwrap();
-            let error = build_processor_chain(&options, Some(&invalid_tokenizer), false)
+            let error = build_processor_chain(&options, Some(&invalid_tokenizer), false, None)
                 .err()
                 .expect("unsupported byte contract must be explicit");
             assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
@@ -2011,7 +2109,7 @@ mod lark_prefill_tests {
                 activation: None,
                 grammar: grammar.into(),
             });
-            let error = build_processor_chain(&invalid, Some(&tokenizer), false)
+            let error = build_processor_chain(&invalid, Some(&tokenizer), false, None)
                 .err()
                 .expect("invalid token reference");
             assert!(format!("{error:#}").contains("grammar token"), "{error:#}");
@@ -2042,7 +2140,7 @@ mod lark_prefill_tests {
             greedy: true,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         let mut logits = vec![0.0; 32];
         chain
             .process(&mut logits, &ProcessorContext::default())
@@ -2094,7 +2192,8 @@ mod lark_prefill_tests {
             ..Default::default()
         };
         for (prefix, expected) in [("", 4), ("hello", 5), ("helloworld", 3)] {
-            let chain = build_processor_chain(&options(prefix), Some(&tokenizer), false).unwrap();
+            let chain =
+                build_processor_chain(&options(prefix), Some(&tokenizer), false, None).unwrap();
             let mut logits = vec![0.0; 32];
             chain
                 .process(&mut logits, &ProcessorContext::default())
@@ -2121,7 +2220,7 @@ mod lark_prefill_tests {
                 assert!(!logits[4].is_finite() && !logits[5].is_finite());
             }
         }
-        let error = build_processor_chain(&options("world"), Some(&tokenizer), false)
+        let error = build_processor_chain(&options("world"), Some(&tokenizer), false, None)
             .err()
             .expect("invalid grammar prefill must be rejected");
         assert!(

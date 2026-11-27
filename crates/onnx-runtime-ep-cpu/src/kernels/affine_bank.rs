@@ -210,16 +210,6 @@ pub(super) struct AffineBank<'a> {
     zero: u8,
 }
 impl<'a> AffineBank<'a> {
-    pub(super) fn new(
-        codes: &'a TensorView<'_>,
-        scales: &'a TensorView<'_>,
-        zeros: Option<&'a TensorView<'_>>,
-        [experts, width, depth]: [usize; 3],
-        block: usize,
-        zero: u8,
-    ) -> Result<Self> {
-        Self::prepare(codes, scales, zeros, [experts, width, depth], block, zero)?.validate()
-    }
     /// Validate metadata and Host address proofs without reading scale values.
     pub(super) fn prepare(
         codes: &'a TensorView<'_>,
@@ -282,15 +272,25 @@ impl<'a> AffineBank<'a> {
         zeros: Option<Row<'_, u8>>,
         input: &[f32],
     ) -> f32 {
-        input.iter().enumerate().fold(0.0, |sum, (col, &x)| {
-            let p = col / self.block;
-            let q = (codes.get::<DENSE>(col / 2) >> ((col % 2) * 4)) & 15;
-            let z = zeros
+        let mut sum = 0.0;
+        // Metadata proves that block is positive and divides depth. Scale and
+        // zero point are constant within a block; resolve them once rather than
+        // dividing/reading parameters for every weight. Preserve each column's
+        // rounded weight, multiplication and accumulation in its original order.
+        for (p, values) in input.chunks_exact(self.block).enumerate() {
+            let scale = scales.get::<DENSE>(p);
+            let zero = zeros
                 .as_ref()
                 .map_or(self.zero, |z| (z.get::<DENSE>(p / 2) >> ((p % 2) * 4)) & 15);
-            let weight = f32::from(i16::from(q) - i16::from(z)) * scales.get::<DENSE>(p);
-            sum + x * weight
-        })
+            let start = p * self.block;
+            for (offset, &x) in values.iter().enumerate() {
+                let col = start + offset;
+                let q = (codes.get::<DENSE>(col / 2) >> ((col % 2) * 4)) & 15;
+                let weight = f32::from(i16::from(q) - i16::from(zero)) * scale;
+                sum += x * weight;
+            }
+        }
+        sum
     }
 }
 

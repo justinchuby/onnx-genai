@@ -81,7 +81,9 @@ plugin EPs (via C ABI bridge) handle them.
 | Tile | 6 | Repeat for broadcasting. |
 | Range | 11, 27 | Arithmetic progression; opset 27 adds FP16/BF16 with FLOAT or DOUBLE intermediates. |
 | CausalConvWithState | 27 | Depthwise causal convolution with optional bias and input carry; emits the last `K−1` samples. |
+| CausalConvWithState | 29 | Standalone nxrt CPU/CUDA with positive `dilation` (default 1), retaining `(K−1) * dilation` raw samples across chunks; an empty chunk preserves state. ORT plugins retain the opset-27 and contrib schemas only. |
 | LinearAttention | 27 | Packed recurrent attention, all four update rules, forward GQA, and a separately typed state. Contrib behavior is unchanged. |
+| LinearAttention | 29 | Adds compact Q/K with independent value and state heads, plus optional post-update state snapshots for every token on native CPU and CUDA. |
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
 | ScatterElements | 11 | Native CPU/CUDA; opset 29 adds mean reduction. |
@@ -107,6 +109,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | InstanceNormalization | 6 | Style transfer, diffusion. |
 | DepthToSpace | 1 | Super-resolution, diffusion. |
 | SpaceToDepth | 1 | |
+| ReverseSequence | 10, 28 | Standalone CPU/CUDA only. Fixed-width tensors; standalone execution accepts BF16 from opset 10, although ONNX first lists it in the opset 28 schema. Mixed managed-string/Int64 inputs are not supported. |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
 | Compress | 9 | |

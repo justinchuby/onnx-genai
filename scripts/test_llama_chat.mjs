@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Real-browser chat, network recovery and active-reload tests against ONNX fixtures.
-// Usage: node scripts/test_llama_chat.mjs [absolute path to playwright/index.mjs] [screenshot.png]
-// Requires a built target/debug/onnx-genai-server and Chrome. Run under the
+// Usage: node scripts/test_llama_chat.mjs [playwright/index.mjs] [screenshot.png] [server-binary]
+// Requires a built server binary (default target/debug/onnx-genai-server) and Chrome. Run under the
 // host's shared workload lock when other sessions are measuring performance.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -12,6 +12,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { createServer, request as httpRequest } from 'node:http';
+
+// Reserve a fixture port without competing with another local development server.
+async function unusedPort() {
+  const reservation = createServer();
+  reservation.listen(0, '127.0.0.1');
+  await once(reservation, 'listening');
+  const port = reservation.address().port;
+  const closed = once(reservation, 'close');
+  reservation.close();
+  await closed;
+  return port;
+}
 
 // Expand only the position table of this known fixture, deriving its name and
 // dimensions from the graph. Runtime code and the maintained fixture stay intact.
@@ -80,10 +92,10 @@ async function stopServer(process) {
 
 // A real network fault, not an inference stub: end only the first browser
 // reader after its first SSE chunk. The backend producer continues independently.
-async function disconnectingProxy() {
+async function disconnectingProxy(backendPort) {
   let disconnected = 0;
   const proxy = createServer((incoming, outgoing) => {
-    const upstream = httpRequest({ hostname: '127.0.0.1', port: 18081,
+    const upstream = httpRequest({ hostname: '127.0.0.1', port: backendPort,
       path: incoming.url, method: incoming.method, headers: incoming.headers }, response => {
       outgoing.writeHead(response.statusCode, response.headers);
       outgoing.flushHeaders();
@@ -109,9 +121,9 @@ async function disconnectingProxy() {
     });
     incoming.pipe(upstream);
   });
-  proxy.listen(18082, '127.0.0.1');
+  proxy.listen(0, '127.0.0.1');
   await once(proxy, 'listening');
-  return { server: proxy, disconnectCount: () => disconnected };
+  return { server: proxy, origin: `http://127.0.0.1:${proxy.address().port}`, disconnectCount: () => disconnected };
 }
 
 async function longGenerationRequests(page, outputTokens) {
@@ -169,10 +181,10 @@ async function stopActiveGeneration(browser, origin, outputTokens) {
 
 async function activeReload(browser) {
   const fixture = await longContextFixture();
-  const backendOrigin = 'http://127.0.0.1:18081';
-  const origin = 'http://127.0.0.1:18082';
-  const server = spawn('target/debug/onnx-genai-server', [fixture.directory,
-    '--model-id', 'browser-reconnect-fixture', '--addr', '127.0.0.1:18081',
+  const backendPort = await unusedPort();
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const server = spawn(serverBinary, [fixture.directory,
+    '--model-id', 'browser-reconnect-fixture', '--addr', `127.0.0.1:${backendPort}`,
     '--max-output-tokens', String(fixture.outputTokens), '--replay-buffer-bytes', String(32 * 1024 * 1024)
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   let diagnostics = '';
@@ -180,7 +192,8 @@ async function activeReload(browser) {
   let page, proxy;
   try {
     await waitForServer(backendOrigin, server, () => diagnostics);
-    proxy = await disconnectingProxy();
+    proxy = await disconnectingProxy(backendPort);
+    const origin = proxy.origin;
     page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
     const errors = [], posts = [], replayRequests = [];
     page.on('pageerror', error => errors.push(error.message));
@@ -270,10 +283,11 @@ async function activeReload(browser) {
   }
 }
 
+const serverBinary = process.argv[4] || 'target/debug/onnx-genai-server';
 const { chromium } = await import(process.argv[2] ? pathToFileURL(process.argv[2]).href : 'playwright');
-const port = 18080;
+const port = await unusedPort();
 const origin = `http://127.0.0.1:${port}`;
-const server = spawn('target/debug/onnx-genai-server', [
+const server = spawn(serverBinary, [
   'tests/fixtures/tiny-llm', '--addr', `127.0.0.1:${port}`, '--max-output-tokens', '32'
 ], { stdio: ['ignore', 'pipe', 'pipe'] });
 let diagnostics = '';
@@ -300,9 +314,14 @@ try {
   const firstResponse = await responsePromise;
   assert(firstResponse.ok(), `chat request failed: ${firstResponse.status()} ${await firstResponse.text()}`);
   await firstResponse.finished();
+  // Navigation can retire Chrome's response-body handle. Capture the completed
+  // wire bytes once while that document is live, then compare replay after reload.
+  const originalWire = await firstResponse.text();
+  const conversationId = (await firstResponse.request().allHeaders())['x-conversation-id'];
+  assert(conversationId, 'UI did not identify its conversation for resumable streaming');
   const payload = firstResponse.request().postDataJSON();
   assert(!payload.tools?.length, 'UI attached tools to a model that explicitly declares no tool protocol');
-  const wireAnswer = (await firstResponse.text()).split('\n')
+  const wireAnswer = originalWire.split('\n')
     .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
     .flatMap(line => JSON.parse(line.slice(6)).choices ?? [])
     .map(choice => choice.delta?.content ?? '').join('');
@@ -318,9 +337,6 @@ try {
   await page.reload({ waitUntil: 'networkidle' });
   await page.getByLabel('User message with actions', { exact: true }).first().waitFor({ timeout: 15000 });
   assert((await page.locator('body').innerText()).includes('hello'), 'conversation was not restored after reload');
-  const conversationId = (await firstResponse.request().allHeaders())['x-conversation-id'];
-  assert(conversationId, 'UI did not identify its conversation for resumable streaming');
-  const originalWire = await firstResponse.text();
   const replay = await page.evaluate(async ({ origin, conversationId }) => {
     const response = await fetch(`${origin}/v1/stream?conv_id=${encodeURIComponent(conversationId)}&from=0`);
     return { status: response.status, body: await response.text() };

@@ -89,6 +89,18 @@ __device__ float op_gelu_tanh(float x) {
     return x * 0.5f * (1.0f + tanhf(inner));
 }
 
+#define DEFINE_GELU_F64(NAME, EXPR) \
+extern "C" __global__ void NAME##_f64(const double* x, double* y, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) { \
+        const double v = x[i]; \
+        y[i] = isinf(v) && v < 0.0 ? 0.0 : (EXPR); \
+    } \
+}
+
+DEFINE_GELU_F64(gelu, (0.5 * v) * (1.0 + erf(v * 0.7071067811865475244)))
+DEFINE_GELU_F64(gelu_tanh, (0.5 * v) * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v))))
+
 __device__ float op_add(float a, float b) { return a + b; }
 __device__ float op_sub(float a, float b) { return a - b; }
 __device__ float op_mul(float a, float b) { return a * b; }
@@ -304,13 +316,14 @@ extern "C" __global__ void decomposed_silu_bf16(
 /// NVRTC module names (one module holds all unary / all binary entries so a
 /// runtime compiles each source string at most once — see
 /// [`CudaRuntime::nvrtc_function`]).
-const POINTWISE_MODULE: &str = "elementwise_float_v5";
+const POINTWISE_MODULE: &str = "elementwise_float_v6";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloatDtype {
     F32,
     F16,
     Bf16,
+    F64,
 }
 
 impl FloatDtype {
@@ -330,6 +343,7 @@ impl FloatDtype {
             Self::F32 => "f32",
             Self::F16 => "f16",
             Self::Bf16 => "bf16",
+            Self::F64 => "f64",
         }
     }
 }
@@ -344,7 +358,8 @@ pub enum UnaryOp {
     Sigmoid,
     Silu,
     Gelu,
-    GeluTanh,
+    StandardGeluExact,
+    StandardGeluTanh,
 }
 
 impl UnaryOp {
@@ -356,13 +371,27 @@ impl UnaryOp {
             UnaryOp::Tanh => "tanh",
             UnaryOp::Sigmoid => "sigmoid",
             UnaryOp::Silu => "silu",
-            UnaryOp::Gelu => "gelu",
-            UnaryOp::GeluTanh => "gelu_tanh",
+            UnaryOp::Gelu | UnaryOp::StandardGeluExact => "gelu",
+            UnaryOp::StandardGeluTanh => "gelu_tanh",
         }
     }
 
     fn entry(self, dtype: FloatDtype) -> String {
         format!("{}_{}", self.stem(), dtype.suffix())
+    }
+
+    fn dtype(self, dtype: DataType) -> Result<FloatDtype> {
+        if matches!(self, Self::StandardGeluExact | Self::StandardGeluTanh) {
+            return match dtype {
+                DataType::Float64 => Ok(FloatDtype::F64),
+                _ => FloatDtype::from_onnx("Gelu", "X", dtype).map_err(|_| {
+                    not_implemented(format!(
+                        "Gelu with X dtype {dtype:?} (supported: Float16, Float32, Float64, BFloat16)"
+                    ))
+                }),
+            };
+        }
+        FloatDtype::from_onnx(self.op_name(), "input", dtype)
     }
 
     /// ONNX op type this maps to (for error messages).
@@ -374,8 +403,7 @@ impl UnaryOp {
             UnaryOp::Tanh => "Tanh",
             UnaryOp::Sigmoid => "Sigmoid",
             UnaryOp::Silu => "Silu",
-            UnaryOp::Gelu => "Gelu",
-            UnaryOp::GeluTanh => "Gelu",
+            UnaryOp::Gelu | UnaryOp::StandardGeluExact | UnaryOp::StandardGeluTanh => "Gelu",
         }
     }
 }
@@ -502,22 +530,29 @@ pub struct StandardGeluFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
+impl StandardGeluFactory {
+    fn op(node: &Node) -> Result<UnaryOp> {
+        match node.attr("approximate") {
+            None => Ok(UnaryOp::StandardGeluExact),
+            Some(attribute) => match attribute.as_str() {
+                Some("none") => Ok(UnaryOp::StandardGeluExact),
+                Some("tanh") => Ok(UnaryOp::StandardGeluTanh),
+                _ => Err(EpError::KernelFailed(
+                    "cuda_ep Gelu: approximate must be 'none' or 'tanh'".into(),
+                )),
+            },
+        }
+    }
+
+    pub(super) fn validate(node: &Node, dtype: DataType) -> Result<()> {
+        Self::op(node)?.dtype(dtype).map(|_| ())
+    }
+}
+
 impl KernelFactory for StandardGeluFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let op = match node.attr("approximate") {
-            None => UnaryOp::Gelu,
-            Some(attribute) => match attribute.as_str() {
-                Some("none") => UnaryOp::Gelu,
-                Some("tanh") => UnaryOp::GeluTanh,
-                _ => {
-                    return Err(EpError::KernelFailed(
-                        "cuda_ep Gelu: approximate must be 'none' or 'tanh'".into(),
-                    ));
-                }
-            },
-        };
         Ok(Box::new(UnaryKernel {
-            op,
+            op: Self::op(node)?,
             runtime: self.runtime.clone(),
             decomposed_silu: false,
             last_capture_safe_signature: Mutex::new(None),
@@ -559,8 +594,8 @@ impl UnaryKernel {
             )));
         }
         let x = &inputs[0];
-        let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
-        if dtype != FloatDtype::F32 {
+        let dtype = self.op.dtype(x.dtype)?;
+        if matches!(dtype, FloatDtype::F16 | FloatDtype::Bf16) {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
         if outputs[0].dtype != x.dtype {
@@ -629,8 +664,8 @@ impl UnaryKernel {
                 UnaryOp::Relu => 1,
                 UnaryOp::Sqrt | UnaryOp::Erf | UnaryOp::Tanh => 1,
                 UnaryOp::Sigmoid | UnaryOp::Silu => 4,
-                UnaryOp::Gelu => 6,
-                UnaryOp::GeluTanh => 9,
+                UnaryOp::Gelu | UnaryOp::StandardGeluExact => 6,
+                UnaryOp::StandardGeluTanh => 9,
             };
             (n as u64).saturating_mul(per_element)
         });
@@ -762,7 +797,7 @@ impl BroadcastMetadataCache {
             "binary broadcast metadata",
             |key| key.a_shape == a_shape && key.b_shape == b_shape && key.out_shape == out_shape,
             || {
-                let metadata = broadcast_metadata(a_shape, b_shape, out_shape);
+                let metadata = broadcast_metadata(a_shape, b_shape, out_shape)?;
                 Ok((
                     BroadcastMetadataKey {
                         a_shape: a_shape.to_vec(),
@@ -1130,20 +1165,20 @@ pub(crate) fn capture_shape_eligible(seq_independent: bool, _shape: &[usize]) ->
     seq_independent
 }
 
-pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
+pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Result<Vec<u64>> {
     let mut metadata = out.iter().map(|&d| d as u64).collect::<Vec<_>>();
-    metadata.extend(broadcast_strides(a, out));
-    metadata.extend(broadcast_strides(b, out));
+    metadata.extend(broadcast_strides(a, out)?);
+    metadata.extend(broadcast_strides(b, out)?);
     if metadata.is_empty() {
         metadata.push(0);
     }
-    metadata
+    Ok(metadata)
 }
 
-pub(crate) fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
-    let contiguous = onnx_runtime_ir::compute_contiguous_strides(input);
+pub(crate) fn broadcast_strides(input: &[usize], out: &[usize]) -> Result<Vec<u64>> {
+    let contiguous = onnx_runtime_ir::compute_contiguous_strides(input)?;
     let leading = out.len() - input.len();
-    (0..out.len())
+    Ok((0..out.len())
         .map(|axis| {
             if axis < leading {
                 0
@@ -1156,7 +1191,7 @@ pub(crate) fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
                 }
             }
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) fn u64_bytes(values: &[u64]) -> &[u8] {
@@ -1183,7 +1218,7 @@ mod tests {
             UnaryOp::Sigmoid,
             UnaryOp::Silu,
             UnaryOp::Gelu,
-            UnaryOp::GeluTanh,
+            UnaryOp::StandardGeluTanh,
         ];
         for op in ops {
             // Every advertised entry must be present verbatim in the NVRTC source.
@@ -1192,6 +1227,27 @@ mod tests {
                 "missing NVRTC generator for {}",
                 op.op_name()
             );
+        }
+    }
+
+    #[test]
+    fn only_standard_gelu_unary_modes_resolve_float64() {
+        for (op, expected) in [
+            (UnaryOp::StandardGeluExact, "gelu_f64"),
+            (UnaryOp::StandardGeluTanh, "gelu_tanh_f64"),
+        ] {
+            assert_eq!(op.entry(op.dtype(DataType::Float64).unwrap()), expected);
+        }
+        for op in [
+            UnaryOp::Gelu,
+            UnaryOp::Relu,
+            UnaryOp::Sqrt,
+            UnaryOp::Erf,
+            UnaryOp::Tanh,
+            UnaryOp::Sigmoid,
+            UnaryOp::Silu,
+        ] {
+            assert!(op.dtype(DataType::Float64).is_err(), "{op:?}");
         }
     }
 
@@ -1263,9 +1319,21 @@ mod tests {
 
     #[test]
     fn broadcast_strides_are_right_aligned_and_zero_for_expanded_axes() {
-        assert_eq!(broadcast_strides(&[4, 1, 3], &[4, 5, 3]), [3, 0, 1]);
-        assert_eq!(broadcast_strides(&[1, 5, 3], &[4, 5, 3]), [0, 3, 1]);
-        assert_eq!(broadcast_strides(&[3], &[4, 5, 3]), [0, 0, 1]);
+        assert_eq!(
+            broadcast_strides(&[4, 1, 3], &[4, 5, 3])
+                .expect("fixture shape has representable contiguous strides"),
+            [3, 0, 1]
+        );
+        assert_eq!(
+            broadcast_strides(&[1, 5, 3], &[4, 5, 3])
+                .expect("fixture shape has representable contiguous strides"),
+            [0, 3, 1]
+        );
+        assert_eq!(
+            broadcast_strides(&[3], &[4, 5, 3])
+                .expect("fixture shape has representable contiguous strides"),
+            [0, 0, 1]
+        );
     }
 
     #[test]
@@ -1767,7 +1835,11 @@ extern "C" __global__ void read_after_delay(
         let new_a = [1usize, 4];
         let new_b = [4usize];
         let new_out = [1usize, 4];
-        let metadata_bytes = u64_bytes(&broadcast_metadata(&old_a, &old_b, &old_out)).len();
+        let metadata_bytes = u64_bytes(
+            &broadcast_metadata(&old_a, &old_b, &old_out)
+                .expect("fixture shape has representable contiguous strides"),
+        )
+        .len();
 
         let mut cache = BroadcastMetadataCache::new(runtime.clone());
         let old_ptr = cache.prepare(&old_a, &old_b, &old_out).unwrap();

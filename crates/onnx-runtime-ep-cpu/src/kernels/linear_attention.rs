@@ -56,6 +56,7 @@
 //! (RULES.md §2) without changing the arithmetic.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::linear_attention::{Heads, has_trajectory};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
@@ -91,8 +92,8 @@ impl UpdateRule {
 
 pub struct LinearAttentionKernel {
     standard: bool,
-    q_num_heads: usize,
-    kv_num_heads: usize,
+    trajectory: bool,
+    heads: Heads,
     update_rule: UpdateRule,
     /// `None` => resolve to `1 / sqrt(d_k)` at execute time.
     scale: Option<f32>,
@@ -102,25 +103,10 @@ pub struct LinearAttentionFactory;
 
 impl KernelFactory for LinearAttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let read_heads = |name: &str| -> Result<usize> {
-            node.attr(name)
-                .and_then(|a| a.as_int())
-                .and_then(|v| usize::try_from(v).ok())
-                .filter(|&v| v > 0)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(format!(
-                        "LinearAttention: `{name}` must be a positive integer"
-                    ))
-                })
-        };
-        let q_num_heads = read_heads("q_num_heads")?;
-        let kv_num_heads = read_heads("kv_num_heads")?;
-        let standard = node.is_default_domain() && node.local_opset().is_some_and(|v| v >= 27);
-        if standard && !q_num_heads.is_multiple_of(kv_num_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "LinearAttention-27: q_num_heads={q_num_heads} must be a positive multiple of kv_num_heads={kv_num_heads}"
-            )));
-        }
+        let opset = matches!(node.domain.as_str(), "" | "ai.onnx")
+            .then(|| node.local_opset().unwrap_or(27));
+        let heads = Heads::from_node(node, opset)
+            .map_err(|detail| EpError::KernelFailed(format!("LinearAttention: {detail}")))?;
 
         let update_rule = match node.attr("update_rule").and_then(|a| a.as_str()) {
             Some("linear") => UpdateRule::Linear,
@@ -142,9 +128,9 @@ impl KernelFactory for LinearAttentionFactory {
         };
 
         Ok(Box::new(LinearAttentionKernel {
-            standard,
-            q_num_heads,
-            kv_num_heads,
+            standard: opset.is_some(),
+            trajectory: opset.is_some_and(has_trajectory),
+            heads,
             update_rule,
             scale,
         }))
@@ -168,9 +154,12 @@ impl Kernel for LinearAttentionKernel {
                     DataType::Float32 | DataType::Float16 | DataType::BFloat16
                 )
             };
-            if outputs.len() != 2 || outputs[1].is_absent() {
+            if !(2..=if self.trajectory { 3 } else { 2 }).contains(&outputs.len())
+                || outputs[0].is_absent()
+                || outputs[1].is_absent()
+            {
                 return Err(EpError::KernelFailed(
-                    "LinearAttention-27: both output and present_state are required".into(),
+                    "LinearAttention: expected output and present_state, plus optional states in opset 29+".into(),
                 ));
             }
             if !supported(dtype)
@@ -182,9 +171,12 @@ impl Kernel for LinearAttentionKernel {
                     .any(|v| v.dtype != dtype)
                 || outputs[0].dtype != dtype
                 || outputs[1].dtype != state_dtype
+                || outputs
+                    .get(2)
+                    .is_some_and(|s| !s.is_absent() && s.dtype != state_dtype)
             {
                 return Err(EpError::KernelFailed(format!(
-                    "LinearAttention-27: activations must all use {dtype:?} and state {state_dtype:?}; supported types are Float32, Float16 and BFloat16"
+                    "LinearAttention: activations must all use {dtype:?} and state {state_dtype:?}; supported types are Float32, Float16 and BFloat16"
                 )));
             }
         }
@@ -206,65 +198,27 @@ impl Kernel for LinearAttentionKernel {
             )));
         }
 
-        let q_num_heads = self.q_num_heads;
-        let kv_num_heads = self.kv_num_heads;
+        let q_num_heads = self.heads.query;
+        let state_heads = self.heads.state;
         if !q_hidden.is_multiple_of(q_num_heads) {
             return Err(EpError::KernelFailed(format!(
                 "LinearAttention: query hidden {q_hidden} not divisible by q_num_heads {q_num_heads}"
             )));
         }
         let d_k = q_hidden / q_num_heads;
-        if d_k == 0 || !k_shape[2].is_multiple_of(d_k) {
+        let n_k_heads = self
+            .heads
+            .packed_key_heads(k_shape[2], d_k, self.standard)
+            .map_err(|detail| EpError::KernelFailed(format!("LinearAttention: {detail}")))?;
+        if !v_shape[2].is_multiple_of(state_heads) || (self.trajectory && v_shape[2] == 0) {
             return Err(EpError::KernelFailed(format!(
-                "LinearAttention: key hidden {} not divisible by d_k {d_k}",
-                k_shape[2]
-            )));
-        }
-        let n_k_heads = k_shape[2] / d_k;
-        if n_k_heads == 0 || (self.standard && n_k_heads != kv_num_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "LinearAttention: key has {n_k_heads} heads, expected {}",
-                if self.standard {
-                    kv_num_heads.to_string()
-                } else {
-                    "at least one".into()
-                }
-            )));
-        }
-        if !v_shape[2].is_multiple_of(kv_num_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "LinearAttention: value hidden {} not divisible by kv_num_heads {kv_num_heads}",
+                "LinearAttention: value hidden {} must be divisible by the state head count {state_heads} (and positive in opset 29+)",
                 v_shape[2]
             )));
         }
-        let d_v = v_shape[2] / kv_num_heads;
-
-        // Head mapping (mirrors ORT). Standard GQA: H_q >= H_kv. Inverse GQA:
-        // H_q < H_kv (heads_per_group = 0 signals the inverse mapping).
-        let heads_per_group = if q_num_heads >= kv_num_heads {
-            if !q_num_heads.is_multiple_of(kv_num_heads) {
-                return Err(EpError::KernelFailed(format!(
-                    "LinearAttention: q_num_heads {q_num_heads} must be a multiple of kv_num_heads \
-                     {kv_num_heads}"
-                )));
-            }
-            q_num_heads / kv_num_heads
-        } else {
-            if !kv_num_heads.is_multiple_of(q_num_heads) {
-                return Err(EpError::KernelFailed(format!(
-                    "LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of \
-                     q_num_heads {q_num_heads} (inverse GQA)"
-                )));
-            }
-            0
-        };
-        if !kv_num_heads.is_multiple_of(n_k_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of n_k_heads \
-                 {n_k_heads}"
-            )));
-        }
-        let kv_per_k_head = kv_num_heads / n_k_heads;
+        let d_v = v_shape[2] / state_heads;
+        let heads_per_group = self.heads.queries_per_state;
+        let kv_per_k_head = state_heads / n_k_heads;
 
         let scale = self.scale.unwrap_or_else(|| 1.0 / (d_k as f32).sqrt());
 
@@ -277,9 +231,7 @@ impl Kernel for LinearAttentionKernel {
                 decay.is_some(),
                 beta.is_some(),
             ) {
-                return Err(EpError::KernelFailed(format!(
-                    "LinearAttention-27: {detail}"
-                )));
+                return Err(EpError::KernelFailed(format!("LinearAttention: {detail}")));
             }
         } else if needs_decay && decay.is_none() {
             return Err(EpError::KernelFailed(
@@ -301,15 +253,14 @@ impl Kernel for LinearAttentionKernel {
                         "LinearAttention: decay must be [B={batch}, T={seq}, ...], got {s:?}"
                     )));
                 }
-                let per_key = if s[2] == kv_num_heads * d_k {
-                    true
-                } else if s[2] == kv_num_heads {
+                let per_key = if s[2] == state_heads {
                     false
+                } else if state_heads.checked_mul(d_k) == Some(s[2]) {
+                    true
                 } else {
                     return Err(EpError::KernelFailed(format!(
-                        "LinearAttention: decay last dim must be H_kv={kv_num_heads} or \
-                         H_kv·d_k={}, got {}",
-                        kv_num_heads * d_k,
+                        "LinearAttention: decay last dim must be the state head count {state_heads} or \
+                         that count times d_k={d_k}, got {}",
                         s[2]
                     )));
                 };
@@ -327,13 +278,13 @@ impl Kernel for LinearAttentionKernel {
                         "LinearAttention: beta must be [B={batch}, T={seq}, ...], got {s:?}"
                     )));
                 }
-                let per_head = if s[2] == kv_num_heads {
+                let per_head = if s[2] == state_heads {
                     true
                 } else if s[2] == 1 {
                     false
                 } else {
                     return Err(EpError::KernelFailed(format!(
-                        "LinearAttention: beta last dim must be H_kv={kv_num_heads} or 1, got {}",
+                        "LinearAttention: beta last dim must be the state head count {state_heads} or 1, got {}",
                         s[2]
                     )));
                 };
@@ -347,13 +298,13 @@ impl Kernel for LinearAttentionKernel {
         let v = to_dense_f32_widen("LinearAttention", &inputs[2])?;
 
         let state_per_head = d_k * d_v;
-        let total_state = batch * kv_num_heads * state_per_head;
+        let total_state = batch * state_heads * state_per_head;
+        let present_shape = [batch, state_heads, d_k, d_v];
         let state_init = if let Some(view) = past_state {
             let s = view.shape;
-            if s.len() != 4 || s[0] != batch || s[1] != kv_num_heads || s[2] != d_k || s[3] != d_v {
+            if s != present_shape {
                 return Err(EpError::KernelFailed(format!(
-                    "LinearAttention: past_state must be [B={batch}, H_kv={kv_num_heads}, \
-                     d_k={d_k}, d_v={d_v}], got {s:?}"
+                    "LinearAttention: past_state must have shape {present_shape:?}, got {s:?}"
                 )));
             }
             Some(to_dense_f32_widen("LinearAttention", view)?)
@@ -361,10 +312,36 @@ impl Kernel for LinearAttentionKernel {
             None
         };
 
-        let output_hidden = q_num_heads.max(kv_num_heads) * d_v;
+        let output_hidden = self.heads.output * d_v;
+        let mut trajectory = None;
+        if self.standard {
+            let output_shape = [batch, seq, output_hidden];
+            for (name, actual, expected) in [
+                ("output", outputs[0].shape, output_shape.as_slice()),
+                ("present_state", outputs[1].shape, present_shape.as_slice()),
+            ] {
+                if actual != expected {
+                    return Err(EpError::KernelFailed(format!(
+                        "LinearAttention: {name} must have shape {expected:?}, got {actual:?}"
+                    )));
+                }
+            }
+            if let Some(states) = outputs.get(2).filter(|s| !s.is_absent()) {
+                let expected = [batch, seq, state_heads, d_k, d_v];
+                if states.shape != expected {
+                    return Err(EpError::KernelFailed(format!(
+                        "LinearAttention: states must have shape {expected:?}, got {:?}",
+                        states.shape
+                    )));
+                }
+                trajectory = Some(vec![0.0; states.numel()]);
+            }
+        }
         let (primary_output, present_outputs) = outputs.split_at_mut(1);
         let output_len = batch * seq * output_hidden;
 
+        // Empty outputs can have a byte-aligned dangling pointer. Use the
+        // writeback path for them rather than forming a typed slice.
         // In-place-aliasing guard (see `dtype::output_direct_write_eligible`):
         // the present state and the primary output are written directly into
         // their executor buffers, but a persistent DeviceIoBinding may bind an
@@ -397,7 +374,8 @@ impl Kernel for LinearAttentionKernel {
         let mut owned_state;
         let (state, state_is_direct): (&mut [f32], bool) =
             if present_outputs.first_mut().is_some_and(|present| {
-                output_direct_write_eligible(present, total_state, &input_ranges)
+                total_state != 0
+                    && output_direct_write_eligible(present, total_state, &input_ranges)
             }) {
                 let present = present_outputs.first_mut().unwrap();
                 // SAFETY: the guard proved a host-accessible contiguous Float32
@@ -425,7 +403,7 @@ impl Kernel for LinearAttentionKernel {
         let direct_output = {
             let mut ranges = input_ranges;
             ranges.push(slice_byte_range(state));
-            output_direct_write_eligible(&primary_output[0], output_len, &ranges)
+            output_len != 0 && output_direct_write_eligible(&primary_output[0], output_len, &ranges)
         };
         let mut owned_output;
         let output: &mut [f32] = if direct_output {
@@ -445,7 +423,7 @@ impl Kernel for LinearAttentionKernel {
             d_k,
             d_v,
             q_num_heads,
-            kv_num_heads,
+            state_heads,
             n_k_heads,
             heads_per_group,
             output_hidden,
@@ -458,9 +436,9 @@ impl Kernel for LinearAttentionKernel {
 
         let mut retrieved = vec![0.0f32; d_v];
         for b in 0..batch {
-            for h_kv in 0..kv_num_heads {
+            for h_kv in 0..state_heads {
                 let h_k = h_kv / kv_per_k_head;
-                let s_off = (b * kv_num_heads + h_kv) * state_per_head;
+                let s_off = (b * state_heads + h_kv) * state_per_head;
                 process_head(
                     &mut state[s_off..s_off + state_per_head],
                     &q,
@@ -469,6 +447,7 @@ impl Kernel for LinearAttentionKernel {
                     decay_data.as_deref(),
                     beta_data.as_deref(),
                     output,
+                    trajectory.as_deref_mut(),
                     &mut retrieved,
                     b,
                     h_kv,
@@ -484,6 +463,9 @@ impl Kernel for LinearAttentionKernel {
         if !state_is_direct && let Some(present) = present_outputs.first_mut() {
             write_dense_f32_narrow("LinearAttention", present, state)?;
         }
+        if let Some(trajectory) = trajectory {
+            write_dense_f32_narrow("LinearAttention", &mut present_outputs[1], &trajectory)?;
+        }
         Ok(())
     }
 }
@@ -494,7 +476,7 @@ struct HeadParams {
     d_k: usize,
     d_v: usize,
     q_num_heads: usize,
-    kv_num_heads: usize,
+    state_heads: usize,
     n_k_heads: usize,
     heads_per_group: usize,
     output_hidden: usize,
@@ -518,6 +500,7 @@ fn process_head(
     decay: Option<&[f32]>,
     beta: Option<&[f32]>,
     output: &mut [f32],
+    mut trajectory: Option<&mut [f32]>,
     retrieved: &mut [f32],
     batch_idx: usize,
     h_kv: usize,
@@ -531,13 +514,13 @@ fn process_head(
     for t in 0..p.seq {
         let row = batch_idx * p.seq + t;
         let kt = &k[row * (p.n_k_heads * d_k) + h_k * d_k..][..d_k];
-        let vt = &v[row * (p.kv_num_heads * d_v) + h_kv * d_v..][..d_v];
+        let vt = &v[row * (p.state_heads * d_v) + h_kv * d_v..][..d_v];
 
         // ---- Step 1: decay S *= exp(g_t) ----
         if p.needs_decay {
             let decay = decay.expect("decay presence validated");
             if p.decay_per_key_dim {
-                let gt = &decay[row * (p.kv_num_heads * d_k) + h_kv * d_k..][..d_k];
+                let gt = &decay[row * (p.state_heads * d_k) + h_kv * d_k..][..d_k];
                 for (i, &g) in gt.iter().enumerate() {
                     let exp_g = g.exp();
                     let s_row = &mut state[i * d_v..i * d_v + d_v];
@@ -546,7 +529,7 @@ fn process_head(
                     }
                 }
             } else {
-                let exp_g = decay[row * p.kv_num_heads + h_kv].exp();
+                let exp_g = decay[row * p.state_heads + h_kv].exp();
                 for s in state.iter_mut() {
                     *s *= exp_g;
                 }
@@ -564,7 +547,7 @@ fn process_head(
             }
             // ---- Step 3: delta update  S += k_t ⊗ (beta·(v_t − r)) ----
             let bt = if p.beta_per_head {
-                beta.expect("beta presence validated")[row * p.kv_num_heads + h_kv]
+                beta.expect("beta presence validated")[row * p.state_heads + h_kv]
             } else {
                 beta.expect("beta presence validated")[row]
             };
@@ -589,6 +572,11 @@ fn process_head(
             }
         }
 
+        if let Some(states) = trajectory.as_deref_mut() {
+            let offset = (row * p.state_heads + h_kv) * state.len();
+            states[offset..offset + state.len()].copy_from_slice(state);
+        }
+
         // ---- Step 4: readout o_t = scale · q_tᵀ S (updated S) ----
         if p.heads_per_group > 0 {
             for g in 0..p.heads_per_group {
@@ -597,7 +585,7 @@ fn process_head(
             }
         } else {
             // Inverse GQA: this kv head's query head, output slot is h_kv.
-            let h_q = h_kv * p.q_num_heads / p.kv_num_heads;
+            let h_q = h_kv / (p.state_heads / p.q_num_heads);
             readout(q, output, state, row, h_q, h_kv, p);
         }
     }
@@ -785,6 +773,67 @@ mod tests {
         assert!(k.execute(&ins, &mut outs).is_err());
     }
 
+    #[test]
+    fn zero_tokens_preserve_state_with_empty_byte_backed_outputs() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+        let shape = [1, 0, 2];
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
+        let states_shape = [1, 0, 1, 2, 2];
+        let states_strides = compute_contiguous_strides(&states_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let empty = Owned::f32(&shape, &[]);
+        let past = [1.0, -2.0, 3.0, -4.0];
+        let past_state = Owned::f32(&[1, 1, 2, 2], &past);
+        let inputs = [empty.view(), empty.view(), empty.view(), past_state.view()];
+
+        for opset in [27, 29] {
+            let mut node = Node::new(NodeId(0), "LinearAttention", vec![], vec![]);
+            node.version = Some(opset);
+            node.attributes
+                .insert("q_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("kv_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("update_rule".into(), Attribute::String(b"linear".to_vec()));
+
+            let mut output = Vec::<u8>::new();
+            let mut states = Vec::<u8>::new();
+            let mut present_state = Owned::zeros_f32(&[1, 1, 2, 2]);
+            let mut outputs = vec![
+                TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr().cast()),
+                    DataType::Float32,
+                    &shape,
+                    &strides,
+                    DeviceId::cpu(),
+                ),
+                present_state.view_mut(),
+            ];
+            if opset == 29 {
+                outputs.push(TensorMut::new(
+                    DevicePtrMut(states.as_mut_ptr().cast()),
+                    DataType::Float32,
+                    &states_shape,
+                    &states_strides,
+                    DeviceId::cpu(),
+                ));
+            }
+            LinearAttentionFactory
+                .create(&node, &[])
+                .unwrap()
+                .execute(&inputs, &mut outputs)
+                .unwrap();
+            assert_eq!(outputs[0].numel(), 0);
+            if opset == 29 {
+                assert_eq!(outputs[2].numel(), 0);
+            }
+            assert_eq!(present_state.to_f32(), past);
+        }
+    }
+
     /// Persistent DeviceIoBindings may alias an input buffer onto an output
     /// buffer. The direct-write decode path must stay correct when the primary
     /// output aliases `v` or when `present_state` aliases `past_state` (the
@@ -848,7 +897,8 @@ mod tests {
             let state_ptr = shared_state.as_ptr() as *const std::ffi::c_void;
             let present_ptr = shared_state.as_mut_ptr() as *mut std::ffi::c_void;
             let sshape = [1usize, 1, 2, 2];
-            let sstrides = compute_contiguous_strides(&sshape);
+            let sstrides = compute_contiguous_strides(&sshape)
+                .expect("fixture shape has representable contiguous strides");
             let (q, kk, v, gd, bd) = (owned_q(), owned_k(), owned_v(), owned_g(), owned_beta());
             let mut out = Owned::zeros_f32(&[1, 1, 2]);
             let state_view = TensorView::new(DevicePtr(state_ptr), f32c, &sshape, &sstrides, cpu);
@@ -877,7 +927,8 @@ mod tests {
             let v_ptr = shared_v.as_ptr() as *const std::ffi::c_void;
             let out_ptr = shared_v.as_mut_ptr() as *mut std::ffi::c_void;
             let vshape = [1usize, 1, 2];
-            let vstrides = compute_contiguous_strides(&vshape);
+            let vstrides = compute_contiguous_strides(&vshape)
+                .expect("fixture shape has representable contiguous strides");
             let (q, kk, st, gd, bd) = (owned_q(), owned_k(), owned_st(), owned_g(), owned_beta());
             let mut present = Owned::zeros_f32(&[1, 1, 2, 2]);
             let v_view = TensorView::new(DevicePtr(v_ptr), f32c, &vshape, &vstrides, cpu);

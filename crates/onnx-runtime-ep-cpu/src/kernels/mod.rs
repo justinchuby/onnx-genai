@@ -182,7 +182,7 @@ static NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static STRING_ONLY: &[DataType] = &[DataType::String];
 static STRING_BOOL_DTYPES: &[DataType] = &[DataType::String, DataType::Bool];
 static STRING_I64_DTYPES: &[DataType] = &[DataType::String, DataType::Int64];
-/// Exact dtype union for `pkg.nxrt::DsaIndexSelect` edges.
+/// Exact dtype union for `pkg.nxrt._private::DsaIndexSelect` edges.
 ///
 /// Inputs 0..=2 accept the three compute floats, input 3 is f32, and the sole
 /// output is int64. Per-slot constraints below keep the input union from
@@ -307,6 +307,7 @@ pub fn input_dtype_constraints_for_op(
     static TEXT_STRING_INPUT: &[(usize, &[DataType])] = &[(0, STRING_ONLY)];
     static STRING_CONCAT_INPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, STRING_ONLY)];
     match (op_type, domain) {
+        ("ReverseSequence", "") => onnx_runtime_ep_api::reverse_sequence::INPUT_DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -321,7 +322,7 @@ pub fn input_dtype_constraints_for_op(
         ("STFT", "") => STFT_SLOTS,
         ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_SLOTS,
         ("RegexFullMatch", "") | ("StringSplit", "") => TEXT_STRING_INPUT,
         ("StringConcat", "") => STRING_CONCAT_INPUTS,
         _ => &[],
@@ -343,7 +344,7 @@ pub fn output_dtype_constraints_for_op(
     match (op_type, domain) {
         ("DFT", "") => DFT_OUTPUTS,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_OUTPUTS,
         ("RegexFullMatch", "") => REGEX_OUTPUTS,
         ("StringSplit", "") => STRING_SPLIT_OUTPUTS,
         _ => &[],
@@ -382,6 +383,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("Dropout", "")
         | ("Unique", "") => ALL_DTYPES,
 
+        ("ReverseSequence", "") => onnx_runtime_ep_api::reverse_sequence::DTYPES,
         ("StringConcat", "") => STRING_ONLY,
         ("RegexFullMatch", "") => STRING_BOOL_DTYPES,
         ("StringSplit", "") => STRING_I64_DTYPES,
@@ -548,6 +550,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
             DataType::Int64,
         ],
         ("CumSum", "") => ARITH_DTYPES,
+        ("RNN", "") => onnx_runtime_ep_api::rnn::DTYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
 
@@ -589,10 +592,10 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("MoE", "com.microsoft") => FLOAT_COMPUTE_DTYPES,
         ("QMoE", "com.microsoft") => F32_ONLY,
 
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_DTYPES,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_DTYPES,
 
-        // Remaining pkg.nxrt custom ops: f32-only (fail closed).
-        (_, "pkg.nxrt") => F32_ONLY,
+        // Remaining pkg.nxrt._private custom ops: f32-only (fail closed).
+        (_, onnx_runtime_ir::RUNTIME_DOMAIN) => F32_ONLY,
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
@@ -669,6 +672,7 @@ pub mod gelu;
 pub mod gemm;
 pub mod group_query_attention;
 mod half_gemm;
+mod random;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
@@ -679,6 +683,7 @@ mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
 pub mod hardmax;
+mod host_rows;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
@@ -709,7 +714,9 @@ pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
+mod reverse_sequence;
 pub mod rmsnorm;
+mod rnn;
 pub mod rotary_embedding;
 pub mod sdpa;
 pub mod selection;
@@ -881,6 +888,10 @@ pub const PHASE1_OPS: &[&str] = &[
     "Unique",
     "Pad",
     "ConstantOfShape",
+    "RandomNormal",
+    "RandomNormalLike",
+    "RandomUniform",
+    "RandomUniformLike",
     "Size",
     "Trilu",
     "GatherElements",
@@ -891,6 +902,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Compress",
     "Tile",
     "Range",
+    "RNN",
     "CumSum",
     "Clip",
     "ArgMax",
@@ -1096,17 +1108,28 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), true)
+    let mut registry =
+        build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), true);
+    register_standalone_linear_attention(&mut registry);
+    registry
 }
 
-/// Build the ORT CPU registry and derive its type-constraint advertisement.
+pub(crate) fn register_standalone_linear_attention(reg: &mut OpRegistry) {
+    reg.register(
+        OpKey::new("LinearAttention", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(linear_attention::LinearAttentionFactory),
+    );
+}
+
+/// Build the shared CPU registry and derive the ORT plugin's advertised keys.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
     let reg = build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), false);
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
 
-/// Derive one [`CpuOpDescriptor`] per entry in `reg`.
+/// Derive one [`CpuOpDescriptor`] per plugin-visible entry in `reg`.
 ///
 /// Reads the registry itself rather than a list accumulated during
 /// registration. Those two had drifted: `register_cnn_ops` takes `&mut
@@ -1119,11 +1142,12 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 /// `KernelRegistryEntry` list, and `node_passes_dtype_filter` fails closed on
 /// an op with no entry, so every one of those 18 was claimed by `supports_op`
 /// and then dropped at capability time -- handing it to ORT's CPU EP, which is
-/// exactly what this EP must never do. Deriving from the registry makes the
-/// two sets identical by construction instead of by convention.
+/// exactly what this EP must never do. Deriving from [`OpRegistry::plugin_keys`]
+/// keeps ordinary registrations aligned while allowing explicit native-only
+/// revisions whose storage ABI the shipped plugin must not advertise.
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
-        .keys()
+        .plugin_keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| {
@@ -1170,7 +1194,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::AffineFactory),
     );
     rec.register(
@@ -1179,7 +1203,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::PackedFactory),
     );
     rec.register(
@@ -1200,7 +1224,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     }
     rec.register(
         OpKey::new("GroupedMatMul", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::Factory),
     );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
@@ -1233,7 +1257,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(matmul_nbits::MatMulNBitsFactory::new(resources.clone())),
     );
     rec.register(
-        OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory::new(
             derived_weights.clone(),
@@ -1241,7 +1265,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         )),
     );
     rec.register(
-        OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory::new(
             derived_weights.clone(),
@@ -1249,22 +1273,22 @@ pub(crate) fn build_cpu_registry_with_resources(
         )),
     );
     rec.register(
-        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        OpKey::new("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(index_share::IndexShareFactory),
     );
     rec.register(
-        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        OpKey::new("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dsa_index_select::DsaIndexSelectFactory),
     );
     rec.register(
-        OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(varlen_attention::VarlenAttentionFactory),
     );
     rec.register(
-        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory),
     );
@@ -1274,12 +1298,16 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(packed_multi_head_attention::PackedMultiHeadAttentionFactory),
     );
     rec.register(
-        OpKey::new("SparseKvGather", "pkg.nxrt", 1),
+        OpKey::new("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
     );
     rec.register(
-        OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        OpKey::new(
+            "CompressedSparseAttention",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(compressed_sparse_attention::CompressedSparseAttentionFactory),
     );
@@ -1386,10 +1414,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
-    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    // The factory resolves the versioned dilation attribute for the standard op.
     rec.register_through(
         OpKey::new("CausalConvWithState", "", 27),
         28,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(causal_conv::CausalConvWithStateFactory),
+    );
+    rec.register(
+        OpKey::new("CausalConvWithState", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
@@ -1601,21 +1634,30 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::TanhFactory),
     );
-    rec.register(
-        OpKey::new("Cast", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: false }),
-    );
-    rec.register(
-        OpKey::new("Cast", "", 28),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: true }),
-    );
+    for opset in [1, 28] {
+        rec.register(
+            OpKey::new("Cast", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastFactory { opset }),
+        );
+    }
     rec.register(
         OpKey::new("CastLike", "", 15),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastLikeFactory),
+        Box::new(cast::CastLikeFactory { opset: 15 }),
     );
+    for opset in [19, 24] {
+        rec.register_native_only(
+            OpKey::new("Cast", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastFactory { opset }),
+        );
+        rec.register_native_only(
+            OpKey::new("CastLike", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastLikeFactory { opset }),
+        );
+    }
     rec.register(
         OpKey::new("BitCast", "", 26),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1724,6 +1766,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(constant_of_shape::ConstantOfShapeFactory),
     );
+    for op in onnx_runtime_ep_api::random::OPS {
+        for version in onnx_runtime_ep_api::random::VERSIONS {
+            rec.register(
+                OpKey::new(op, "", version),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(random::RandomFactory(version)),
+            );
+        }
+    }
     rec.register(
         OpKey::new("Constant", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -2073,6 +2124,13 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(movement_ops::TriluFactory),
     );
     // Indexed data movement and sequence construction.
+    for version in onnx_runtime_ep_api::reverse_sequence::VERSIONS {
+        rec.register(
+            OpKey::new("ReverseSequence", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(reverse_sequence::ReverseSequenceFactory(version)),
+        );
+    }
     rec.register(
         OpKey::new("GatherElements", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -2146,6 +2204,17 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("CumSum", "", 14),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::CumSumFactory),
+    );
+    rec.register_through(
+        OpKey::new("RNN", "", 14),
+        21,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(rnn::Factory),
+    );
+    rec.register(
+        OpKey::new("RNN", "", 22),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(rnn::Factory),
     );
     rec.register(
         OpKey::new("CumProd", "", 26),
@@ -2634,6 +2703,88 @@ pub(crate) mod testutil {
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 
+    /// Dense fixed-width fixture materialized with padded, reversed or packed
+    /// origins. Input shapes are positive and source bytes are canonical dense.
+    pub(crate) struct Repacked {
+        backing: Vec<u128>,
+        shape: Vec<usize>,
+        strides: Vec<i64>,
+        base: usize,
+        offset: usize,
+        dtype: DataType,
+    }
+    impl Repacked {
+        pub(crate) fn new(source: &Owned, mode: usize) -> Self {
+            let shape = source.shape.clone();
+            let width = source.dtype.byte_size();
+            let mut strides = compute_contiguous_strides(&shape)
+                .expect("fixture shape has representable contiguous strides");
+            if matches!(mode, 1..=3 | 5) {
+                let mut step = if mode == 2 { 2 } else { 1 };
+                for (axis, &dim) in shape.iter().enumerate().rev() {
+                    strides[axis] = step;
+                    step = step * dim as i64 + 3;
+                }
+            }
+            let extent = shape
+                .iter()
+                .zip(&strides)
+                .map(|(&d, &s)| (d - 1) * s as usize)
+                .sum::<usize>();
+            let offset = if mode == 3 {
+                extent * width
+            } else if mode == 5 {
+                (shape[0] - 1) * strides[0] as usize * width
+            } else {
+                0
+            };
+            if mode == 3 {
+                strides.iter_mut().for_each(|s| *s = -*s);
+            }
+            if mode == 5 {
+                strides[0] = -strides[0];
+            }
+            let base = usize::from(mode == 4);
+            let len = (extent + 1) * width + base;
+            let mut backing = vec![0xccccccccccccccccccccccccccccccccu128; len.div_ceil(16)];
+            let storage = unsafe {
+                std::slice::from_raw_parts_mut(
+                    backing.as_mut_ptr().cast::<u8>(),
+                    backing.len() * 16,
+                )
+            };
+            for (logical, value) in source.bytes.chunks_exact(width).enumerate() {
+                let mut n = logical;
+                let mut at = (offset + base) as i64;
+                for (axis, &dim) in shape.iter().enumerate().rev() {
+                    let coordinate = n % dim;
+                    n /= dim;
+                    at += coordinate as i64 * strides[axis] * width as i64;
+                }
+                let at = at as usize;
+                storage[at..at + width].copy_from_slice(value);
+            }
+            Self {
+                backing,
+                shape,
+                strides,
+                base,
+                offset,
+                dtype: source.dtype,
+            }
+        }
+        pub(crate) fn view(&self) -> TensorView<'_> {
+            TensorView::new(
+                DevicePtr(unsafe { self.backing.as_ptr().cast::<u8>().add(self.base).cast() }),
+                self.dtype,
+                &self.shape,
+                &self.strides,
+                DeviceId::cpu(),
+            )
+            .with_byte_offset(self.offset)
+        }
+    }
+
     pub trait PreparedTestKernel: onnx_runtime_ep_api::Kernel {
         fn execute_prepared(
             &self,
@@ -2815,7 +2966,8 @@ pub(crate) mod testutil {
 
     impl Owned {
         pub fn f32(shape: &[usize], data: &[f32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 4);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2829,7 +2981,8 @@ pub(crate) mod testutil {
         }
 
         pub fn f64(shape: &[usize], data: &[f64]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 8);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2843,7 +2996,8 @@ pub(crate) mod testutil {
         }
 
         pub fn i64(shape: &[usize], data: &[i64]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 8);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2857,7 +3011,8 @@ pub(crate) mod testutil {
         }
 
         pub fn i32(shape: &[usize], data: &[i32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 4);
             for v in data {
                 bytes.extend_from_slice(&v.to_le_bytes());
@@ -2872,7 +3027,8 @@ pub(crate) mod testutil {
 
         /// An f16 buffer built by rounding `data` (given in f32) to half.
         pub fn f16(shape: &[usize], data: &[f32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 2);
             for &v in data {
                 bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
@@ -2888,7 +3044,8 @@ pub(crate) mod testutil {
         /// An f16 buffer built from raw 16-bit patterns (for adversarial
         /// NaN/inf/denormal cases that must survive without f32-reinterpret).
         pub fn f16_bits(shape: &[usize], bits: &[u16]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(bits.len() * 2);
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
@@ -2903,7 +3060,8 @@ pub(crate) mod testutil {
 
         /// A bf16 buffer built by rounding `data` (given in f32) to bfloat16.
         pub fn bf16(shape: &[usize], data: &[f32]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(data.len() * 2);
             for &v in data {
                 bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes());
@@ -2918,7 +3076,8 @@ pub(crate) mod testutil {
 
         /// A bf16 buffer built from raw 16-bit patterns.
         pub fn bf16_bits(shape: &[usize], bits: &[u16]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut bytes = Vec::with_capacity(bits.len() * 2);
             for &b in bits {
                 bytes.extend_from_slice(&b.to_le_bytes());
@@ -2933,7 +3092,8 @@ pub(crate) mod testutil {
 
         /// A u8 buffer.
         pub fn u8(shape: &[usize], data: &[u8]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             Self {
                 bytes: data.to_vec(),
                 shape: shape.to_vec(),
@@ -2943,7 +3103,8 @@ pub(crate) mod testutil {
         }
 
         pub fn bool_(shape: &[usize], data: &[bool]) -> Self {
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let bytes = data.iter().map(|&b| b as u8).collect();
             Self {
                 bytes,
@@ -2962,10 +3123,10 @@ pub(crate) mod testutil {
         /// A zero-filled output buffer of `shape` with element type `dtype`.
         pub fn zeros(dtype: DataType, shape: &[usize]) -> Self {
             let n: usize = shape.iter().product();
-            let strides = compute_contiguous_strides(shape);
-            let esize = dtype.byte_size();
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             Self {
-                bytes: vec![0u8; n * esize],
+                bytes: vec![0u8; dtype.storage_bytes(n)],
                 shape: shape.to_vec(),
                 strides,
                 dtype,
@@ -3082,7 +3243,7 @@ mod tests {
 
     #[test]
     fn dsa_index_select_advertises_exact_mixed_edge_dtypes() {
-        let dtypes = supported_dtypes_for_op("DsaIndexSelect", "pkg.nxrt");
+        let dtypes = supported_dtypes_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(
             dtypes,
             &[
@@ -3093,7 +3254,8 @@ mod tests {
             ]
         );
 
-        let constraints = input_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt");
+        let constraints =
+            input_dtype_constraints_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(constraints.len(), 4);
         assert_eq!(constraints[0], (0, FLOAT_COMPUTE_DTYPES));
         assert_eq!(constraints[1], (1, FLOAT_COMPUTE_DTYPES));
@@ -3101,7 +3263,7 @@ mod tests {
         assert_eq!(constraints[3], (3, F32_ONLY));
 
         assert_eq!(
-            output_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt"),
+            output_dtype_constraints_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN),
             &[(0, I64_ONLY)]
         );
     }
@@ -3583,7 +3745,7 @@ mod tests {
         // the `com.microsoft::RotaryEmbedding` contrib alias adds one,
         // `com.microsoft::MultiHeadAttention` (separate-QKV SDPA) adds one, and
         // `com.microsoft::Attention` (packed-QKV SDPA) adds one.
-        // The six `pkg.nxrt` NCHWc blocked-layout ops (reorder to/from blocked,
+        // The six `pkg.nxrt._private` NCHWc blocked-layout ops (reorder to/from blocked,
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed). Standard
@@ -3591,7 +3753,7 @@ mod tests {
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
-        // standard-domain `CausalConvWithState` (opset 27) adds one alongside
+        // standard-domain `CausalConvWithState` (opsets 27 and 29) adds two alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
@@ -3601,12 +3763,17 @@ mod tests {
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast and Celu each add one registration.
         // MeanVarianceNormalization-29 adds one registration.
+        // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
+        // Opset-29 LinearAttention adds one standalone registration.
+        // RNN has separate opset-14-through-21 and opset-22 registrations.
+        // The four random generators each have a second (opset-22) revision.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 126
+                + 137
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
+                + onnx_runtime_ep_api::reverse_sequence::VERSIONS.len()
         );
         for op in PHASE1_OPS {
             let since = reg
@@ -3651,19 +3818,56 @@ mod tests {
         assert!(reg.lookup("QLinearMatMul", "", 10).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
-        assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("BlockQuantizedMoE", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("IndexShare", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("VarlenAttention", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("PackedVarlenAttention", "pkg.nxrt", 1).is_some());
+        assert_eq!(onnx_runtime_ir::RUNTIME_DOMAIN, "pkg.nxrt._private");
+        for key in reg
+            .keys()
+            .filter(|key| key.domain == onnx_runtime_ir::RUNTIME_DOMAIN)
+        {
+            assert!(
+                reg.lookup(&key.op_type, "pkg.nxrt", key.since_version)
+                    .is_none(),
+                "old private domain must not alias {} at opset {}",
+                key.op_type,
+                key.since_version
+            );
+        }
+        assert!(reg.lookup("MoE", "com.microsoft", 1).is_some());
+        assert!(reg.lookup("GroupedMatMul", "", 29).is_some());
+        assert!(
+            reg.lookup("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
         assert!(
             reg.lookup("PackedMultiHeadAttention", "com.microsoft", 1)
                 .is_some()
         );
-        assert!(reg.lookup("SparseKvGather", "pkg.nxrt", 1).is_some());
         assert!(
-            reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)
+            reg.lookup("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
                 .is_some()
+        );
+        assert!(
+            reg.lookup(
+                "CompressedSparseAttention",
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1
+            )
+            .is_some()
         );
         assert!(reg.lookup("Conv", "", 21).is_some());
         assert!(
@@ -3682,8 +3886,8 @@ mod tests {
         for op in ["LinearAttention", "CausalConvWithState"] {
             assert!(!reg.supports(op, "", 26));
             assert!(reg.supports(op, "ai.onnx", 28));
-            assert!(!reg.supports(op, "", 29));
-            assert!(reg.lookup(op, "", 29).is_none());
+            assert!(reg.supports(op, "", 29));
+            assert!(reg.lookup(op, "", 29).is_some());
         }
         assert!(
             reg.lookup("GatherBlockQuantized", "com.microsoft", 1)
@@ -3847,14 +4051,15 @@ mod tests {
 
     #[test]
     fn fail_closed_pkg_nxrt_ops_get_f32_only() {
-        let dtypes = supported_dtypes_for_op("BlockQuantizedMatMul", "pkg.nxrt");
+        let dtypes =
+            supported_dtypes_for_op("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(dtypes, &[DataType::Float32]);
     }
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op version must have a descriptor except
-        // standalone-only Celu-28, AffineMoe, and RoiAlign.
+        // Every registered op other than explicitly standalone-only entries
+        // must have a descriptor.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -3879,21 +4084,27 @@ mod tests {
             })
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        let mut expected = std::collections::BTreeSet::from([
-            ("Celu", "", 28),
-            (
-                onnx_runtime_optimizer::affine_moe::OP,
-                onnx_runtime_ir::RUNTIME_DOMAIN,
-                1,
-            ),
-        ]);
-        if cfg!(feature = "ops-cnn") {
-            expected.extend(
-                onnx_runtime_ir::roi_align::VERSIONS
-                    .into_iter()
-                    .map(|version| ("RoiAlign", "", version)),
-            );
-        }
+        #[cfg(feature = "ops-cnn")]
+        let roi_align = onnx_runtime_ir::roi_align::VERSIONS
+            .into_iter()
+            .map(|version| ("RoiAlign", "", version));
+        #[cfg(not(feature = "ops-cnn"))]
+        let roi_align = std::iter::empty();
+        let expected = roi_align
+            .chain([
+                ("Cast", "", 19),
+                ("Cast", "", 24),
+                ("CastLike", "", 19),
+                ("CastLike", "", 24),
+                ("LinearAttention", "", 29),
+                ("Celu", "", 28),
+                (
+                    onnx_runtime_optimizer::affine_moe::OP,
+                    onnx_runtime_ir::RUNTIME_DOMAIN,
+                    1,
+                ),
+            ])
+            .collect();
         assert_eq!(missing, expected);
         assert_eq!(
             descriptors.len() + missing.len(),
@@ -3941,7 +4152,49 @@ mod tests {
             b.iter().map(key).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn packed_cast_dtypes_do_not_expand_plugin_descriptors() {
+        let (registry, descriptors) = build_cpu_registry_with_descriptors();
+        for opset in [21, 25] {
+            assert!(registry.supports("Cast", "", opset));
+            assert!(registry.supports("CastLike", "", opset));
+        }
+        let cast_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "Cast")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        let cast_like_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "CastLike")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        assert_eq!(cast_versions, vec![1, 28]);
+        assert_eq!(cast_like_versions, vec![15]);
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| matches!(descriptor.op_type.as_str(), "Cast" | "CastLike"))
+        {
+            for packed in [
+                DataType::Uint4,
+                DataType::Int4,
+                DataType::Uint2,
+                DataType::Int2,
+            ] {
+                assert!(
+                    !descriptor.supported_dtypes.contains(&packed),
+                    "CPU ORT plugin descriptor {:?} must not advertise standalone packed dtype {packed:?}",
+                    descriptor.op_type
+                );
+            }
+        }
+    }
 }
 
 mod decoded_projection;
+mod packed_bytes;
+mod packed_projection;
+mod projection_input;
+pub(crate) mod routing_workspace;
 pub(crate) mod weight_cache;

@@ -24,6 +24,45 @@ use onnx_runtime_ep_cpu::kernels::build_cpu_registry;
 use onnx_runtime_ep_plugin::compute::ShapeInference;
 use onnx_runtime_ir::{Attribute, Node, NodeId, ValueId};
 
+#[test]
+fn linear_attention_plugin_shape_admission_uses_resolved_schema_revision() {
+    let input_shapes = vec![vec![Some(1), Some(2), Some(4)]; 3];
+    for domain in ["", "ai.onnx"] {
+        let mut node = Node::new(
+            NodeId(0),
+            "LinearAttention",
+            vec![Some(ValueId(0)), Some(ValueId(1)), Some(ValueId(2))],
+            vec![ValueId(3), ValueId(4)],
+        );
+        node.domain = domain.into();
+        node.attributes
+            .insert("q_num_heads".into(), Attribute::Int(1));
+        node.attributes
+            .insert("kv_num_heads".into(), Attribute::Int(1));
+        node.attributes
+            .insert("update_rule".into(), Attribute::String(b"linear".to_vec()));
+
+        for revision in [26, 27, 28, 29, 30] {
+            // ORT's node reader stores the resolved schema revision here,
+            // not the graph's opset import.
+            node.version = Some(revision);
+            let strategy = ShapeInference::for_node(&node, &input_shapes, 2);
+            if matches!(revision, 27 | 28) {
+                assert!(
+                    matches!(strategy, ShapeInference::NativeRegistry { shape_operands, .. }
+                        if shape_operands.is_empty()),
+                    "{domain:?} LinearAttention-{revision} must retain native shape admission",
+                );
+            } else {
+                assert!(
+                    matches!(strategy, ShapeInference::Declined { .. }),
+                    "{domain:?} LinearAttention-{revision} must not enter plugin shape dispatch",
+                );
+            }
+        }
+    }
+}
+
 /// Ops that resolve to `Declined` under the probe below, and therefore reach
 /// ORT's CPU EP rather than ours when they appear in a graph.
 ///
@@ -61,13 +100,13 @@ const DECLINED: &[(&str, &str)] = &[
     ("com.microsoft", "FusedAttention"),
     ("com.microsoft", "FusedGemm"),
     ("com.microsoft", "FusedMatMulBias"),
-    ("pkg.nxrt", "BlockQuantizedMatMul"),
-    ("pkg.nxrt", "BlockQuantizedMoE"),
-    ("pkg.nxrt", "CompressedSparseAttention"),
-    ("pkg.nxrt", "IndexShare"),
-    ("pkg.nxrt", "PackedVarlenAttention"),
-    ("pkg.nxrt", "SparseKvGather"),
-    ("pkg.nxrt", "VarlenAttention"),
+    ("pkg.nxrt._private", "BlockQuantizedMatMul"),
+    ("pkg.nxrt._private", "BlockQuantizedMoE"),
+    ("pkg.nxrt._private", "CompressedSparseAttention"),
+    ("pkg.nxrt._private", "IndexShare"),
+    ("pkg.nxrt._private", "PackedVarlenAttention"),
+    ("pkg.nxrt._private", "SparseKvGather"),
+    ("pkg.nxrt._private", "VarlenAttention"),
     // ── 3. Inferrable but unwritten. These appear in real input graphs, we
     //       have a kernel, and we hand them to ORT anyway. This is the work.
     //
@@ -105,19 +144,19 @@ const DECLINED: &[(&str, &str)] = &[
 /// The NCHWc layout pass is compiled only with the reference linked, so these
 /// six are absent from the registry of every shipped build. They belong to
 /// group 2 above: `CpuNchwcLayoutPropagation` emits them into the private
-/// `pkg.nxrt` domain *after* capability, so no model ever presents one and
+/// `pkg.nxrt._private` domain *after* capability, so no model ever presents one and
 /// `GetCapability` is never asked about them. Kept in a separate list rather
 /// than folded into `DECLINED`, because in a default build naming them would
 /// fail the opposite assertion — they are not declined there, they do not
 /// exist.
 #[cfg(feature = "mlas")]
 const DECLINED_WITH_REFERENCE: &[(&str, &str)] = &[
-    ("pkg.nxrt", "NchwcAveragePool"),
-    ("pkg.nxrt", "NchwcConv"),
-    ("pkg.nxrt", "NchwcGlobalAveragePool"),
-    ("pkg.nxrt", "NchwcMaxPool"),
-    ("pkg.nxrt", "NchwcReorderToBlocked"),
-    ("pkg.nxrt", "NchwcReorderToNchw"),
+    ("pkg.nxrt._private", "NchwcAveragePool"),
+    ("pkg.nxrt._private", "NchwcConv"),
+    ("pkg.nxrt._private", "NchwcGlobalAveragePool"),
+    ("pkg.nxrt._private", "NchwcMaxPool"),
+    ("pkg.nxrt._private", "NchwcReorderToBlocked"),
+    ("pkg.nxrt._private", "NchwcReorderToNchw"),
 ];
 
 /// Ops registered only so a test can exercise the registry machinery. They are
@@ -159,7 +198,7 @@ fn declines(op_type: &str, domain: &str) -> bool {
         );
     }
 
-    if (domain, op_type) == ("pkg.nxrt", "DsaIndexSelect") {
+    if (domain, op_type) == ("pkg.nxrt._private", "DsaIndexSelect") {
         let inputs = (0..4).map(|i| Some(ValueId(i))).collect();
         let mut node = Node::new(NodeId(0), op_type, inputs, vec![ValueId(100)]);
         node.domain = domain.to_string();
@@ -248,16 +287,22 @@ fn registered_ops() -> Vec<(String, String)> {
 
 #[test]
 fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
+    use onnx_runtime_ep_plugin::ep::{NATIVE_RANDOM_EXCLUSIONS, first_excluded_revision};
+
     let (_, descriptors) = onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors();
     let raw_abi_ops: std::collections::BTreeSet<_> = descriptors
         .iter()
         .filter(|descriptor| descriptor.supports_raw_tensor_abi)
         .map(|descriptor| (descriptor.domain.clone(), descriptor.op_type.clone()))
         .collect();
-    // Managed host kernels never enter the raw plugin's shape filter.
+    // Managed host kernels and operators excluded at every revision never
+    // reach the raw plugin's shape filter.
     let actual: Vec<(String, String)> = registered_ops()
         .into_iter()
         .filter(|key| raw_abi_ops.contains(key))
+        .filter(|(domain, op)| {
+            first_excluded_revision(NATIVE_RANDOM_EXCLUSIONS, domain, op) != Some(0)
+        })
         .filter(|(domain, op)| declines(op, domain))
         .collect();
 

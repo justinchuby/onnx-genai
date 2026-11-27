@@ -45,7 +45,8 @@ fn run(
     let rt = ep.runtime();
     let dev: DeviceId = ep.device_id();
     let shape = [x.len()];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let x_buf = ep.allocate(std::mem::size_of_val(x), 256).unwrap();
     let mut y_buf = ep.allocate(std::mem::size_of_val(x), 256).unwrap();
     // SAFETY: x_buf was allocated for exactly this byte slice.

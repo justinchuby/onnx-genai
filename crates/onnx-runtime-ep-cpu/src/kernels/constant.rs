@@ -251,7 +251,8 @@ mod tests {
             let claim = ep.supports_op(&node, opset, &[], &[], &[]);
             assert!(claim.is_supported(), "{dtype:?}: {:?}", claim.reason());
             let kernel = ep.get_kernel(&node, &[], opset).unwrap();
-            let strides = compute_contiguous_strides(shape);
+            let strides = compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             let mut storage = vec![0xA5u8; payload.len() + 2];
             let out = TensorMut::new(
                 DevicePtrMut(storage.as_mut_ptr().cast()),

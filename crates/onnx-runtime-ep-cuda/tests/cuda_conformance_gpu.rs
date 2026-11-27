@@ -113,6 +113,353 @@ fn transpose_packed_cuda_matches_reference_bytes() {
     }
 }
 
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
+    let ep = require_cuda();
+    let shape = static_shape([7]);
+    let mut node = Node::new(NodeId(0), "Cast", vec![], vec![]);
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+    assert!(
+        ep.supports_op(&node, 1, &[shape.clone()], &[DataType::Uint8], &[])
+            .is_supported()
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Int2 as i64));
+    assert!(
+        ep.supports_op(&node, 1, &[shape], &[DataType::Uint8], &[])
+            .is_supported()
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float8E4M3FN as i64));
+    assert!(
+        ep.supports_op(&node, 25, &[static_shape([7])], &[DataType::Uint4], &[],)
+            .reason()
+            .is_some_and(|reason| reason.contains("does not support target dtype"))
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+    assert!(
+        ep.supports_op(
+            &node,
+            25,
+            &[static_shape([7])],
+            &[DataType::Float8E4M3FN],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("does not support source dtype"))
+    );
+
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+    assert!(
+        ep.supports_op(
+            &node,
+            27,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("opset 28"))
+    );
+    assert!(
+        ep.supports_op(
+            &node,
+            28,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .is_supported()
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Int32 as i64));
+    assert!(
+        ep.supports_op(
+            &node,
+            28,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("supports only"))
+    );
+    let cast_like = Node::new(NodeId(1), "CastLike", vec![], vec![]);
+    assert!(
+        ep.supports_op(
+            &cast_like,
+            15,
+            &[static_shape([3]), static_shape([3])],
+            &[DataType::Float6E2M3, DataType::Float32],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("standard Cast"))
+    );
+
+    let cases = [
+        (
+            "uint8-to-uint4-codes-and-zero-points",
+            1,
+            input(DataType::Uint8, &[7], &[0u8, 1, 7, 8, 15, 16, 255]),
+            DataType::Uint4,
+            vec![0x10, 0x87, 0x0f, 0x0f],
+        ),
+        (
+            "uint4-to-int2-between-packed-types",
+            1,
+            input(DataType::Uint4, &[5], &[0x10u8, 0x87, 0xff]),
+            DataType::Int2,
+            vec![0x34, 0x03],
+        ),
+        (
+            "int2-to-int4-sign-extension",
+            1,
+            input(DataType::Int2, &[5], &[0x34u8, 0x03]),
+            DataType::Int4,
+            vec![0x10, 0x0f, 0x0f],
+        ),
+    ];
+    for (label, opset, source, target, expected) in cases {
+        let attrs = [("to", Attribute::Int(target as i64))];
+        let outputs = [(target, source.shape.clone())];
+        assert_eq!(
+            run_cpu(
+                "Cast",
+                "",
+                opset,
+                std::slice::from_ref(&source),
+                &outputs,
+                &attrs
+            )[0],
+            expected,
+            "{label}: CPU reference"
+        );
+        assert_eq!(
+            run_cuda(
+                &ep,
+                "Cast",
+                "",
+                opset,
+                std::slice::from_ref(&source),
+                &outputs,
+                &attrs,
+            )[0],
+            expected,
+            "{label}: CUDA"
+        );
+    }
+
+    let floats = float_input(
+        DataType::Float32,
+        &[6],
+        &[-20.0, -8.9, -7.9, 7.9, 8.0, f32::NAN],
+    );
+    let attrs = [("to", Attribute::Int(DataType::Int4 as i64))];
+    let outputs = [(DataType::Int4, vec![6])];
+    let expected = vec![0x8c, 0x79, 0x08];
+    assert_eq!(
+        run_cpu(
+            "Cast",
+            "",
+            1,
+            std::slice::from_ref(&floats),
+            &outputs,
+            &attrs
+        )[0],
+        expected
+    );
+    assert_eq!(
+        run_cuda(&ep, "Cast", "", 1, &[floats], &outputs, &attrs)[0],
+        expected
+    );
+
+    let source = input(DataType::Uint8, &[5], &[0u8, 1, 2, 3, 4]);
+    let target = input(DataType::Uint2, &[1], &[0u8]);
+    let outputs = [(DataType::Uint2, vec![5])];
+    let expected = vec![0xe4, 0x00];
+    assert_eq!(
+        run_cpu(
+            "CastLike",
+            "",
+            15,
+            &[source.clone(), target.clone()],
+            &outputs,
+            &[],
+        )[0],
+        expected
+    );
+    assert_eq!(
+        run_cuda(&ep, "CastLike", "", 15, &[source, target], &outputs, &[])[0],
+        expected
+    );
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+fn native_random_cuda_distribution_dtype_seed_and_capture() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let ep = require_cuda();
+    const COUNT: usize = 4096;
+    for (op, dtype, version) in [
+        ("RandomNormal", DataType::Float64, 1),
+        ("RandomNormalLike", DataType::BFloat16, 22),
+        ("RandomUniform", DataType::Float16, 1),
+        ("RandomUniformLike", DataType::Float32, 1),
+    ] {
+        let inputs = if op.ends_with("Like") {
+            vec![input(DataType::Int32, &[COUNT], &[15_i32; COUNT])]
+        } else {
+            vec![]
+        };
+        let outputs = [(dtype, vec![COUNT])];
+        let mut attrs = vec![
+            ("dtype", Attribute::Int(dtype as i64)),
+            ("seed", Attribute::Float(0.25)),
+        ];
+        if inputs.is_empty() {
+            attrs.push(("shape", Attribute::Ints(vec![COUNT as i64])));
+        }
+        let normal = op.starts_with("RandomNormal");
+        attrs.extend(if normal {
+            [
+                ("mean", Attribute::Float(2.0)),
+                ("scale", Attribute::Float(0.5)),
+            ]
+        } else {
+            [
+                ("low", Attribute::Float(-2.0)),
+                ("high", Attribute::Float(3.0)),
+            ]
+        });
+        let first = run_cuda(&ep, op, "", version, &inputs, &outputs, &attrs);
+        assert_eq!(
+            first,
+            run_cuda(&ep, op, "", version, &inputs, &outputs, &attrs),
+            "{op}"
+        );
+        let values = decode_floats(&first[0], dtype);
+        let mean = values.iter().sum::<f32>() / COUNT as f32;
+        if normal {
+            let variance = values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f32>()
+                / COUNT as f32;
+            assert!((mean - 2.0).abs() < 0.06, "{op}: mean {mean}");
+            assert!((variance - 0.25).abs() < 0.04, "{op}: variance {variance}");
+        } else {
+            assert!(
+                values.iter().all(|value| (-2.0..=3.0).contains(value)),
+                "{op}"
+            );
+            assert!((mean - 0.5).abs() < 0.15, "{op}: mean {mean}");
+        }
+
+        let (graph, id) = common::build_graph(op, "", version, &inputs, &outputs, &attrs);
+        let shapes = inputs
+            .iter()
+            .map(|input| input.shape.clone())
+            .collect::<Vec<_>>();
+        let kernel = ep.get_kernel(graph.node(id), &shapes, version).unwrap();
+        let support = kernel.capture_support();
+        assert!(
+            support
+                .reason()
+                .is_some_and(|reason| reason.contains("RNG state")),
+            "{op}"
+        );
+        if dtype == DataType::BFloat16 {
+            let claim = ep.supports_op(
+                graph.node(id),
+                21,
+                &[onnx_runtime_ir::static_shape([COUNT])],
+                &[DataType::Int32],
+                &[],
+            );
+            assert!(
+                claim
+                    .reason()
+                    .is_some_and(|reason| reason.contains("BF16 starting at opset 22"))
+            );
+        }
+        if op.ends_with("Like") {
+            let claim = ep.supports_op(
+                graph.node(id),
+                version,
+                &[onnx_runtime_ir::static_shape([COUNT])],
+                &[DataType::String],
+                &[],
+            );
+            assert!(
+                claim
+                    .reason()
+                    .is_some_and(|reason| reason.contains("no CUDA representation"))
+            );
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn gelu_opset20_cuda_preserves_float64_precision() {
+    let ep = require_cuda();
+    let xs = [
+        -3.123_456_789_012_345_f64,
+        -0.731_234_567_890_123,
+        0.613_579_246_801_357,
+        2.123_456_789_012_345,
+    ];
+    // Independent binary64 references from the normal CDF (erfc) and tanh formulas.
+    let exact = [
+        -0.002_791_435_029_202_671_6,
+        -0.169_878_911_821_562_23,
+        0.448_068_269_507_055_3,
+        2.087_659_986_821_002_6,
+    ];
+    let tanh = [
+        -0.002_428_442_720_514_409_3,
+        -0.169_942_551_318_503_17,
+        0.448_032_695_466_633_16,
+        2.087_864_070_651_28,
+    ];
+    let shape = [2, 2];
+    let x = input(DataType::Float64, &shape, &xs);
+    for (mode, expected) in [(None, exact), (Some("none"), exact), (Some("tanh"), tanh)] {
+        let attrs = mode
+            .map(|m| vec![("approximate", Attribute::String(m.as_bytes().to_vec()))])
+            .unwrap_or_default();
+        let output = run_cuda(
+            &ep,
+            "Gelu",
+            "",
+            20,
+            std::slice::from_ref(&x),
+            &[(DataType::Float64, shape.to_vec())],
+            &attrs,
+        );
+        assert_eq!(output[0].len(), std::mem::size_of_val(&expected));
+        for ((bytes, x), expected) in output[0].chunks_exact(8).zip(xs).zip(expected) {
+            let got = f64::from_ne_bytes(bytes.try_into().unwrap());
+            assert!(
+                (got - expected).abs() <= 2e-15,
+                "{mode:?}: GELU({x})={got}, expected {expected}"
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Profile model
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2745,6 +3092,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // Batch 6 (issue #67): model-shaping/indexing structural operators.
     p.push(sweep("GatherND", gather_nd_cases()));
     p.push(sweep("SpaceToDepth", space_to_depth_cases()));
+    p.push(dedicated(
+        "ReverseSequence",
+        "cuda_conformance_gpu.rs",
+        "Direct CUDA execution against independent byte-exact expectations",
+    ));
     p.push(sweep("EyeLike", eye_like_cases()));
 
     // Batch 7 (issue #67): general padding/cropping and sequence construction.
@@ -3017,8 +3369,8 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(dedicated(
         "Gelu",
-        "fused_epilogue_gpu.rs",
-        "GELU activation",
+        "cuda_conformance_gpu.rs",
+        "standard opset-20 Gelu: exact and tanh with FP64 references",
     ));
     p.push(dedicated("Silu", "activations_gpu.rs", "SiLU activation"));
     p.push(dedicated("LeakyRelu", "activations_gpu.rs", "alpha-driven"));
@@ -3185,6 +3537,18 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "opset24_ops_gpu.rs",
         "fill from shape",
     ));
+    for op in [
+        "RandomNormal",
+        "RandomNormalLike",
+        "RandomUniform",
+        "RandomUniformLike",
+    ] {
+        p.push(dedicated(
+            op,
+            "cuda_conformance_gpu.rs",
+            "native RNG distribution, seed, dtype and capture contract",
+        ));
+    }
     p.push(dedicated("OneHot", "opset24_ops_gpu.rs", "one-hot encode"));
 
     // Structural data-movement.
@@ -3206,6 +3570,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // Indexed / scan.
     p.push(dedicated("TopK", "indexing_gpu.rs", "top-k"));
     p.push(dedicated("CumSum", "indexing_gpu.rs", "prefix scan"));
+    p.push(dedicated(
+        "RNN",
+        "rnn_gpu.rs",
+        "native recurrence, layouts, lengths and dtypes",
+    ));
     p.push(dedicated(
         "GatherElements",
         "indexing_gpu.rs",
@@ -3504,6 +3873,103 @@ fn tensor_scatter_batch_offsets_match_cpu() {
     let ep = require_cuda();
     for case in tensor_scatter_cases() {
         run_case(&ep, &case);
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn reverse_sequence_cuda_exact_bytes() {
+    let ep = require_cuda();
+    let bits = [
+        0x7f81u16, 0x7fc3, 0x8000, 0x0000, 0x0001, 0x8001, 0xff80, 0x7f80,
+    ];
+    let bf16 = DataType::BFloat16;
+    let i64 = DataType::Int64;
+    let lengths = input(i64, &[2], &[2i64, 0]);
+    for opset in [10, 28] {
+        let time_major = run_cuda(
+            &ep,
+            "ReverseSequence",
+            "",
+            opset,
+            &[input(bf16, &[2, 2, 2], &bits), lengths.clone()],
+            &[(bf16, vec![2, 2, 2])],
+            &[],
+        );
+        assert_eq!(
+            time_major,
+            vec![common::raw(&[
+                0x0001u16, 0x8001, 0x8000, 0x0000, 0x7f81, 0x7fc3, 0xff80, 0x7f80,
+            ])],
+            "opset {opset}"
+        );
+    }
+
+    let complex = DataType::Complex128;
+    let batch_major = run_cuda(
+        &ep,
+        "ReverseSequence",
+        "",
+        10,
+        &[
+            input(
+                complex,
+                &[2, 3],
+                &[[1u64, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12]],
+            ),
+            lengths,
+        ],
+        &[(complex, vec![2, 3])],
+        &[
+            ("batch_axis", Attribute::Int(0)),
+            ("time_axis", Attribute::Int(1)),
+        ],
+    );
+    assert_eq!(
+        batch_major,
+        vec![common::raw(&[
+            [3u64, 4],
+            [1, 2],
+            [5, 6],
+            [7, 8],
+            [9, 10],
+            [11, 12],
+        ])]
+    );
+
+    let u8 = DataType::Uint8;
+    for (shape, lengths) in [(vec![3, 0], vec![]), (vec![0, 2], vec![0i64, 0])] {
+        let outputs = run_cuda(
+            &ep,
+            "ReverseSequence",
+            "",
+            28,
+            &[
+                input(u8, &shape, &[] as &[u8]),
+                input(i64, &[lengths.len()], &lengths),
+            ],
+            &[(u8, shape.clone())],
+            &[],
+        );
+        assert_eq!(outputs, vec![Vec::<u8>::new()]);
+    }
+    for (shape, bad_length) in [([2, 2], -1i64), ([0, 2], 1), ([2, 2], i64::MAX)] {
+        let data = vec![0u8; shape.iter().product()];
+        let error = common::try_run_cuda(
+            &ep,
+            "ReverseSequence",
+            "",
+            28,
+            &[input(u8, &shape, &data), input(i64, &[2], &[0, bad_length])],
+            &[(u8, shape.to_vec())],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("[1] = {bad_length} is outside 0..={}", shape[0]))
+        );
     }
 }
 

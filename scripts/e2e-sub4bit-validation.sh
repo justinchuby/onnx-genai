@@ -96,7 +96,7 @@ register = """    reg.register("", "Gemm", 1, gemm);
 """
 registrations = """    reg.register("", "Gemm", 1, gemm);
     reg.register(
-        "pkg.nxrt",
+        "pkg.nxrt._private",
         "BlockQuantizedMatMul",
         1,
         attribute_sized_matmul,

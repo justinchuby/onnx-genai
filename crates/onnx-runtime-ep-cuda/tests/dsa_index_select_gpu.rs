@@ -5,7 +5,7 @@
     clippy::type_complexity,
     clippy::drop_non_drop
 )]
-//! GPU parity tests for `pkg.nxrt::DsaIndexSelect` v1.
+//! GPU parity tests for `pkg.nxrt._private::DsaIndexSelect` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
 //! API, runs it through both the CPU reference kernel (the authoritative
@@ -43,7 +43,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct HostTensor {
@@ -212,7 +212,12 @@ fn run_cpu(
 
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -231,7 +236,10 @@ fn run_cpu(
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut out_bufs: Vec<Vec<u8>> = output_specs
         .iter()
@@ -373,13 +381,21 @@ fn run_gpu_with_workspace_owner(
     let buffers = upload_inputs(ep, inputs)?;
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let views = input_views(inputs, &buffers, &strides, ep);
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_lens: Vec<usize> = output_specs
         .iter()
@@ -448,13 +464,21 @@ fn run_gpu_capture_replay(
     let buffers = upload_inputs(ep, inputs)?;
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let views = input_views(inputs, &buffers, &strides, ep);
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_lens: Vec<usize> = output_specs
         .iter()
@@ -1705,13 +1729,21 @@ fn bench_config(
     let buffers = upload_inputs(ep, inputs).expect("upload inputs");
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let views = input_views(inputs, &buffers, &strides, ep);
 
     let out_strides: Vec<_> = specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_lens: Vec<usize> = specs
         .iter()

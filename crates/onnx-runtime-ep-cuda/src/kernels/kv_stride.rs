@@ -39,7 +39,7 @@ pub(crate) enum KvCachePath {
     UnfusedDecodePrep,
     F32DecodeRead,
     ReferenceRead,
-    Phase2aRead,
+    BlasSoftmaxRead,
 }
 
 impl KvCachePath {
@@ -53,7 +53,7 @@ impl KvCachePath {
             Self::UnfusedDecodePrep => "unfused decode prep",
             Self::F32DecodeRead => "f32 split-K decode read",
             Self::ReferenceRead => "reference attention read",
-            Self::Phase2aRead => "phase2a attention read",
+            Self::BlasSoftmaxRead => "cuBLASLt/softmax attention read",
         }
     }
 }

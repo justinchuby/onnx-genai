@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity tests for `pkg.nxrt::SparseKvGather` v1.
+//! GPU parity tests for `pkg.nxrt._private::SparseKvGather` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
 //! API, runs it through the CUDA EP, and compares the device output against the
@@ -32,7 +32,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct HostTensor {
@@ -181,11 +181,15 @@ fn run_cpu_result(
         .unwrap();
     let strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let ptrs: Vec<*const u8> = inputs.iter().map(|input| input.bytes.as_ptr()).collect();
     let input_views = views(inputs, &ptrs, &strides, DeviceId::cpu());
-    let output_strides = compute_contiguous_strides(output_shape);
+    let output_strides = compute_contiguous_strides(output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_len = output_shape.iter().product::<usize>() * out_dtype.byte_size();
     let mut output = vec![0u8; output_len];
     let output_view = TensorMut::new(
@@ -223,14 +227,18 @@ fn run_gpu(
     }
     let strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let ptrs: Vec<*const u8> = buffers.iter().map(|b| b.as_ptr() as *const u8).collect();
     let input_views = views(inputs, &ptrs, &strides, ep.device_id());
     let output_len = output_shape.iter().product::<usize>();
     let output_bytes = output_len * out_dtype.byte_size();
     let mut output_buffer = ep.allocate(output_bytes.max(1), 256)?;
-    let output_strides = compute_contiguous_strides(output_shape);
+    let output_strides = compute_contiguous_strides(output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         out_dtype,

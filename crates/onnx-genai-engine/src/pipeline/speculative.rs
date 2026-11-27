@@ -1699,16 +1699,19 @@ impl WorkflowRuntime {
             );
         }
         let control = request.generation_control.clone().unwrap_or_default();
-        if plan.execution_mode == CandidateTreeExecutionMode::DrainAtSeam
-            && let Some(limit) = options.max_context
-            && match &request.request.prompt {
-                crate::config::GeneratePrompt::TokenIds(tokens) => tokens.len() >= limit,
-                crate::config::GeneratePrompt::TokenRows(rows) => {
-                    rows.first().is_some_and(|tokens| tokens.len() >= limit)
-                }
-                crate::config::GeneratePrompt::Text(_) => false,
-            }
-        {
+        let initial_context_exhausted = plan.execution_mode
+            == CandidateTreeExecutionMode::DrainAtSeam
+            && options
+                .max_context
+                .is_some_and(|limit| match &request.request.prompt {
+                    crate::config::GeneratePrompt::TokenIds(tokens) => tokens.len() >= limit,
+                    crate::config::GeneratePrompt::TokenRows(rows) => {
+                        rows.first().is_some_and(|tokens| tokens.len() >= limit)
+                    }
+                    crate::config::GeneratePrompt::Text(_) => false,
+                });
+        let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
+        if initial_context_exhausted {
             return finish_candidate_tree_without_generation(
                 staged_output_observer,
                 "candidate-tree initial context-limit boundary",
@@ -1722,7 +1725,6 @@ impl WorkflowRuntime {
             super::generation::OutputObservationMode::AcceptedPrefix,
         )
         .context("admit candidate-tree generation output controls")?;
-        let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
         let mut host = CandidateTreeWorkflowHost {
             runtime: self,
             plan,

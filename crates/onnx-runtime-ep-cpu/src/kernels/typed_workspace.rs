@@ -80,6 +80,72 @@ impl<T: Copy + Default, const N: usize> TypedWorkspace<T, N> {
     }
 }
 
+/// Typed payloads plus route indices within the same admitted Host lane.
+/// This composes layouts only: no allocation, ownership or admission policy.
+pub(super) struct ValueIndexWorkspace<T: Copy + Default, const N: usize> {
+    op: &'static str,
+    values: TypedWorkspace<T, N>,
+    indices: TypedWorkspace<usize, 1>,
+    layout: WorkspaceLayout<2>,
+}
+impl<T: Copy + Default, const N: usize> ValueIndexWorkspace<T, N> {
+    pub(super) fn new(
+        op: &'static str,
+        values: [(&str, usize); N],
+        indices: (&str, usize),
+    ) -> Result<Self> {
+        let values = TypedWorkspace::new(op, values)?;
+        let indices = TypedWorkspace::new(op, [indices])?;
+        let region = |r: WorkspaceRequirement| {
+            Layout::from_size_align(r.bytes as usize, r.alignment).map_err(|e| {
+                EpError::KernelFailed(format!(
+                    "{op}: invalid workspace sublayout: {e}; reduce prepared dimensions"
+                ))
+            })
+        };
+        let layout = WorkspaceLayout::new([
+            region(values.requirement())?,
+            region(indices.requirement())?,
+        ])
+        .map_err(|e| {
+            EpError::KernelFailed(format!("{op}: cannot combine value/index workspace: {e}"))
+        })?;
+        Ok(Self {
+            op,
+            values,
+            indices,
+            layout,
+        })
+    }
+    pub(super) fn requirement(&self) -> WorkspaceRequirement {
+        WorkspaceRequirement {
+            bytes: self.layout.bytes() as u64,
+            alignment: self.layout.alignment(),
+            ..WorkspaceRequirement::NONE
+        }
+    }
+    /// # Safety
+    /// Caller lends exclusive live Host backing, disjoint from all tensors.
+    /// Full binding precedes initialization; scratch cannot escape the closure.
+    pub(super) unsafe fn with_buffers<R>(
+        &self,
+        view: Option<WorkspaceView>,
+        body: impl for<'a> FnOnce([&'a mut [T]; N], &'a mut [usize]) -> Result<R>,
+    ) -> Result<R> {
+        let [values, indices] = self
+            .layout
+            .bind(view)
+            .map_err(|e| EpError::KernelFailed(format!("{}: {e}", self.op)))?;
+        // SAFETY: complete outer layout validated before either subregion is
+        // initialized; caller proves lifetime, exclusivity and Host access.
+        unsafe {
+            self.values.with_buffers(Some(values), |f| {
+                self.indices.with_buffers(Some(indices), |[i]| body(f, i))
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +398,43 @@ mod tests {
                 .to_string()
                 .contains("zero-sized")
         );
+    }
+    #[test]
+    fn mixed_regions_initialize_fresh_backing_and_refuse_incomplete_outer_layout() {
+        let plan = ValueIndexWorkspace::<f32, _>::new(
+            "mixed fixture",
+            [("values", 3), ("empty", 0)],
+            ("indices", 3),
+        )
+        .unwrap();
+        let req = plan.requirement();
+        let mut fresh = [MaybeUninit::<u128>::uninit(); 8];
+        let lane = WorkspaceView::new(DevicePtrMut(fresh.as_mut_ptr().cast()), req.bytes as usize);
+        // SAFETY: exclusive aligned Host backing covers the complete layout.
+        unsafe {
+            plan.with_buffers(Some(lane), |[values, empty], indices| {
+                assert_eq!(values, [0.; 3]);
+                assert!(empty.is_empty());
+                assert_eq!(indices, [0; 3]);
+                Ok(())
+            })
+        }
+        .unwrap();
+        let mut poison = [0xaaaaaaaaaaaaaaaau128; 8];
+        let lane = WorkspaceView::new(
+            DevicePtrMut(poison.as_mut_ptr().cast()),
+            req.bytes as usize - 1,
+        );
+        // SAFETY: lane names live exclusive backing; incomplete capacity must
+        // refuse before any typed subregion is initialized or body is called.
+        assert!(
+            unsafe {
+                plan.with_buffers(Some(lane), |_, _| -> Result<()> {
+                    panic!("short outer layout reached user code")
+                })
+            }
+            .is_err()
+        );
+        assert!(poison.iter().all(|&v| v == 0xaaaaaaaaaaaaaaaau128));
     }
 }

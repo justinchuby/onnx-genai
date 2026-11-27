@@ -164,6 +164,129 @@ pub struct KernelRegistryEntry {
     pub output_dtype_constraints: &'static [(usize, &'static [DataType])],
 }
 
+/// Exclude an operator starting at a particular schema revision (inclusive).
+#[derive(Clone, Copy, Debug)]
+pub struct OperatorExclusion {
+    pub domain: &'static str,
+    pub op_type: &'static str,
+    /// Zero excludes every revision.
+    pub since_version: u32,
+}
+
+pub type OperatorExclusions = &'static [OperatorExclusion];
+
+/// Tensor-state convolution with dilated history is currently standalone only.
+pub const STANDALONE_CAUSAL_CONV: OperatorExclusions = &[OperatorExclusion {
+    domain: "",
+    op_type: "CausalConvWithState",
+    since_version: 29,
+}];
+
+/// Native RNN support is standalone-only; ORT retains its existing RNN placement.
+pub const STANDALONE_RNN_EXCLUSION: OperatorExclusions = &[OperatorExclusion {
+    domain: "",
+    op_type: "RNN",
+    since_version: 0,
+}];
+
+/// Apply both standalone-only rules with a single factory update.
+pub const STANDALONE_CAUSAL_CONV_AND_RNN: OperatorExclusions =
+    &[STANDALONE_CAUSAL_CONV[0], STANDALONE_RNN_EXCLUSION[0]];
+
+/// Native RNG needs node-owned run state, which the ORT plugin does not bind.
+pub const NATIVE_RANDOM_EXCLUSIONS: OperatorExclusions = &{
+    use onnx_runtime_ep_api::random::OPS;
+    let mut rules = [OperatorExclusion {
+        domain: "",
+        op_type: "",
+        since_version: 0,
+    }; OPS.len()];
+    let mut i = 0;
+    while i < OPS.len() {
+        rules[i].op_type = OPS[i];
+        i += 1;
+    }
+    rules
+};
+
+/// Apply the CPU and CUDA factory exclusions together; updates replace the slice.
+pub const STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM: OperatorExclusions = &{
+    let existing = STANDALONE_CAUSAL_CONV_AND_RNN;
+    let mut rules =
+        [existing[0]; STANDALONE_CAUSAL_CONV_AND_RNN.len() + NATIVE_RANDOM_EXCLUSIONS.len()];
+    let mut i = 0;
+    while i < existing.len() {
+        rules[i] = existing[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < NATIVE_RANDOM_EXCLUSIONS.len() {
+        rules[i + j] = NATIVE_RANDOM_EXCLUSIONS[j];
+        j += 1;
+    }
+    rules
+};
+
+/// Standalone kernel revisions not exposed by the shipped ORT factories.
+pub const SHIPPED_ORT_EXCLUSIONS: OperatorExclusions = &{
+    let existing = STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM;
+    let mut rules = [OperatorExclusion {
+        domain: "",
+        op_type: "ReverseSequence",
+        since_version: 0,
+    }; STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM.len() + 1];
+    let mut i = 0;
+    while i < existing.len() {
+        rules[i] = existing[i];
+        i += 1;
+    }
+    rules
+};
+
+/// Earliest excluded schema revision for the normalized operator name.
+pub fn first_excluded_revision(
+    exclusions: OperatorExclusions,
+    domain: &str,
+    op_type: &str,
+) -> Option<u32> {
+    let domain = onnx_runtime_ir::normalize_domain(domain);
+    exclusions
+        .iter()
+        .filter(|rule| {
+            onnx_runtime_ir::normalize_domain(rule.domain) == domain && rule.op_type == op_type
+        })
+        .map(|rule| rule.since_version)
+        .min()
+}
+
+pub(crate) fn excludes_schema_revision(
+    exclusions: OperatorExclusions,
+    node: &onnx_runtime_ir::Node,
+) -> bool {
+    first_excluded_revision(exclusions, &node.domain, &node.op_type).is_some_and(|since| {
+        // ORT's Node_GetSinceVersion is authoritative, not the graph import.
+        node.version
+            .is_none_or(|version| version <= 0 || version >= i64::from(since))
+    })
+}
+
+pub(crate) fn query_plugin_capabilities(
+    view: &onnx_runtime_ir::GraphView<'_>,
+    ep: &dyn ExecutionProvider,
+    exclusions: OperatorExclusions,
+    mut node_admissible: impl FnMut(NodeIndex, bool) -> bool,
+) -> onnx_runtime_ep_api::Result<Vec<onnx_runtime_ep_api::SubgraphClaim>> {
+    onnx_runtime_ep_api::abi::OrtGraphView::new(view).query_capabilities_filtered(
+        ep,
+        |index, graph_kernel| {
+            let node = view.node(index);
+            // Exclude before partitioning so an unsupported node cannot take
+            // supported neighbors out with it in the later registry filter.
+            !excludes_schema_revision(exclusions, node) && node_admissible(index, graph_kernel)
+        },
+    )
+}
+
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
 ///
 /// The first field is `OrtEp` so the pointer can be cast directly.
@@ -183,6 +306,7 @@ pub struct ExportedEp {
     /// that `GetCapability` can dtype-filter claims against the same source of
     /// truth. Empty when no registry entries were provided.
     pub registry_entries: Vec<KernelRegistryEntry>,
+    pub(crate) operator_exclusions: OperatorExclusions,
     /// Whether ORT places this EP's tensors in host-accessible memory, copied
     /// from the factory's `DeviceSupport::host_accessible` in `CreateEp`.
     ///
@@ -330,6 +454,7 @@ impl ExportedEp {
             name_cstr,
             kernel_registry: registry,
             registry_entries: entries,
+            operator_exclusions: &[],
             host_accessible: false,
             workspace_execution: None,
         }
@@ -395,7 +520,6 @@ fn ep_get_capability_inner(
         }
     };
     let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
-    let ort_view = onnx_runtime_ep_api::abi::OrtGraphView::new(&view);
 
     // Is this a non-CPU (GPU) EP? Two capability-time gates below are specific to
     // the GPU plugin and must not disturb the CPU plugin, whose paths already
@@ -434,8 +558,9 @@ fn ep_get_capability_inner(
     // so the deferral cannot be reintroduced by overriding a default — there is
     // nothing left to override.
     let mut graph_kernel_nodes = std::collections::HashSet::new();
+    let exclusions = exported.operator_exclusions;
     let claims = exported.ep.with(|ep| {
-        ort_view.query_capabilities_filtered(ep, |node, graph_kernel| {
+        query_plugin_capabilities(&view, ep, exclusions, |node, graph_kernel| {
             if graph_kernel {
                 if ep.executor_kernel_scope(view.node(node))
                     == onnx_runtime_ep_api::ExecutorKernelScope::Required
@@ -899,6 +1024,21 @@ fn ep_compile_inner(
             }
         };
         let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
+
+        if let Some(node) = view
+            .nodes()
+            .map(|index| view.node(index))
+            .find(|node| excludes_schema_revision(exported.operator_exclusions, node))
+        {
+            cleanup_partial_infos(out_infos, i);
+            return fail_status(&format!(
+                "Compile: the ORT plugin cannot run {}::{} node '{}' at schema revision {:?}; use standalone nxrt or a plugin supporting that revision",
+                onnx_runtime_ir::normalize_domain(&node.domain),
+                node.op_type,
+                node.name,
+                node.version,
+            ));
+        }
 
         let graph_claims = match exported
             .ep
@@ -2201,6 +2341,288 @@ mod tests {
         (g, nid)
     }
 
+    #[test]
+    fn causal_conv_plugin_claims_legacy_schema_not_graph_import() {
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, static_shape};
+
+        let mut provider = CpuExecutionProvider::new();
+        provider
+            .initialize(&onnx_runtime_ep_api::EpConfig::default())
+            .unwrap();
+        for (domain, revision, allowed) in [
+            ("", Some(27), true),
+            ("ai.onnx", Some(28), true),
+            ("com.microsoft", Some(1), true),
+            ("", Some(29), false),
+            ("ai.onnx", Some(29), false),
+            ("", None, false),
+            ("", Some(0), false),
+        ] {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(
+                domain.into(),
+                if domain == "com.microsoft" { 1 } else { 29 },
+            );
+            let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 2, 4]));
+            let w = graph.create_named_value("w", DataType::Float32, static_shape([2, 1, 3]));
+            let y = graph.create_named_value("y", DataType::Float32, static_shape([1, 2, 4]));
+            let state =
+                graph.create_named_value("state", DataType::Float32, static_shape([1, 2, 2]));
+            graph.add_input(x);
+            graph.add_input(w);
+            graph.add_output(y);
+            graph.add_output(state);
+            let mut node = Node::new(
+                NodeId(0),
+                "CausalConvWithState",
+                vec![Some(x), Some(w)],
+                vec![y, state],
+            );
+            node.domain = domain.into();
+            node.version = revision;
+            let id = graph.insert_node(node);
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+
+            let standalone =
+                super::query_plugin_capabilities(&view, &provider, &[], |_, _| true).unwrap();
+            assert_eq!(standalone[0].node_ids, [id], "{domain:?} {revision:?}");
+            let claims = super::query_plugin_capabilities(
+                &view,
+                &provider,
+                super::STANDALONE_CAUSAL_CONV,
+                |_, _| {
+                    assert!(allowed, "{domain:?} {revision:?} reached plugin admission");
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                claims.len(),
+                usize::from(allowed),
+                "{domain:?} {revision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_conv_plugin_shapes_decline_standalone_schema() {
+        use crate::compute::ShapeInference;
+        use onnx_runtime_ir::{Node, NodeId};
+
+        for (domain, revision, allowed) in [
+            ("", 27, true),
+            ("ai.onnx", 28, true),
+            ("com.microsoft", 1, true),
+            ("", 29, false),
+            ("ai.onnx", 29, false),
+        ] {
+            let mut node = Node::new(NodeId(0), "CausalConvWithState", vec![], vec![]);
+            node.domain = domain.into();
+            node.version = Some(revision);
+            let strategy = ShapeInference::for_node(
+                &node,
+                &[
+                    vec![Some(1), Some(2), Some(4)],
+                    vec![Some(2), Some(1), Some(3)],
+                ],
+                2,
+            );
+            assert_eq!(
+                matches!(
+                    strategy,
+                    ShapeInference::NativeRegistry { .. } | ShapeInference::CausalConvWithState
+                ),
+                allowed,
+                "{domain:?} {revision}"
+            );
+            if !allowed {
+                assert!(matches!(strategy, ShapeInference::Declined { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_cast_like_declines_fp8_at_the_ort_claim_boundary() {
+        use onnx_runtime_ep_cpu::kernels::{
+            input_dtype_constraints_for_op, output_dtype_constraints_for_op,
+        };
+        use onnx_runtime_ep_cpu::{CpuExecutionProvider, build_cpu_registry_with_descriptors};
+        use onnx_runtime_ir::static_shape;
+
+        let (_, descriptors) = build_cpu_registry_with_descriptors();
+        let cast_like = descriptors
+            .iter()
+            .filter(|d| d.op_type == "CastLike" && d.domain.is_empty() && d.supports_raw_tensor_abi)
+            .collect::<Vec<_>>();
+        let [descriptor] = cast_like.as_slice() else {
+            panic!("expected exactly one shipped CPU CastLike descriptor");
+        };
+        let entries = [KernelRegistryEntry {
+            op_type: "CastLike",
+            domain: "",
+            since_version: i32::try_from(descriptor.since_version).unwrap(),
+            end_version: i32::try_from(descriptor.end_version).unwrap_or(i32::MAX),
+            supported_dtypes: descriptor.supported_dtypes,
+            input_dtype_constraints: input_dtype_constraints_for_op("CastLike", ""),
+            output_dtype_constraints: output_dtype_constraints_for_op("CastLike", ""),
+        }];
+        let provider = CpuExecutionProvider::new();
+        let shapes = [static_shape([2]), static_shape([1])];
+        for (opset, fp8) in [(19, DataType::Float8E4M3FN), (24, DataType::Float8E8M0)] {
+            for (source, target, allowed) in [
+                (DataType::Float32, DataType::Int64, true),
+                (fp8, DataType::Float32, false),
+                (DataType::Float32, fp8, false),
+            ] {
+                let dtypes = [source, target];
+                let (graph, id) = graph_with_node("CastLike", "", &dtypes, &[target]);
+                let node = graph.node(id);
+                assert!(
+                    provider
+                        .supports_op(node, opset, &shapes, &dtypes, &[])
+                        .is_supported(),
+                    "native CastLike-{opset} must accept {source:?} -> {target:?}"
+                );
+                assert_eq!(
+                    super::node_passes_dtype_filter(node, &graph, &entries),
+                    allowed,
+                    "ORT CastLike-{opset} eligibility for {source:?} -> {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_random_is_excluded_before_plugin_partitioning() {
+        use onnx_runtime_ep_api::{
+            Cost, DeviceBuffer, DeviceId, EpConfig, Fence, Kernel, KernelMatch, Result,
+            WorkspacePlanning,
+        };
+        use onnx_runtime_ir::{
+            Graph, GraphView, GraphViewCache, Node, NodeId, Shape, TensorLayout,
+        };
+
+        struct ClaimingEp(Option<NodeId>);
+
+        impl ExecutionProvider for ClaimingEp {
+            fn name(&self) -> &str {
+                "claiming_test_ep"
+            }
+            fn device_type(&self) -> DeviceType {
+                DeviceType::Cpu
+            }
+            fn device_id(&self) -> DeviceId {
+                DeviceId::cpu()
+            }
+            fn initialize(&mut self, _: &EpConfig) -> Result<()> {
+                unreachable!()
+            }
+            fn shutdown(&mut self) -> Result<()> {
+                unreachable!()
+            }
+            fn supports_op(
+                &self,
+                _: &Node,
+                _: u64,
+                _: &[Shape],
+                _: &[DataType],
+                _: &[TensorLayout],
+            ) -> KernelMatch {
+                KernelMatch::Supported {
+                    workspace_planning: WorkspacePlanning::Metadata,
+                    cost: Cost::ZERO,
+                    required_input_layouts: None,
+                    output_layouts: vec![],
+                }
+            }
+            fn claim_graph(&self, _: &Graph) -> Result<Vec<NodeId>> {
+                Ok(self.0.into_iter().collect())
+            }
+            fn get_kernel(&self, _: &Node, _: &[Vec<usize>], _: u64) -> Result<Box<dyn Kernel>> {
+                unreachable!()
+            }
+            fn allocate(&self, _: usize, _: usize) -> Result<DeviceBuffer> {
+                unreachable!()
+            }
+            fn deallocate(&self, _: DeviceBuffer) -> Result<()> {
+                unreachable!()
+            }
+            fn copy(&self, _: &DeviceBuffer, _: &mut DeviceBuffer, _: usize) -> Result<()> {
+                unreachable!()
+            }
+            fn copy_async(
+                &self,
+                _: &DeviceBuffer,
+                _: &mut DeviceBuffer,
+                _: usize,
+            ) -> Result<Fence> {
+                unreachable!()
+            }
+            fn sync(&self) -> Result<()> {
+                unreachable!()
+            }
+        }
+
+        for (domain, version, excluded) in [
+            ("", Some(1), true),
+            ("ai.onnx", Some(22), true),
+            ("", None, true),
+            ("test.custom", Some(22), false),
+        ] {
+            let (mut graph, random) = graph_with_node(
+                "RandomUniformLike",
+                domain,
+                &[DataType::Float32],
+                &[DataType::Float32],
+            );
+            graph.node_mut(random).version = version;
+            let random_input = graph.node(random).inputs[0].unwrap();
+            let random_output = graph.node(random).outputs[0];
+            graph.inputs.push(random_input);
+            let output = graph.create_named_value("neighbor", DataType::Float32, Shape::default());
+            let neighbor = graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![random_output],
+                vec![output],
+            ));
+            graph.outputs.push(output);
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+
+            for graph_kernel in [false, true] {
+                let ep = ClaimingEp(graph_kernel.then_some(random));
+                let baseline = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+                assert_eq!(baseline.len(), 1);
+                assert_eq!(baseline[0].node_ids, [random, neighbor]);
+
+                let mut saw_random = false;
+                let claims = query_plugin_capabilities(
+                    &view,
+                    &ep,
+                    NATIVE_RANDOM_EXCLUSIONS,
+                    |node, via_graph| {
+                        if view.node(node).id == random {
+                            assert_eq!(via_graph, graph_kernel);
+                            saw_random = true;
+                        }
+                        true
+                    },
+                )
+                .unwrap();
+                assert_eq!(saw_random, !excluded);
+                assert_eq!(claims.len(), 1);
+                if excluded {
+                    assert_eq!(claims[0].node_ids, [neighbor]);
+                } else {
+                    assert_eq!(claims[0].node_ids, [random, neighbor]);
+                }
+            }
+        }
+    }
+
     /// f32 node with matching registry entry is claimed.
     #[test]
     fn dtype_filter_claims_f32_node() {
@@ -2374,7 +2796,7 @@ mod tests {
         const FLOATS: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
         let entries = vec![KernelRegistryEntry {
             op_type: "DsaIndexSelect",
-            domain: "pkg.nxrt",
+            domain: "pkg.nxrt._private",
             since_version: 1,
             end_version: i32::MAX,
             supported_dtypes: &[
@@ -2394,7 +2816,7 @@ mod tests {
 
         let (good, good_id) = graph_with_node(
             "DsaIndexSelect",
-            "pkg.nxrt",
+            "pkg.nxrt._private",
             &[
                 DataType::Float32,
                 DataType::Float32,
@@ -2411,7 +2833,7 @@ mod tests {
 
         let (bad, bad_id) = graph_with_node(
             "DsaIndexSelect",
-            "pkg.nxrt",
+            "pkg.nxrt._private",
             &[
                 DataType::Float32,
                 DataType::Float32,

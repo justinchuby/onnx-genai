@@ -38,13 +38,17 @@ pub mod affine_gather;
 pub mod attention_window;
 pub mod bit_cast;
 pub mod epcontext;
+pub mod float8_cast;
 pub mod gemm;
 pub mod host_parallel;
 pub mod kernel;
 pub mod mean_variance_normalization;
 pub mod packed_routed;
 pub mod provider;
+pub mod random;
 pub mod registry;
+pub mod reverse_sequence;
+pub mod rnn;
 pub mod standard_activation;
 pub mod standard_math;
 pub mod tensor;
@@ -77,9 +81,9 @@ pub use provider::{
     ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactReport,
     ExecutorArtifactRequirementState, ExecutorArtifactState, ExecutorArtifactUseGuard,
     ExecutorInstanceId, ExecutorKernelScope, ExecutorRouteResidencyConfig, Fence,
-    GraphKernelClaims, GraphKernelRequest, GraphKernelScope, HostToDeviceCopier,
-    RawDeviceAllocationSiteStats, SealedDeviceAllocation, StructuralCaptureDecline,
-    WorkspaceAllocation,
+    GraphKernelClaims, GraphKernelRequest, GraphKernelScope, HostPayloadFunding,
+    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
+    StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

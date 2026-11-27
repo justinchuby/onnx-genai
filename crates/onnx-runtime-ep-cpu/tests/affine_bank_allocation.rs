@@ -1,5 +1,8 @@
 //! Real allocator evidence for borrowed affine expert-bank storage.
-use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DevicePtr, DevicePtrMut, ExecutionProvider, OutputMetadata, TensorMetadata, TensorMut,
+    TensorView, WorkspaceView,
+};
 use onnx_runtime_ep_cpu::{CpuExecutionProvider, dtype::to_dense};
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -225,13 +228,38 @@ fn affine_grouped_projection_has_no_bank_sized_copies_for_any_bank_layout() {
             &[128, 128, 1],
             onnx_runtime_ir::DeviceId::cpu(),
         );
+        let metadata = inputs
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect::<Vec<_>>();
+        let facts = [OutputMetadata::from_view(&y)];
+        let request = kernel
+            .workspace_requirement_for_execution(
+                &inputs,
+                std::slice::from_ref(&y),
+                &metadata,
+                &facts,
+                None,
+            )
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        let mut backing = vec![0u128; (request.bytes as usize).div_ceil(16)];
+        let workspace = WorkspaceView::new(
+            DevicePtrMut(backing.as_mut_ptr().cast()),
+            request.bytes as usize,
+        );
         kernel
-            .execute(&inputs, std::slice::from_mut(&mut y))
+            .execute_with_workspace(&inputs, std::slice::from_mut(&mut y), Some(workspace))
             .unwrap();
         let counts = observed(threshold, || {
             for _ in 0..4 {
                 kernel
-                    .execute(std::hint::black_box(&inputs), std::slice::from_mut(&mut y))
+                    .execute_with_workspace(
+                        std::hint::black_box(&inputs),
+                        std::slice::from_mut(&mut y),
+                        Some(workspace),
+                    )
                     .unwrap();
             }
         });
@@ -248,5 +276,128 @@ fn affine_grouped_projection_has_no_bank_sized_copies_for_any_bank_layout() {
             }
             assert_eq!(value.to_bits(), expected.to_bits(), "mode={mode} n={n}");
         }
+    }
+}
+
+#[test]
+fn affine_grouped_payloads_are_admitted_once_without_heap_copies() {
+    let (m, s, e, n, k) = (4usize, 8usize, 4usize, 64usize, 32usize);
+    let r = m * s;
+    let blocks = k / 2;
+    let mut node = Node::new(
+        NodeId(0),
+        onnx_runtime_ir::quantized_grouped::OP,
+        vec![],
+        vec![],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    for (name, value) in [("depth", k), ("block_size", 2), ("zero", 7)] {
+        node.attributes
+            .insert(name.into(), Attribute::Int(value as i64));
+    }
+    let kernel = CpuExecutionProvider::new()
+        .get_kernel(&node, &[], 1)
+        .unwrap();
+    let activation = vec![0.25f32; m * k];
+    let routes = (0..r).map(|i| (i % e) as i64).collect::<Vec<_>>();
+    let codes = vec![0x88; e * n * k / 2];
+    let scales = vec![1f32; e * n * blocks];
+    let zeros = vec![0x77; e * n * blocks.div_ceil(2)];
+    let xbytes = activation
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let rbytes = routes
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let sbytes = scales
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let mut result = vec![0f32; m * s * n];
+    let threshold = k * 4;
+    for bytes in [
+        m * k * 4,
+        r * size_of::<i64>(),
+        r * size_of::<usize>(),
+        m * s * n * 4,
+        k * 4,
+    ] {
+        assert!(
+            observed(threshold, || {
+                std::hint::black_box(vec![0u8; bytes]);
+            })
+            .1 > 0
+        );
+    }
+    for mode in [0, 1, 3, 4] {
+        let x = Backing::new(DataType::Float32, [1, m, k], &xbytes, mode);
+        let routes = Backing::new(DataType::Int64, [1, m, s], &rbytes, mode);
+        let weights = Backing::new(DataType::Uint8, [e, n, k / 2], &codes, mode);
+        let scales = Backing::new(DataType::Float32, [e, n, blocks], &sbytes, mode);
+        let zeros = Backing::new(DataType::Uint8, [e, n, blocks.div_ceil(2)], &zeros, mode);
+        let xs = [m, k];
+        let xstep = [x.strides[1], x.strides[2]];
+        let rs = [m, s];
+        let rstep = [routes.strides[1], routes.strides[2]];
+        let xview = TensorView::new(
+            x.view().data,
+            DataType::Float32,
+            &xs,
+            &xstep,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+        .with_byte_offset(x.offset);
+        let rview = TensorView::new(
+            routes.view().data,
+            DataType::Int64,
+            &rs,
+            &rstep,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+        .with_byte_offset(routes.offset);
+        let inputs = [xview, weights.view(), rview, scales.view(), zeros.view()];
+        let shape = [m, s, n];
+        let strides = [(s * n) as i64, n as i64, 1];
+        let mut out = TensorMut::new(
+            DevicePtrMut(result.as_mut_ptr().cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        let metadata = inputs
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
+            .collect::<Vec<_>>();
+        let req = kernel
+            .workspace_requirement_for_execution(
+                &inputs,
+                std::slice::from_ref(&out),
+                &metadata,
+                &[OutputMetadata::from_view(&out)],
+                None,
+            )
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        let mut backing = vec![0xaaaaaaaaaaaaaaaau128; (req.bytes as usize).div_ceil(16)];
+        let lane = WorkspaceView::new(
+            DevicePtrMut(backing.as_mut_ptr().cast()),
+            req.bytes as usize,
+        );
+        for _ in 0..4 {
+            let (_, copies) = observed(threshold, || {
+                kernel
+                    .execute_with_workspace(&inputs, std::slice::from_mut(&mut out), Some(lane))
+                    .unwrap()
+            });
+            assert_eq!(
+                copies, 0,
+                "mode={mode}: no payload-sized allocations during execution"
+            );
+        }
+        assert!(result.iter().all(|&v| v == 8.));
     }
 }

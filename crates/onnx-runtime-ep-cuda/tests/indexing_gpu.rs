@@ -132,7 +132,10 @@ fn run(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -157,7 +160,10 @@ fn run(
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_views = outputs
         .iter()
@@ -255,7 +261,10 @@ fn with_warmed_capture(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -280,7 +289,10 @@ fn with_warmed_capture(
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let workspace = std::cell::RefCell::new(None);
     let execute =
@@ -458,7 +470,10 @@ fn run_cpu(
         .unwrap();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -475,7 +490,10 @@ fn run_cpu(
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_bytes = outputs
         .iter()
@@ -1533,7 +1551,10 @@ fn scatter_elements_warmed_fp16_int32_path_is_capture_safe() {
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -1550,7 +1571,8 @@ fn scatter_elements_warmed_fp16_int32_path_is_capture_safe() {
         })
         .collect::<Vec<_>>();
     let mut output = ep.allocate(3 * std::mem::size_of::<f16>(), 256).unwrap();
-    let output_strides = compute_contiguous_strides(&[3]);
+    let output_strides = compute_contiguous_strides(&[3])
+        .expect("fixture shape has representable contiguous strides");
     let execute = |output: &mut DeviceBuffer| {
         let output_view = TensorMut::new(
             DevicePtrMut(output.as_mut_ptr()),

@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU correctness tests for `pkg.nxrt::PackedVarlenAttention` v1.
+//! GPU correctness tests for `pkg.nxrt._private::PackedVarlenAttention` v1.
 //!
 //! The packed (unpadded) varlen kernel must reproduce, sequence for sequence,
 //! what the standard `ai.onnx::Attention` kernel computes for the SAME logical
@@ -48,7 +48,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const PACKED_DOMAIN: &str = "pkg.nxrt";
+const PACKED_DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct Tensor {
@@ -201,7 +201,10 @@ fn run_node(
         .map(|input| {
             input
                 .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+                .map(|input| {
+                    compute_contiguous_strides(&input.shape)
+                        .expect("fixture shape has representable contiguous strides")
+                })
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>();
@@ -224,7 +227,8 @@ fn run_node(
     let out_elems: usize = out_shape.iter().product();
     let out_bytes = out_dtype.storage_bytes(out_elems);
     let mut output_buffer = ep.allocate(out_bytes.max(1), 256)?;
-    let output_strides = compute_contiguous_strides(&out_shape);
+    let output_strides = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         out_dtype,

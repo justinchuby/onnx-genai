@@ -11,9 +11,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::MirostatVersion;
-use llguidance::api::TopLevelGrammar;
-use llguidance::toktrie::{ApproximateTokEnv, InferenceCapabilities, TokRxInfo, TokTrie};
-use llguidance::{Constraint as LlgConstraint, ParserFactory};
+use onnx_genai_llguidance::api::TopLevelGrammar;
+use onnx_genai_llguidance::toktrie::{
+    ApproximateTokEnv, InferenceCapabilities, TokRxInfo, TokTrie,
+};
+use onnx_genai_llguidance::{Constraint as LlgConstraint, ParserFactory};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -247,12 +249,14 @@ pub trait LogitProcessor: Send + Sync {
 
 /// Ordered chain of logit processors.
 pub struct ProcessorChain {
+    publication_decoder: Option<std::sync::Arc<crate::byte_stream::ByteStreamContract>>,
     processors: Vec<Box<dyn LogitProcessor>>,
     device_transforms: Option<Vec<DeviceSamplingTransform>>,
     track_candidates: bool,
     track_candidate_ids: bool,
     optional_start: Option<usize>,
     selection_feedback: bool,
+    _decoder_workspace: Option<std::sync::Arc<onnx_runtime_memory_governor::MemoryLease>>,
 }
 impl Default for ProcessorChain {
     fn default() -> Self {
@@ -261,8 +265,32 @@ impl Default for ProcessorChain {
 }
 
 impl ProcessorChain {
+    pub(crate) fn bind_publication_decoder(
+        &mut self,
+        decoder: Option<std::sync::Arc<crate::byte_stream::ByteStreamContract>>,
+    ) {
+        self.publication_decoder = decoder;
+    }
+    pub(crate) fn publication_workspace(
+        &self,
+    ) -> Option<std::sync::Arc<onnx_runtime_memory_governor::MemoryLease>> {
+        self._decoder_workspace.clone()
+    }
+    pub(crate) fn publication_decoder(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::byte_stream::ByteStreamContract>> {
+        self.publication_decoder.as_ref()
+    }
+    pub(crate) fn retain_decoder_workspace(
+        &mut self,
+        lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+    ) {
+        self._decoder_workspace = lease.map(std::sync::Arc::new);
+    }
     pub fn new() -> Self {
         Self {
+            _decoder_workspace: None,
+            publication_decoder: None,
             processors: Vec::new(),
             device_transforms: Some(Vec::new()),
             track_candidates: false,
@@ -744,7 +772,7 @@ impl LlguidanceConstraint {
         } else {
             tok_trie
         };
-        let tok_env: llguidance::toktrie::TokEnv =
+        let tok_env: onnx_genai_llguidance::toktrie::TokEnv =
             std::sync::Arc::new(ApproximateTokEnv::new(tok_trie));
         Self::from_tok_env(kind, grammar, &tok_env, &prefix_ids, sampled_vocab_size)
     }
@@ -752,7 +780,7 @@ impl LlguidanceConstraint {
     fn from_tok_env(
         kind: GrammarConstraintKind,
         grammar: &str,
-        tok_env: &llguidance::toktrie::TokEnv,
+        tok_env: &onnx_genai_llguidance::toktrie::TokEnv,
         prefix_ids: &[TokenId],
         sampled_vocab_size: usize,
     ) -> anyhow::Result<Self> {
@@ -905,7 +933,7 @@ impl Constraint for LlguidanceConstraint {
 }
 
 impl LlguidanceState {
-    fn current_step(&mut self) -> anyhow::Result<llguidance::toktrie::StepResult> {
+    fn current_step(&mut self) -> anyhow::Result<onnx_genai_llguidance::toktrie::StepResult> {
         let previous = self.constraint.step_result();
         if previous.is_stop() || previous.sample_mask.is_some() {
             return Ok(previous.clone());
@@ -4903,8 +4931,11 @@ mod tests {
             crate::text_projection::ProjectionKind::Plain,
             prefix,
             4096,
-            vec![eos],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![eos],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         ConstraintProcessor::new(Box::new(constraint), texts, vec![eos])

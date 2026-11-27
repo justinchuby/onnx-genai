@@ -209,7 +209,7 @@ fn dequantize_packed_resolves_shape_and_checks_exact_payload() {
 fn dequantize_packed_gather_enforces_row_block_and_operand_contracts() {
     let packed_gather = |dims: Vec<i64>| {
         let mut n = node("DequantizePackedGather", 2, 1);
-        n.domain = "pkg.nxrt".into();
+        n.domain = "pkg.nxrt._private".into();
         n = with_attr(n, "format", Attribute::String(b"gguf:q5_1".to_vec()));
         with_attr(n, "shape", Attribute::Ints(dims))
     };
@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        297,
+        299,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -838,6 +838,24 @@ fn recurrent_only_sets_declared_outputs() {
         assert!(outputs[1].type_info.is_some(), "{op} Y_h");
         assert!(outputs[2].type_info.is_none(), "{op} has no Y_c");
     }
+}
+
+#[test]
+fn rnn_infers_optional_hidden_size_from_recurrent_weights() {
+    let outputs = run(
+        &node("RNN", 3, 2),
+        vec![
+            f32in(vec![c(5), c(3), c(7)]),
+            f32in(vec![c(1), sym(90), c(7)]),
+            f32in(vec![c(1), sym(90), sym(90)]),
+        ],
+        22,
+    );
+    assert_eq!(out_shape(&outputs), vec![c(5), c(1), c(3), sym(90)]);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(3), sym(90)]
+    );
 }
 
 #[test]
@@ -1389,7 +1407,35 @@ fn assert_quantized_matmul_shapes(n: &Node, n_in: usize) {
 
 #[test]
 fn block_quantized_matmul_uses_n_and_preserves_leading_dims() {
-    let n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt", 2, 4864);
+    let n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt._private", 2, 4864);
+    assert_quantized_matmul_shapes(&n, 2);
+}
+
+#[test]
+fn packed_activation_arithmetic_validates_the_explicit_abi_before_shape_work() {
+    for op in ["BlockQuantizedMatMul", "BlockQuantizedMoE"] {
+        for (mode, version, detail) in [
+            ("q8_0", 1, "integer 2"),
+            ("float32", 2, "integer 1"),
+            ("auto", 1, "activation_arithmetic"),
+        ] {
+            let mut n = with_domain(node(op, 0, 1), "pkg.nxrt._private");
+            n.attributes.insert(
+                "activation_arithmetic".into(),
+                Attribute::String(mode.as_bytes().to_vec()),
+            );
+            n.attributes
+                .insert("block_layout_version".into(), Attribute::Int(version));
+            assert_invalid(try_run(&n, vec![], 1).unwrap_err(), op, detail);
+        }
+    }
+    let mut n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt._private", 2, 4864);
+    n.attributes.insert(
+        "activation_arithmetic".into(),
+        Attribute::String(b"q8_0".to_vec()),
+    );
+    n.attributes
+        .insert("block_layout_version".into(), Attribute::Int(2));
     assert_quantized_matmul_shapes(&n, 2);
 }
 
@@ -2504,7 +2550,160 @@ fn opset27_recurrent_outputs_infer_carry_without_past_state() {
     for op in ["LinearAttention", "CausalConvWithState"] {
         assert!(registry.get("", op, 26).is_none());
         assert!(registry.get("", op, 28).is_some());
-        assert!(registry.get("", op, 29).is_none());
+        assert!(registry.get("", op, 29).is_some());
+    }
+}
+
+#[test]
+fn causal_conv_opset29_infers_and_checks_dilated_history() {
+    let causal = with_attr(
+        node("CausalConvWithState", 4, 2),
+        "dilation",
+        Attribute::Int(3),
+    );
+    let inputs = |history| {
+        vec![
+            f32in(vec![c(2), c(4), c(0)]),
+            f32in(vec![c(4), c(1), c(4)]),
+            f32in(vec![c(4)]),
+            f32in(vec![c(2), c(4), c(history)]),
+        ]
+    };
+    let outputs = run(&causal, inputs(9), 29);
+    assert_eq!(out_shape(&outputs), vec![c(2), c(4), c(0)]);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(4), c(9)]
+    );
+    let wrong_history = try_run(&causal, inputs(3), 29).unwrap_err().to_string();
+    assert!(
+        wrong_history.contains("past_state history must be 9"),
+        "{wrong_history}"
+    );
+    for version in [27, 28] {
+        let wrong_version = try_run(&causal, inputs(9), version)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_version.contains("opset 29"), "{wrong_version}");
+    }
+
+    let causal = with_attr(
+        node("CausalConvWithState", 2, 2),
+        "dilation",
+        Attribute::Int(i64::MAX),
+    );
+    let inputs = |k| vec![f32in(vec![c(1), c(1), c(0)]), f32in(vec![c(1), c(1), c(k)])];
+    let overflow = try_run(&causal, inputs(2), 29).unwrap_err().to_string();
+    assert!(overflow.contains("exceeds int64"), "{overflow}");
+    assert_eq!(
+        run(&causal, inputs(1), 29)[1]
+            .type_info
+            .as_ref()
+            .unwrap()
+            .shape,
+        vec![c(1), c(1), c(0)]
+    );
+}
+
+#[test]
+fn causal_conv_opset29_checks_known_history_with_symbolic_kernel() {
+    let causal = with_attr(
+        node("CausalConvWithState", 4, 2),
+        "dilation",
+        Attribute::Int(3),
+    );
+    let inputs = |history| {
+        vec![
+            f32in(vec![c(2), c(4), c(0)]),
+            f32in(vec![c(4), c(1), sym(7)]),
+            f32in(vec![c(4)]),
+            f32in(vec![c(2), c(4), c(history)]),
+        ]
+    };
+    for history in [0, 9] {
+        let output = run(&causal, inputs(history), 29);
+        assert_eq!(
+            output[1].type_info.as_ref().unwrap().shape,
+            vec![c(2), c(4), c(history)]
+        );
+    }
+    for (history, expected) in [
+        (-3, "nonnegative multiple of dilation"),
+        (4, "nonnegative multiple of dilation"),
+        (i64::MAX, "exceeds int64"),
+    ] {
+        let error = try_run(&causal, inputs(history), 29)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn linear_attention_29_infers_independent_state_heads_and_trajectory() {
+    let t = |dt, shape: &[i64]| tin(dt, shape.iter().copied().map(c).collect());
+    let f16 = DataType::Float16;
+    let f32 = DataType::Float32;
+    let linear = with_attr(
+        with_attr(
+            with_attr(
+                node("LinearAttention", 6, 3),
+                "q_num_heads",
+                Attribute::Int(2),
+            ),
+            "kv_num_heads",
+            Attribute::Int(2),
+        ),
+        "v_num_heads",
+        Attribute::Int(6),
+    );
+    let inputs = || {
+        vec![
+            t(f16, &[2, 0, 8]),
+            t(f16, &[2, 0, 8]),
+            t(f16, &[2, 0, 30]),
+            t(f32, &[2, 6, 4, 5]),
+            t(f16, &[2, 0, 24]),
+            t(f16, &[2, 0, 1]),
+        ]
+    };
+    let outputs = run(&linear, inputs(), 29);
+    for (i, (dtype, shape)) in [
+        (f16, vec![2, 0, 30]),
+        (f32, vec![2, 6, 4, 5]),
+        (f32, vec![2, 0, 6, 4, 5]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = outputs[i].type_info.as_ref().unwrap();
+        assert_eq!(output.dtype, dtype);
+        assert_eq!(output.shape, shape.into_iter().map(c).collect::<Vec<_>>());
+    }
+    let mut omitted = linear.clone();
+    omitted.outputs[2] = None;
+    assert!(run(&omitted, inputs(), 29)[2].type_info.is_none());
+    assert!(try_run(&linear, inputs(), 28).is_err());
+    for (attr, n) in [("v_num_heads", -1), ("v_num_heads", 5), ("q_num_heads", 4)] {
+        let err = try_run(
+            &with_attr(linear.clone(), attr, Attribute::Int(n)),
+            inputs(),
+            29,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("v_num_heads"), "{err}");
+    }
+    for (slot, shape, label) in [
+        (1, vec![2, 0, 6], "key head dimension"),
+        (2, vec![2, 0, 0], "value packed width"),
+        (3, vec![2, 2, 4, 5], "past_state"),
+        (4, vec![2, 0, 8], "decay last dimension"),
+        (5, vec![2, 0, 2], "beta last dimension"),
+    ] {
+        let mut bad = inputs();
+        bad[slot] = t(f16, &shape);
+        let err = try_run(&linear, bad, 29).unwrap_err();
+        assert!(err.to_string().contains(label), "{err}");
     }
 }
 
@@ -3842,7 +4041,7 @@ fn moe_and_qmoe_preserve_activation_shape() {
         assert_eq!(out_dtype(&outs), DataType::Float32);
     }
 
-    let n = with_domain(node("BlockQuantizedMoE", 5, 1), "pkg.nxrt");
+    let n = with_domain(node("BlockQuantizedMoE", 5, 1), "pkg.nxrt._private");
     let inputs = vec![
         f32in(vec![sym(0), c(4), c(512)]),
         f32in(vec![c(4), c(8)]),
@@ -3857,7 +4056,7 @@ fn moe_and_qmoe_preserve_activation_shape() {
 
 #[test]
 fn sparse_kv_gather_emits_selected_kv_shape() {
-    let n = with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt");
+    let n = with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3874,7 +4073,7 @@ fn sparse_kv_gather_emits_selected_kv_shape() {
 fn index_share_mirrors_query_and_present_kv() {
     // Exporter emission: 6 inputs (q, key, value, past_key, past_value,
     // selected_indices), single attn_output that mirrors the query.
-    let n = with_domain(node("IndexShare", 6, 1), "pkg.nxrt");
+    let n = with_domain(node("IndexShare", 6, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3891,7 +4090,7 @@ fn index_share_mirrors_query_and_present_kv() {
     assert_eq!(out_dtype(&outs), DataType::Float32);
 
     // With 3 outputs, present K/V are `[B, kv, S_past + S_cur, H]`.
-    let n = with_domain(node("IndexShare", 6, 3), "pkg.nxrt");
+    let n = with_domain(node("IndexShare", 6, 3), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3921,7 +4120,7 @@ fn kv_cache_capacity_append_reports_past_capacity_not_a_grown_concat() {
     // output keeps `past`'s shape even though `current` contributes tokens.
     // The `Concat` this op replaces would report `S_past + S_cur` (7 + 1 = 8)
     // for the same inputs, so 7-not-8 is the whole contract.
-    let n = with_domain(node("KvCacheCapacityAppend", 3, 1), "pkg.nxrt");
+    let n = with_domain(node("KvCacheCapacityAppend", 3, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3953,7 +4152,7 @@ fn kv_cache_capacity_append_reports_past_capacity_not_a_grown_concat() {
 
 #[test]
 fn varlen_attention_preserves_packed_query_geometry() {
-    let n = with_domain(node("VarlenAttention", 5, 1), "pkg.nxrt");
+    let n = with_domain(node("VarlenAttention", 5, 1), "pkg.nxrt._private");
     let outs = run(
         &n,
         vec![
@@ -3981,7 +4180,7 @@ fn custom_ops_validate_arity_rank_and_compression_contracts() {
     );
     assert!(
         try_run(
-            &with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt"),
+            &with_domain(node("SparseKvGather", 2, 1), "pkg.nxrt._private"),
             vec![
                 f32in(vec![c(2), c(3), c(4)]),
                 tin(DataType::Int32, vec![c(2), c(3), c(4), c(5)]),
@@ -3992,7 +4191,10 @@ fn custom_ops_validate_arity_rank_and_compression_contracts() {
     );
 
     let invalid_ratio = with_attr(
-        with_domain(node("CompressedSparseAttention", 10, 3), "pkg.nxrt"),
+        with_domain(
+            node("CompressedSparseAttention", 10, 3),
+            "pkg.nxrt._private",
+        ),
         "compression_ratio",
         Attribute::Int(8),
     );
@@ -4005,8 +4207,10 @@ fn custom_ops_validate_arity_rank_and_compression_contracts() {
         .is_err()
     );
 
-    let mut wrong_ratio128_arity =
-        with_domain(node("CompressedSparseAttention", 10, 2), "pkg.nxrt");
+    let mut wrong_ratio128_arity = with_domain(
+        node("CompressedSparseAttention", 10, 2),
+        "pkg.nxrt._private",
+    );
     for (name, value) in [
         ("num_heads", 1),
         ("head_dim", 64),
@@ -4048,7 +4252,7 @@ fn csa_ratio4_node(domain: &str) -> Node {
 
 #[test]
 fn compressed_sparse_attention_emits_all_ratio4_state_shapes() {
-    for domain in ["pkg.nxrt", "com.microsoft"] {
+    for domain in ["pkg.nxrt._private", "com.microsoft"] {
         let mut inputs = vec![NodeIo::default(); 19];
         inputs[0] = f32in(vec![sym(0), c(5), c(8), c(512)]);
         inputs[9] = sd_int_scalar(DataType::Int64, c(12));
@@ -4074,7 +4278,7 @@ fn compressed_sparse_attention_dynamic_total_resolves_every_output() {
     let mut inputs = vec![NodeIo::default(); 19];
     inputs[0] = f32in(vec![c(2), sym(0), c(8), c(512)]);
     inputs[9] = tin(DataType::Int64, vec![]);
-    let outs = run(&csa_ratio4_node("pkg.nxrt"), inputs, 1);
+    let outs = run(&csa_ratio4_node("pkg.nxrt._private"), inputs, 1);
     assert!(outs.iter().all(|output| output.type_info.is_some()));
     let cache_records = outs[1].type_info.as_ref().unwrap().shape[1].clone();
     let index_records = outs[3].type_info.as_ref().unwrap().shape[1].clone();
@@ -4089,7 +4293,10 @@ fn compressed_sparse_attention_dynamic_total_resolves_every_output() {
 
 #[test]
 fn compressed_sparse_attention_ratio128_emits_three_outputs() {
-    let mut n = with_domain(node("CompressedSparseAttention", 11, 3), "pkg.nxrt");
+    let mut n = with_domain(
+        node("CompressedSparseAttention", 11, 3),
+        "pkg.nxrt._private",
+    );
     for (name, value) in [
         ("num_heads", 8),
         ("head_dim", 512),
@@ -7418,6 +7625,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Cast", 1),
     ("", "CastLike", 1),
     ("", "CausalConvWithState", 27),
+    ("", "CausalConvWithState", 29),
     ("", "Ceil", 1),
     ("", "Celu", 12),
     ("", "CenterCropPad", 18),
@@ -7501,6 +7709,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Less", 1),
     ("", "LessOrEqual", 12),
     ("", "LinearAttention", 27),
+    ("", "LinearAttention", 29),
     ("", "Log", 1),
     ("", "Log1p", 29),
     ("", "LogCumSumExp", 29),
@@ -7670,17 +7879,17 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("com.microsoft", "SimplifiedLayerNormalization", 1),
     ("com.microsoft", "SkipLayerNormalization", 1),
     ("com.microsoft", "SkipSimplifiedLayerNormalization", 1),
-    ("pkg.nxrt", "AffineQuantizedGather", 1),
-    ("pkg.nxrt", "AffineQuantizedGroupedMatMul", 1),
-    ("pkg.nxrt", "BlockQuantizedMatMul", 1),
-    ("pkg.nxrt", "BlockQuantizedMoE", 1),
-    ("pkg.nxrt", "CompressedSparseAttention", 1),
-    ("pkg.nxrt", "DequantizePackedGather", 1),
-    ("pkg.nxrt", "IndexShare", 1),
-    ("pkg.nxrt", "KvCacheCapacityAppend", 1),
-    ("pkg.nxrt", "PackedGroupedMatMul", 1),
-    ("pkg.nxrt", "SparseKvGather", 1),
-    ("pkg.nxrt", "VarlenAttention", 1),
+    ("pkg.nxrt._private", "AffineQuantizedGather", 1),
+    ("pkg.nxrt._private", "AffineQuantizedGroupedMatMul", 1),
+    ("pkg.nxrt._private", "BlockQuantizedMatMul", 1),
+    ("pkg.nxrt._private", "BlockQuantizedMoE", 1),
+    ("pkg.nxrt._private", "CompressedSparseAttention", 1),
+    ("pkg.nxrt._private", "DequantizePackedGather", 1),
+    ("pkg.nxrt._private", "IndexShare", 1),
+    ("pkg.nxrt._private", "KvCacheCapacityAppend", 1),
+    ("pkg.nxrt._private", "PackedGroupedMatMul", 1),
+    ("pkg.nxrt._private", "SparseKvGather", 1),
+    ("pkg.nxrt._private", "VarlenAttention", 1),
 ];
 
 /// `""` is the normalized spelling of the default ONNX domain (see

@@ -51,6 +51,38 @@ fn test_api_base() -> *const ort::OrtApiBase {
 }
 
 #[test]
+fn cpu_factory_advertises_linear_attention_only_through_28() {
+    let mut factory = ptr::null_mut();
+    let mut count = 0;
+    let status = unsafe {
+        onnx_runtime_ep_cpu_plugin::CreateEpFactories(
+            ptr::null(),
+            test_api_base(),
+            ptr::null(),
+            &mut factory,
+            1,
+            &mut count,
+        )
+    };
+    assert!(status.is_null());
+    assert_eq!(count, 1);
+    assert!(!factory.is_null());
+    // The Rust-linked export returns this adapter's ExportedFactory.
+    let entries = unsafe {
+        &(*factory.cast::<onnx_runtime_ep_plugin::factory::ExportedFactory>())
+            .kernel_registry_entries
+    };
+    let ranges: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.domain.is_empty() && entry.op_type == "LinearAttention")
+        .map(|entry| (entry.since_version, entry.end_version))
+        .collect();
+    let status = unsafe { onnx_runtime_ep_cpu_plugin::ReleaseEpFactory(factory) };
+    assert!(status.is_null());
+    assert_eq!(ranges, [(27, 28)]);
+}
+
+#[test]
 fn dlopen_and_create_factory() {
     let path = find_cdylib();
 

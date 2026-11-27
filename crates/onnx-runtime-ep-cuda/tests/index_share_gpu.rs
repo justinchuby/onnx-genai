@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity tests for `pkg.nxrt::IndexShare` v1.
+//! GPU parity tests for `pkg.nxrt._private::IndexShare` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
 //! API, runs it through both the CPU reference kernel (the authoritative
@@ -50,7 +50,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 /// Absolute tolerance for the softmax attention output `Y`. Device `expf` and
 /// fused multiply-adds differ from host `libm` by ~1 ULP at these magnitudes.
 const Y_TOLERANCE: f32 = 1e-4;
@@ -298,7 +298,12 @@ fn run_cpu(
 
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -317,7 +322,10 @@ fn run_cpu(
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut out_bufs: Vec<Vec<u8>> = output_specs
         .iter()
@@ -405,7 +413,12 @@ fn run_gpu(
     }
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -424,7 +437,10 @@ fn run_gpu(
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_lens: Vec<usize> = output_specs
         .iter()
@@ -1007,7 +1023,12 @@ fn run_gpu_capture_replay(
     }
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -1026,7 +1047,10 @@ fn run_gpu_capture_replay(
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_lens: Vec<usize> = output_specs
         .iter()
@@ -1390,7 +1414,12 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     }
     let strides: Vec<_> = inputs
         .iter()
-        .map(|slot| slot.as_ref().map(|t| compute_contiguous_strides(&t.shape)))
+        .map(|slot| {
+            slot.as_ref().map(|t| {
+                compute_contiguous_strides(&t.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -1408,7 +1437,8 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         .collect();
 
     let out_len = specs[0].shape.iter().product::<usize>() * specs[0].dtype.byte_size();
-    let out_stride = compute_contiguous_strides(&specs[0].shape);
+    let out_stride = compute_contiguous_strides(&specs[0].shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut out_buffer = ep.allocate(out_len.max(1), 256).expect("alloc out");
     let mut workspace_buffer = None;
     let workspace = workspace_view_for(kernel.as_ref(), &input_views, &mut workspace_buffer, &ep)

@@ -37,6 +37,7 @@ pub struct ExportedFactory {
     /// When non-empty, `create_ep` builds an ORT kernel registry so that ORT
     /// routes f16/bf16 (and other typed) nodes to this EP.
     pub kernel_registry_entries: Vec<crate::ep::KernelRegistryEntry>,
+    operator_exclusions: crate::ep::OperatorExclusions,
     /// Device support configuration for generalized enumeration.
     pub device_support: DeviceSupport,
     /// Device allocators remain factory-owned after ORT releases them. The
@@ -190,6 +191,7 @@ fn build_factory(
         version_cstr,
         constructor,
         kernel_registry_entries: Vec::new(),
+        operator_exclusions: &[],
         device_support: DeviceSupport::cpu_only(),
         device_allocators: Mutex::new(HashMap::new()),
         shared_ep: None,
@@ -458,6 +460,34 @@ pub unsafe fn register_ordered_workspace_execution(
     exported.workspace_execution =
         Some(unsafe { crate::workspace::OrderedWorkspace::new(preflight) });
     ok_status()
+}
+
+/// Exclude operators from both ORT registration and capability discovery.
+///
+/// # Safety
+/// Call once on a live factory returned by this module, after setting its
+/// registry entries and before returning it to ORT or constructing any EPs.
+pub unsafe fn exclude_operators(
+    factory: *mut ort::OrtEpFactory,
+    exclusions: crate::ep::OperatorExclusions,
+) {
+    let exported = unsafe { &mut *factory.cast::<ExportedFactory>() };
+    exported.operator_exclusions = exclusions;
+    exported.kernel_registry_entries.retain_mut(|entry| {
+        let Some(since) =
+            crate::ep::first_excluded_revision(exclusions, entry.domain, entry.op_type)
+        else {
+            return true;
+        };
+        let Ok(since) = i32::try_from(since) else {
+            return true;
+        };
+        if entry.since_version >= since {
+            return false;
+        }
+        entry.end_version = entry.end_version.min(since - 1);
+        true
+    });
 }
 
 /// Outcome of the explicit shared-EP teardown attempted by
@@ -932,6 +962,7 @@ unsafe extern "C" fn factory_create_ep(
         let mut exported_ep = exported_ep;
         exported_ep.host_accessible = exported.device_support.host_accessible;
         exported_ep.workspace_execution = exported.workspace_execution.clone();
+        exported_ep.operator_exclusions = exported.operator_exclusions;
 
         let ep_ptr = Box::into_raw(exported_ep);
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
@@ -1311,6 +1342,250 @@ mod tests {
     use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
     use super::*;
+
+    #[test]
+    fn linear_attention_factory_excludes_schema_29_before_ort_partitioning() {
+        use onnx_runtime_ep_api::abi::OrtGraphView;
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Attribute, Graph, GraphView, GraphViewCache, NodeId, static_shape};
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 29);
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 2, 4]));
+        graph.add_input(x);
+        let mut q = x;
+        let mut nodes = Vec::new();
+        for revision in [27, 29, 28] {
+            let y = graph.create_named_value(
+                format!("y{revision}"),
+                DataType::Float32,
+                static_shape([1, 2, 4]),
+            );
+            let state = graph.create_named_value(
+                format!("state{revision}"),
+                DataType::Float32,
+                static_shape([1, 1, 4, 4]),
+            );
+            let mut node = onnx_runtime_ir::Node::new(
+                NodeId(0),
+                "LinearAttention",
+                vec![Some(q), Some(x), Some(x)],
+                vec![y, state],
+            );
+            node.version = Some(revision);
+            node.attributes
+                .insert("q_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("kv_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("update_rule".into(), Attribute::String(b"linear".to_vec()));
+            nodes.push(graph.insert_node(node));
+            q = y;
+        }
+        graph.add_output(q);
+        let cache = GraphViewCache::build(&graph).unwrap();
+        let view = GraphView::new(&graph, &cache);
+        let ort_view = OrtGraphView::new(&view);
+
+        let mut native = CpuExecutionProvider::new();
+        native.initialize(&EpConfig::default()).unwrap();
+        let native_claims = ort_view.query_capabilities(&native).unwrap();
+        assert_eq!(native_claims.len(), 1);
+        assert_eq!(native_claims[0].node_ids, nodes);
+
+        let mut factory = build_factory(
+            CString::new("linear_attention_scope_test").unwrap(),
+            Box::new(|| Box::new(CpuExecutionProvider::for_ort_plugin())),
+        );
+        let factory_ptr = std::ptr::from_mut(factory.as_mut()).cast::<ort::OrtEpFactory>();
+        let mut raw_ep = std::ptr::null_mut();
+        // SAFETY: this test uses a live factory with no host registry to build.
+        let status = unsafe {
+            ((*factory_ptr).CreateEp.unwrap())(
+                factory_ptr,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut raw_ep,
+            )
+        };
+        assert!(status.is_null() && !raw_ep.is_null());
+        // SAFETY: CreateEp returns a boxed ExportedEp owned by this test.
+        let exported = unsafe { Box::from_raw(raw_ep.cast::<ExportedEp>()) };
+        let claims = exported
+            .ep
+            .with(|ep| ort_view.query_capabilities(ep))
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].node_ids, [nodes[0]]);
+        assert_eq!(claims[1].node_ids, [nodes[2]]);
+    }
+
+    #[test]
+    fn standalone_rnn_exclusion_removes_registry_revisions_and_splits_claims() {
+        use crate::ep::{KernelRegistryEntry, STANDALONE_RNN_EXCLUSION, query_plugin_capabilities};
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, NodeId, static_shape};
+
+        let entry = |domain, op_type, since_version| KernelRegistryEntry {
+            domain,
+            op_type,
+            since_version,
+            end_version: i32::MAX,
+            supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
+        };
+        let mut factory = build_factory(
+            CString::new("test_rnn_factory").unwrap(),
+            Box::new(|| Box::new(CpuExecutionProvider::new())),
+        );
+        factory.kernel_registry_entries = vec![
+            entry("", "RNN", 14),
+            entry("ai.onnx", "RNN", 22),
+            entry("example", "RNN", 1),
+            entry("", "Identity", 19),
+        ];
+        let raw: *mut ExportedFactory = &mut *factory;
+        // SAFETY: the owned factory is live, configured, and has not been exposed.
+        unsafe { exclude_operators(raw.cast(), STANDALONE_RNN_EXCLUSION) };
+        assert_eq!(
+            factory
+                .kernel_registry_entries
+                .iter()
+                .map(|entry| (entry.domain, entry.op_type, entry.since_version))
+                .collect::<Vec<_>>(),
+            [("example", "RNN", 1), ("", "Identity", 19)]
+        );
+
+        let ep = CpuExecutionProvider::new();
+        for revision in [14, 22] {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), revision as u64);
+            let mut value = |name, shape| graph.create_named_value(name, DataType::Float32, shape);
+            let x = value("x", static_shape([1, 1, 1]));
+            let w = value("w", static_shape([1, 1, 1]));
+            let r = value("r", static_shape([1, 1, 1]));
+            let prepared = value("prepared", static_shape([1, 1, 1]));
+            let recurrent = value("recurrent", static_shape([1, 1, 1, 1]));
+            let output = value("output", static_shape([1, 1, 1, 1]));
+            for input in [x, w, r] {
+                graph.add_input(input);
+            }
+            let before = graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(x)],
+                vec![prepared],
+            ));
+            let mut rnn = Node::new(
+                NodeId(1),
+                "RNN",
+                vec![Some(prepared), Some(w), Some(r)],
+                vec![recurrent],
+            );
+            rnn.version = Some(revision);
+            let rnn = graph.insert_node(rnn);
+            let after = graph.insert_node(Node::new(
+                NodeId(2),
+                "Identity",
+                vec![Some(recurrent)],
+                vec![output],
+            ));
+            graph.add_output(output);
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+            let unfiltered = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+            assert!(unfiltered.iter().any(|claim| claim.node_ids.contains(&rnn)));
+
+            let claims =
+                query_plugin_capabilities(&view, &ep, factory.operator_exclusions, |_, _| true)
+                    .unwrap();
+            assert_eq!(claims.len(), 2);
+            assert!(claims.iter().any(|claim| claim.node_ids == [before]));
+            assert!(claims.iter().any(|claim| claim.node_ids == [after]));
+        }
+    }
+
+    #[test]
+    fn standalone_reverse_sequence_is_excluded_before_ort_partitioning() {
+        use crate::ep::{KernelRegistryEntry, SHIPPED_ORT_EXCLUSIONS, query_plugin_capabilities};
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, NodeId, static_shape};
+
+        let mut factory = build_factory(
+            CString::new("scope_test").unwrap(),
+            Box::new(|| Box::new(CpuExecutionProvider::new())),
+        );
+        factory.kernel_registry_entries = [
+            ("", "ReverseSequence", 10),
+            ("ai.onnx", "ReverseSequence", 28),
+            ("", "Identity", 1),
+            ("example", "ReverseSequence", 1),
+        ]
+        .map(|(domain, op_type, since_version)| KernelRegistryEntry {
+            domain,
+            op_type,
+            since_version,
+            end_version: i32::MAX,
+            supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
+        })
+        .to_vec();
+        // SAFETY: this live factory has not been handed to ORT.
+        let factory_ptr = std::ptr::from_mut(factory.as_mut()).cast();
+        unsafe { exclude_operators(factory_ptr, SHIPPED_ORT_EXCLUSIONS) };
+        assert_eq!(
+            factory
+                .kernel_registry_entries
+                .iter()
+                .map(|entry| (entry.domain, entry.op_type))
+                .collect::<Vec<_>>(),
+            [("", "Identity"), ("example", "ReverseSequence")],
+        );
+
+        let mut ep = CpuExecutionProvider::new();
+        ep.initialize(&EpConfig::default()).unwrap();
+        for opset in [10, 28] {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), opset);
+            let x = graph.create_named_value("x", DataType::Float32, static_shape([3, 2]));
+            let lengths = graph.create_named_value("lengths", DataType::Int64, static_shape([2]));
+            let reversed =
+                graph.create_named_value("reversed", DataType::Float32, static_shape([3, 2]));
+            let output =
+                graph.create_named_value("output", DataType::Float32, static_shape([3, 2]));
+            graph.add_input(x);
+            graph.add_input(lengths);
+            graph.add_output(output);
+            let reverse = graph.insert_node(Node::new(
+                NodeId(0),
+                "ReverseSequence",
+                vec![Some(x), Some(lengths)],
+                vec![reversed],
+            ));
+            let identity = graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(reversed)],
+                vec![output],
+            ));
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+
+            let standalone = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+            assert_eq!(standalone.len(), 1);
+            assert_eq!(standalone[0].node_ids, [reverse, identity]);
+            let plugin =
+                query_plugin_capabilities(&view, &ep, factory.operator_exclusions, |_, _| true)
+                    .unwrap();
+            assert_eq!(plugin.len(), 1);
+            assert_eq!(plugin[0].node_ids, [identity]);
+        }
+    }
 
     /// Counts `shutdown()` and `Drop` so a test can tell the explicit teardown
     /// path apart from the Drop-only fallback, and can catch a double shutdown.

@@ -258,7 +258,7 @@ impl Kernel for TransposeKernel {
                     std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<u8>(), bytes),
                 )
             };
-            permute_bytes(src, dst, &in_shape, &perm, esize);
+            permute_bytes(src, dst, &in_shape, &perm, esize)?;
             return Ok(());
         }
 
@@ -266,7 +266,7 @@ impl Kernel for TransposeKernel {
         // input or is not dense. Materialize both ends as the old kernel did.
         let din = to_dense_bytes(&inputs[0])?;
         let mut out = vec![0u8; total * esize];
-        permute_bytes(&din, &mut out, &in_shape, &perm, esize);
+        permute_bytes(&din, &mut out, &in_shape, &perm, esize)?;
         write_dense_bytes(&mut outputs[0], &out)
     }
 
@@ -349,7 +349,7 @@ fn permute_packed(
     // without borrowing the potentially uninitialized allocation as a slice.
     let lanes = 8 / bits;
     let mask = (1u8 << bits) - 1;
-    let in_strides = compute_contiguous_strides(input.shape);
+    let in_strides = compute_contiguous_strides(input.shape)?;
     for byte in 0..bytes {
         let mut packed = 0;
         let first = byte * lanes;
@@ -394,7 +394,13 @@ fn dense_disjoint_output(input: &TensorView, output: &mut TensorMut, bytes: usiz
 }
 
 /// Permute `src` into `dst`, both dense row-major, choosing the cheapest path.
-fn permute_bytes(src: &[u8], dst: &mut [u8], in_shape: &[usize], perm: &[usize], esize: usize) {
+fn permute_bytes(
+    src: &[u8],
+    dst: &mut [u8],
+    in_shape: &[usize],
+    perm: &[usize],
+    esize: usize,
+) -> Result<()> {
     debug_assert_eq!(src.len(), dst.len());
     let collapsed = collapse(in_shape, perm);
     let rank = collapsed.shape.len();
@@ -402,7 +408,7 @@ fn permute_bytes(src: &[u8], dst: &mut [u8], in_shape: &[usize], perm: &[usize],
     // Paths 1 and 2: nothing interleaves, so the tensors are byte-identical.
     if rank <= 1 || collapsed.perm.iter().copied().eq(0..rank) {
         dst.copy_from_slice(src);
-        return;
+        return Ok(());
     }
 
     // Path 3: the permutation fixes a trailing run of axes, so whole blocks of
@@ -423,8 +429,8 @@ fn permute_bytes(src: &[u8], dst: &mut [u8], in_shape: &[usize], perm: &[usize],
             &collapsed.shape[..split],
             &collapsed.perm[..split],
             inner * esize,
-        );
-        return;
+        )?;
+        return Ok(());
     }
 
     // Path 4: the last axis moves. Reduce to batched 2-D transposes when the
@@ -432,7 +438,7 @@ fn permute_bytes(src: &[u8], dst: &mut [u8], in_shape: &[usize], perm: &[usize],
     // prefix, which is what every real attention and matmul layout collapses to.
     if rank == 2 {
         blocked_2d(src, dst, collapsed.shape[0], collapsed.shape[1], esize);
-        return;
+        return Ok(());
     }
     if collapsed.perm[..rank - 2].iter().copied().eq(0..rank - 2)
         && collapsed.perm[rank - 2] == rank - 1
@@ -443,21 +449,28 @@ fn permute_bytes(src: &[u8], dst: &mut [u8], in_shape: &[usize], perm: &[usize],
         let cols = collapsed.shape[rank - 1];
         let plane = rows * cols * esize;
         batched_blocked_2d(src, dst, batch, rows, cols, esize, plane);
-        return;
+        return Ok(());
     }
 
     // General fallback: an odometer, but over the collapsed axes only, and
     // writing straight into `dst`.
-    scatter_general(src, dst, &collapsed.shape, &collapsed.perm, esize);
+    scatter_general(src, dst, &collapsed.shape, &collapsed.perm, esize)?;
+    Ok(())
 }
 
 /// Move `block` contiguous bytes per output position, permuting the positions.
 ///
 /// `shape`/`perm` describe the outer axes only; the trailing axes the
 /// permutation fixed have already been folded into `block`.
-fn block_move(src: &[u8], dst: &mut [u8], shape: &[usize], perm: &[usize], block: usize) {
+fn block_move(
+    src: &[u8],
+    dst: &mut [u8],
+    shape: &[usize],
+    perm: &[usize],
+    block: usize,
+) -> Result<()> {
     let out_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
-    let in_strides = compute_contiguous_strides(shape);
+    let in_strides = compute_contiguous_strides(shape)?;
     let blocks = numel(&out_shape);
     debug_assert_eq!(blocks * block, dst.len());
 
@@ -493,6 +506,7 @@ fn block_move(src: &[u8], dst: &mut [u8], shape: &[usize], perm: &[usize], block
         }
         None => body(dst, 0),
     }
+    Ok(())
 }
 
 /// Cache-blocked 2-D transpose of a `rows x cols` matrix of `esize`-byte
@@ -587,9 +601,15 @@ fn batched_blocked_2d(
 /// the innermost pair — rank >= 3 after collapsing with a rotation, which real
 /// models produce rarely. It is still strictly better than the original: the
 /// odometer runs over the collapsed rank, and there is no intermediate buffer.
-fn scatter_general(src: &[u8], dst: &mut [u8], shape: &[usize], perm: &[usize], esize: usize) {
+fn scatter_general(
+    src: &[u8],
+    dst: &mut [u8],
+    shape: &[usize],
+    perm: &[usize],
+    esize: usize,
+) -> Result<()> {
     let out_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
-    let in_strides = compute_contiguous_strides(shape);
+    let in_strides = compute_contiguous_strides(shape)?;
     let src_strides: Vec<usize> = perm.iter().map(|&p| in_strides[p] as usize).collect();
     let mut idx = vec![0usize; shape.len()];
     let mut written = 0usize;
@@ -602,6 +622,7 @@ fn scatter_general(src: &[u8], dst: &mut [u8], shape: &[usize], perm: &[usize], 
             break;
         }
     }
+    Ok(())
 }
 
 /// Mixed-radix digits of `flat` under `shape`.
@@ -665,7 +686,8 @@ mod tests {
     /// the reference every fast path is checked against.
     fn reference(src: &[u8], in_shape: &[usize], perm: &[usize], esize: usize) -> Vec<u8> {
         let out_shape: Vec<usize> = perm.iter().map(|&p| in_shape[p]).collect();
-        let in_strides = compute_contiguous_strides(in_shape);
+        let in_strides = compute_contiguous_strides(in_shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut out = vec![0u8; numel(&out_shape) * esize];
         if out.is_empty() {
             return out;

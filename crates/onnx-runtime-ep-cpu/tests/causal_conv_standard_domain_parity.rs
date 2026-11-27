@@ -1,4 +1,4 @@
-//! `CausalConvWithState` under the standard `ai.onnx` opset-27 spelling.
+//! `CausalConvWithState` under the standard `ai.onnx` spelling.
 //!
 //! We already implemented this as a `com.microsoft` contrib op for Qwen3.5 /
 //! Gated DeltaNet. ONNX standardized the same operation in opset 27, and this
@@ -215,4 +215,101 @@ fn an_omitted_bias_before_a_present_past_state_is_not_read_as_the_bias() {
         0.0,
     );
     assert_close(&present.to_f32(), &[3.0, 4.0, 7.0, 8.0], 0.0);
+}
+
+#[test]
+fn causal_conv_opset29_keeps_raw_history_across_short_empty_and_long_chunks() {
+    use onnx_runtime_ep_api::TensorView;
+    use onnx_runtime_ir::DataType;
+
+    let weight = Tensor::floats(FloatDType::F32, &[1, 1, 3], &[1.0, 10.0, 100.0]);
+    let run_chunk = |x: &[f32], state: Option<&[f32]>| {
+        let x_shape = [1, 1, x.len()];
+        let state_shape = [1, 1, 4];
+        let x = Tensor::floats(FloatDType::F32, &x_shape, x);
+        let past = state.map(|s| Tensor::floats(FloatDType::F32, &state_shape, s));
+        let mut inputs = vec![x.view(), weight.view()];
+        let mut shapes = vec![x_shape.to_vec(), vec![1, 1, 3]];
+        if let Some(past) = &past {
+            inputs.extend([TensorView::absent(DataType::Undefined), past.view()]);
+            shapes.extend([vec![], state_shape.to_vec()]);
+        }
+        let mut output = Tensor::zeros(FloatDType::F32, &x_shape);
+        let mut present = Tensor::zeros(FloatDType::F32, &state_shape);
+        make_kernel(
+            "CausalConvWithState",
+            [("dilation", Attribute::Int(2))],
+            &shapes,
+            29,
+        )
+        .execute(&inputs, &mut [output.view_mut(), present.view_mut()])
+        .unwrap();
+        (output.to_f32(), present.to_f32())
+    };
+    assert_eq!(run_chunk(&[], None), (vec![], vec![0.0; 4]));
+    let (a, state) = run_chunk(&[1.0, 2.0], None);
+    assert_eq!(a, [100.0, 200.0]);
+    assert_eq!(state, [0.0, 0.0, 1.0, 2.0]);
+    let (empty, copied) = run_chunk(&[], Some(&state));
+    assert!(empty.is_empty());
+    assert_eq!(copied, state);
+    let (b, state) = run_chunk(&[3.0], Some(&copied));
+    assert_eq!(b, [310.0]);
+    assert_eq!(state, [0.0, 1.0, 2.0, 3.0]);
+    let (c, state) = run_chunk(&[4.0, 5.0, 6.0], Some(&state));
+    assert_eq!(c, [420.0, 531.0, 642.0]);
+    assert_eq!(state, [3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(
+        run_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], None),
+        ([a, b, c].concat(), state)
+    );
+}
+
+#[test]
+fn causal_conv_rejects_dilation_in_older_schemas_and_invalid_opset29_values() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ep_cpu::CpuExecutionProvider;
+    use onnx_runtime_ir::{Node, NodeId};
+
+    let ep = CpuExecutionProvider::new();
+    for (domain, opset, attr, message) in [
+        ("", 27, Attribute::Int(1), "opset 29"),
+        ("", 28, Attribute::Int(2), "opset 29"),
+        ("com.microsoft", 1, Attribute::Int(2), "opset 29"),
+        ("", 29, Attribute::Int(0), "integer >= 1"),
+        ("", 29, Attribute::Int(-1), "integer >= 1"),
+        ("", 29, Attribute::Float(2.0), "integer >= 1"),
+    ] {
+        let mut node = Node::new(NodeId(0), "CausalConvWithState", vec![], vec![]);
+        node.domain = domain.into();
+        node.attributes.insert("dilation".into(), attr);
+        let error = ep.get_kernel(&node, &[], opset).err().unwrap().to_string();
+        assert!(error.contains(message), "opset {opset}: {error}");
+    }
+}
+
+#[test]
+fn causal_conv_opset29_requires_one_dtype_for_all_inputs() {
+    let shape = [1, 1, 1];
+    let input = Tensor::floats(FloatDType::F32, &shape, &[1.0]);
+    let weight = Tensor::floats(FloatDType::F16, &shape, &[1.0]);
+    let mut output = Tensor::zeros(FloatDType::F32, &shape);
+    let mut present = Tensor::zeros(FloatDType::F32, &[1, 1, 0]);
+    let kernel = make_kernel(
+        "CausalConvWithState",
+        [],
+        &[shape.to_vec(), shape.to_vec()],
+        29,
+    );
+    let error = kernel
+        .execute(
+            &[input.view(), weight.view()],
+            &mut [output.view_mut(), present.view_mut()],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("weight dtype Float16 must match input dtype Float32"),
+        "{error}"
+    );
 }

@@ -635,7 +635,7 @@ pub struct KernelSizedOutputMetadata {
 
 /// An executor-delivered kernel input. Existing EPs receive `Tensor` variants;
 /// an EP advertising the `nxrt` capability may receive a lazy `Weight` at the
-/// `pkg.nxrt::BlockQuantizedMoE` boundary.
+/// `pkg.nxrt._private::BlockQuantizedMoE` boundary.
 pub enum KernelInput<'a> {
     Tensor(TensorView<'a>),
     Weight(&'a WeightHandle),
@@ -1095,6 +1095,16 @@ pub trait Kernel: Send + KernelType {
         provider: &dyn ExecutionProvider,
     ) -> Result<()> {
         let _ = (constants, provider);
+        Ok(())
+    }
+
+    /// Bind mutable execution state scoped to this node in this executor.
+    /// The callback retains the initial state across shape specialization and
+    /// eviction; kernels without per-node state must not call it.
+    fn bind_node_run_state(
+        &mut self,
+        _bind: &mut dyn FnMut(Arc<dyn Any + Send + Sync>) -> Arc<dyn Any + Send + Sync>,
+    ) -> Result<()> {
         Ok(())
     }
 
