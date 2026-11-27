@@ -75,8 +75,8 @@ plugin EPs (via C ABI bridge) handle them.
 | Pad | 11 | |
 | Flatten | 9 | |
 | MatMulNBits (contrib) | — | INT4 quantized matmul (replaces MatMulInteger). |
-| DequantizeLinear | 10 | INT4/INT8 weight dequantization. |
-| QuantizeLinear | 10 | Activation quantization. |
+| DequantizeLinear | 10 | Standalone INT16/UINT16: scalar at opset 10+, per-axis at 13+, blocked at 21+, and independent floating `output_dtype` at 23+. |
+| QuantizeLinear | 10 | Standalone INT16/UINT16: scalar at opset 10+, per-axis at 13+, blocked at 21+, and independent division `precision` at 23+. A typed zero point selects 16-bit output before opset 21. |
 | QLinearMatMul | 10 | Quantized matmul. |
 | Einsum | 12, 28 | Schema-aware universal semantic/index plan for every legal expression, with `Einsum-12` selected for imported opsets 12..27 and `Einsum-28` for opset 28+ (adding BF16). CPU and CUDA execute the full schema dtype set and arbitrary legal 1..N expressions through zero-copy views, reduction/product, MatMul/BMM, bounded exact-DP/greedy trees, or the mandatory GenericNative fallback; CUDA retains capture-safe snapshots and cuBLASLt fast paths when the complete layout/alignment contract matches. See [EINSUM_PLANNING.md](EINSUM_PLANNING.md), [EINSUM_CONFORMANCE.md](../testing/EINSUM_CONFORMANCE.md), and [CUDA_COVERAGE.md](CUDA_COVERAGE.md). |
 | Tile | 6 | Repeat for broadcasting. |
@@ -111,7 +111,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | SpaceToDepth | 1 | Standalone nxrt inverse NCHW rearrangement; `mode` since opset 28 (DCR default, or CRD). ORT plugin registration remains unchanged. |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
-| Compress | 9 | |
+| Compress | 9, 11, 28 | Compress-28 adds BF16. Native CPU and CUDA preserve BF16 element bits during selection. String tensors are not handled by the CUDA kernel. |
 | Scatter | 9 | |
 | Unique | 11 | |
 | NMS (NonMaxSuppression) | 10 | Detection models. |

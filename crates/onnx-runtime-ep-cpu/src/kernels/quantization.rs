@@ -1,6 +1,7 @@
 //! Standard ONNX linear quantization kernels.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::int16_quantization as q16;
 use onnx_runtime_ir::{DataType, Node};
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
@@ -8,13 +9,44 @@ use super::{check_arity, to_dense_bytes, write_dense_bytes};
 pub struct QuantizeLinearKernel {
     axis: i64,
     block_size: Option<usize>,
+    output_dtype: Option<DataType>,
+    precision: std::result::Result<Option<DataType>, String>,
+    int16: Option<(u64, Node)>,
 }
 
-pub struct QuantizeLinearFactory;
+struct QuantizeLinearFactory {
+    int16_revision: Option<u64>,
+}
+
+pub(crate) fn register_linear_quantization(
+    registry: &mut onnx_runtime_ep_api::OpRegistry,
+    native: bool,
+) {
+    use onnx_runtime_ep_api::{OpKey, WorkspacePlanning};
+    for version in [10, 13, 19, 21, 23, 25] {
+        let int16_revision = native.then_some(version);
+        registry.register(
+            OpKey::new("QuantizeLinear", "", version),
+            WorkspacePlanning::None,
+            Box::new(QuantizeLinearFactory { int16_revision }),
+        );
+        registry.register(
+            OpKey::new("DequantizeLinear", "", version),
+            WorkspacePlanning::None,
+            Box::new(DequantizeLinearFactory { int16_revision }),
+        );
+    }
+}
 
 impl KernelFactory for QuantizeLinearFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(QuantizeLinearKernel {
+            int16: self.int16_revision.map(|revision| (revision, node.clone())),
+            output_dtype: q16::attribute_dtype(node, "output_dtype")
+                .ok()
+                .flatten()
+                .filter(|&dtype| q16::is_code(dtype)),
+            precision: q16::attribute_dtype(node, "precision"),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1),
             block_size: node
                 .attr("block_size")
@@ -29,13 +61,17 @@ pub struct DequantizeLinearKernel {
     axis: i64,
     block_size: Option<usize>,
     output_dtype: Option<DataType>,
+    int16: Option<(u64, Node)>,
 }
 
-pub struct DequantizeLinearFactory;
+struct DequantizeLinearFactory {
+    int16_revision: Option<u64>,
+}
 
 impl KernelFactory for DequantizeLinearFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(DequantizeLinearKernel {
+            int16: self.int16_revision.map(|revision| (revision, node.clone())),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1),
             block_size: node
                 .attr("block_size")
@@ -73,6 +109,11 @@ impl KernelFactory for DynamicQuantizeLinearFactory {
 impl Kernel for QuantizeLinearKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QuantizeLinear", inputs, outputs, 2, 3, 1)?;
+        if let Some((revision, node)) = &self.int16
+            && q16::is_code(outputs[0].dtype)
+        {
+            return self.quantize_int16(*revision, node, inputs, &mut outputs[0]);
+        }
         let x = read_floats("QuantizeLinear", &inputs[0])?;
         let scale = read_floats("QuantizeLinear", &inputs[1])?;
         let zp_dtype = if inputs.len() == 3 && !inputs[2].is_absent() {
@@ -87,7 +128,7 @@ impl Kernel for QuantizeLinearKernel {
             )));
         }
         let zp = if inputs.len() == 3 && !inputs[2].is_absent() {
-            read_integers("QuantizeLinear", &inputs[2])?
+            read_integers("QuantizeLinear", &inputs[2], false)?
         } else {
             vec![0]
         };
@@ -116,10 +157,98 @@ impl Kernel for QuantizeLinearKernel {
     }
 }
 
+impl QuantizeLinearKernel {
+    fn quantize_int16(
+        &self,
+        revision: u64,
+        node: &Node,
+        inputs: &[TensorView],
+        out: &mut TensorMut,
+    ) -> Result<()> {
+        let op = "QuantizeLinear";
+        let invalid = |detail| EpError::KernelFailed(format!("{op}: {detail}"));
+        q16::validate_revision(node, revision, Some(inputs[1].shape.len())).map_err(invalid)?;
+        q16::validate_quantize_types(revision, inputs[0].dtype, inputs[1].dtype)
+            .map_err(invalid)?;
+        let zp = inputs.get(2).filter(|v| !v.is_absent());
+        let expected = zp
+            .map(|z| z.dtype)
+            .or(self.output_dtype)
+            .unwrap_or(DataType::Uint8);
+        if out.dtype != expected || self.output_dtype.is_some_and(|dtype| dtype != expected) {
+            return Err(invalid(format!(
+                "output dtype {:?}, zero_point dtype {:?} and output_dtype {:?} must agree",
+                out.dtype,
+                zp.map(|z| z.dtype),
+                self.output_dtype
+            )));
+        }
+        let precision = q16::quantize_precision(
+            *self
+                .precision
+                .as_ref()
+                .map_err(|detail| invalid(detail.clone()))?,
+            inputs[0].dtype,
+            inputs[1].dtype,
+        )
+        .map_err(invalid)?;
+        let read = |view: &TensorView| -> Result<Vec<f64>> {
+            if view.dtype == DataType::Int32 {
+                Ok(read_integers(op, view, false)?
+                    .into_iter()
+                    .map(|value| value as f64)
+                    .collect())
+            } else {
+                Ok(read_floats(op, view)?.into_iter().map(f64::from).collect())
+            }
+        };
+        let x = read(&inputs[0])?;
+        let scale = read(&inputs[1])?;
+        let zeros = zp.map_or_else(|| Ok(vec![0]), |view| read_integers(op, view, true))?;
+        let params = Params::new(
+            op,
+            inputs[0].shape,
+            inputs[1].shape,
+            &scale,
+            zp.map(|v| v.shape),
+            &zeros,
+            self.axis,
+            self.block_size,
+        )?;
+        let narrow = |value: f64| match precision {
+            DataType::Float16 => half::f16::from_f64(value).to_f64(),
+            DataType::BFloat16 => half::bf16::from_f64(value).to_f64(),
+            _ => value,
+        };
+        let mut bytes = Vec::with_capacity(x.len() * out.dtype.byte_size());
+        for (i, value) in x.into_iter().enumerate() {
+            let p = params.at(i);
+            let quotient = if precision == DataType::Float32 {
+                f64::from(value as f32 / scale[p] as f32)
+            } else {
+                narrow(narrow(value) / narrow(scale[p]))
+            };
+            let code = (quotient.round_ties_even() as i64)
+                .saturating_add(zeros[if zp.is_some() { p } else { 0 }]);
+            write_integer(&mut bytes, out.dtype, code)?;
+        }
+        write_dense_bytes(out, &bytes)
+    }
+}
+
 impl Kernel for DequantizeLinearKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("DequantizeLinear", inputs, outputs, 2, 3, 1)?;
-        let x = read_integers("DequantizeLinear", &inputs[0])?;
+        let accepts_int16 = self.int16.is_some();
+        if let Some((revision, node)) = &self.int16
+            && q16::is_code(inputs[0].dtype)
+        {
+            let invalid = |detail| EpError::KernelFailed(format!("DequantizeLinear: {detail}"));
+            q16::validate_revision(node, *revision, Some(inputs[1].shape.len()))
+                .map_err(invalid)?;
+            q16::validate_dequantize_scale(*revision, inputs[1].dtype).map_err(invalid)?;
+        }
+        let x = read_integers("DequantizeLinear", &inputs[0], accepts_int16)?;
         let scale = read_floats("DequantizeLinear", &inputs[1])?;
         let output_dtype = self.output_dtype.unwrap_or(inputs[1].dtype);
         if outputs[0].dtype != output_dtype {
@@ -135,7 +264,7 @@ impl Kernel for DequantizeLinearKernel {
                     inputs[2].dtype, inputs[0].dtype
                 )));
             }
-            read_integers("DequantizeLinear", &inputs[2])?
+            read_integers("DequantizeLinear", &inputs[2], accepts_int16)?
         } else {
             vec![0]
         };
@@ -216,17 +345,20 @@ struct Params {
 
 impl Params {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn new<T: Into<f64> + Copy>(
         op: &str,
         x_shape: &[usize],
         scale_shape: &[usize],
-        scale: &[f32],
+        scale: &[T],
         zp_shape: Option<&[usize]>,
         zp: &[i64],
         axis: i64,
         block_size: Option<usize>,
     ) -> Result<Self> {
-        if scale.iter().any(|&s| s <= 0.0 || !s.is_finite()) {
+        if scale.iter().any(|&s| {
+            let s = s.into();
+            s <= 0.0 || !s.is_finite()
+        }) {
             return Err(EpError::KernelFailed(format!(
                 "{op}: scale values must be finite and positive"
             )));
@@ -329,7 +461,7 @@ fn read_floats(op: &str, view: &TensorView) -> Result<Vec<f32>> {
     })
 }
 
-fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
+fn read_integers(op: &str, view: &TensorView, int16: bool) -> Result<Vec<i64>> {
     if matches!(view.dtype, DataType::Int4 | DataType::Uint4) {
         view.validate()?;
         if !view.device.is_host_accessible() || !view.is_contiguous() {
@@ -354,6 +486,18 @@ fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
     Ok(match view.dtype {
         DataType::Int8 => bytes.iter().map(|&b| b as i8 as i64).collect(),
         DataType::Uint8 => bytes.into_iter().map(i64::from).collect(),
+        DataType::Int16 if int16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i64::from(i16::from_le_bytes(*b)))
+            .collect(),
+        DataType::Uint16 if int16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i64::from(u16::from_le_bytes(*b)))
+            .collect(),
         DataType::Int32 => bytes
             .as_chunks::<4>()
             .0
@@ -361,8 +505,9 @@ fn read_integers(op: &str, view: &TensorView) -> Result<Vec<i64>> {
             .map(|b| i32::from_le_bytes(*b) as i64)
             .collect(),
         other => {
+            let extra = if int16 { "Int16, Uint16, " } else { "" };
             return Err(EpError::KernelFailed(format!(
-                "{op}: expected Int4, Uint4, Int8, Uint8, or Int32 quantized tensors, got {other:?}"
+                "{op}: expected Int4, Uint4, Int8, Uint8, {extra}or Int32 quantized tensors, got {other:?}"
             )));
         }
     })
@@ -399,6 +544,12 @@ fn write_integer(bytes: &mut Vec<u8>, dtype: DataType, value: i64) -> Result<()>
     match dtype {
         DataType::Int8 => bytes.push(value.clamp(i8::MIN as i64, i8::MAX as i64) as i8 as u8),
         DataType::Uint8 => bytes.push(value.clamp(0, u8::MAX as i64) as u8),
+        DataType::Int16 => bytes.extend_from_slice(
+            &(value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16).to_le_bytes(),
+        ),
+        DataType::Uint16 => {
+            bytes.extend_from_slice(&(value.clamp(0, i64::from(u16::MAX)) as u16).to_le_bytes())
+        }
         DataType::Int32 => bytes.extend_from_slice(
             &(value.clamp(i32::MIN as i64, i32::MAX as i64) as i32).to_le_bytes(),
         ),
@@ -414,7 +565,101 @@ fn write_integer(bytes: &mut Vec<u8>, dtype: DataType, value: i64) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_ep_api::ExecutionProvider;
+
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn ort_plugin_keeps_legacy_linear_quantization_factories() {
+        let native = crate::CpuExecutionProvider::new();
+        let plugin = crate::CpuExecutionProvider::for_ort_plugin();
+        let q = Node::new(onnx_runtime_ir::NodeId(0), "QuantizeLinear", vec![], vec![]);
+        let dq = Node::new(
+            onnx_runtime_ir::NodeId(1),
+            "DequantizeLinear",
+            vec![],
+            vec![],
+        );
+        let scale = Owned::f32(&[], &[0.5]);
+        let x = Owned::f32(&[2], &[1.0, 2.0]);
+
+        for dtype in [DataType::Uint8, DataType::Int16, DataType::Uint16] {
+            assert!(super::super::supported_dtypes_for_op("QuantizeLinear", "").contains(&dtype));
+            assert_eq!(
+                super::super::supported_dtypes_for_op("DequantizeLinear", "").contains(&dtype),
+                dtype == DataType::Uint8
+            );
+            let zp = Owned::zeros(dtype, &[]);
+            for (provider, opset, accepts_int16) in [
+                (&plugin, 21, false),
+                (&native, 10, true),
+                (&native, 19, true),
+                (&native, 21, true),
+            ] {
+                let accepted = dtype == DataType::Uint8 || accepts_int16;
+                let mut codes = Owned::zeros(dtype, &[2]);
+                let result = provider.get_kernel(&q, &[], opset).unwrap().execute(
+                    &[x.view(), scale.view(), zp.view()],
+                    &mut [codes.view_mut()],
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "Q {dtype:?} at opset {opset}: {result:?}"
+                );
+                let mut values = Owned::zeros_f32(&[2]);
+                let result = provider.get_kernel(&dq, &[], opset).unwrap().execute(
+                    &[codes.view(), scale.view(), zp.view()],
+                    &mut [values.view_mut()],
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "DQ {dtype:?} at opset {opset}: {result:?}"
+                );
+                if accepted {
+                    assert_eq!(values.bytes, x.bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn int16_factories_validate_runtime_rank_without_compile_shapes() {
+        let provider = crate::CpuExecutionProvider::new();
+        let x = Owned::f32(&[2, 2], &[1.; 4]);
+        let scale = Owned::f32(&[2], &[0.5; 2]);
+        let zp = Owned::zeros(DataType::Int16, &[2]);
+        let mut codes = Owned::zeros(DataType::Int16, &[2, 2]);
+        let mut values = Owned::zeros_f32(&[2, 2]);
+        let q = Node::new(onnx_runtime_ir::NodeId(0), "QuantizeLinear", vec![], vec![]);
+        let dq = Node::new(
+            onnx_runtime_ir::NodeId(1),
+            "DequantizeLinear",
+            vec![],
+            vec![],
+        );
+        let result = provider.get_kernel(&q, &[], 10).unwrap().execute(
+            &[x.view(), scale.view(), zp.view()],
+            &mut [codes.view_mut()],
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires a scalar scale")
+        );
+        let result = provider.get_kernel(&dq, &[], 10).unwrap().execute(
+            &[codes.view(), scale.view(), zp.view()],
+            &mut [values.view_mut()],
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires a scalar scale")
+        );
+    }
 
     fn i8(shape: &[usize], data: &[i8]) -> Owned {
         Owned {
@@ -432,6 +677,7 @@ mod tests {
         let scale = Owned::f32(&[], &[0.5]);
         let mut out = Owned::zeros_f32(&[3]);
         DequantizeLinearKernel {
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: None,
@@ -448,6 +694,7 @@ mod tests {
         let zp = Owned::u8(&[2], &[2, 4]);
         let mut out = Owned::zeros_f32(&[2, 2]);
         DequantizeLinearKernel {
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: None,
@@ -463,6 +710,9 @@ mod tests {
         let scale = Owned::f32(&[], &[1.0]);
         let mut out = Owned::zeros(DataType::Uint8, &[6]);
         QuantizeLinearKernel {
+            int16: None,
+            output_dtype: None,
+            precision: Ok(None),
             axis: 1,
             block_size: None,
         }
@@ -478,6 +728,9 @@ mod tests {
         let zp = Owned::u8(&[2], &[2, 4]);
         let mut q = Owned::zeros(DataType::Uint8, &[2, 2]);
         QuantizeLinearKernel {
+            int16: None,
+            output_dtype: None,
+            precision: Ok(None),
             axis: 1,
             block_size: None,
         }
@@ -486,6 +739,7 @@ mod tests {
         assert_eq!(q.to_u8(), vec![4, 8, 6, 12]);
         let mut round_trip = Owned::zeros_f32(&[2, 2]);
         DequantizeLinearKernel {
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: None,
@@ -505,6 +759,7 @@ mod tests {
         let zp = Owned::u8(&[1, 2], &[2, 4]);
         let mut out = Owned::zeros_f32(&[1, 4]);
         DequantizeLinearKernel {
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: Some(2),
@@ -525,6 +780,9 @@ mod tests {
             let zero_point = Owned::u8(&[], &[113]);
             let mut output = Owned::zeros(DataType::Uint8, &[rows, 8]);
             QuantizeLinearKernel {
+                int16: None,
+                output_dtype: None,
+                precision: Ok(None),
                 axis: 1,
                 block_size: None,
             }
@@ -554,6 +812,7 @@ mod tests {
             let zero_point = Owned::u8(&[], &[113]);
             let mut output = Owned::zeros(DataType::BFloat16, &[rows, 8]);
             DequantizeLinearKernel {
+                int16: None,
                 output_dtype: None,
                 axis: 1,
                 block_size: None,

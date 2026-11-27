@@ -1,5 +1,5 @@
 //! Integer **bitwise** ops (`BitwiseAnd`, `BitwiseOr`, `BitwiseXor`,
-//! `BitwiseNot`) and the unsigned **`BitShift`** on the GPU via runtime-compiled
+//! `BitwiseNot`) and **`BitShift`** on the GPU via runtime-compiled
 //! (NVRTC) `extern "C"` kernels. This mirrors the CPU EP's coverage
 //! (`crates/onnx-runtime-ep-cpu/src/kernels/bitwise.rs` and `bitshift.rs`) so a
 //! native CUDA model does not fall back to the CPU for these ops.
@@ -13,10 +13,7 @@
 //! * **Bitwise unary** (`BitwiseNot`): one integer input → same-dtype output,
 //!   bitwise complement (`~x`).
 //! * **BitShift** (`direction` = `LEFT`/`RIGHT`): two broadcast-compatible
-//!   **unsigned** integer inputs (Uint8/16/32/64). The shift amount is taken
-//!   modulo the exact CPU contract — `checked_shl`/`checked_shr` yields `0` when
-//!   the (u32-truncated) amount is `>=` the operand bit width — so the kernel
-//!   mirrors `bitshift.rs` bit-for-bit.
+//!   integer inputs in standalone nxrt from opset 11.
 //!
 //! Each op is one thread-per-element grid-stride kernel (bandwidth-bound).
 
@@ -67,17 +64,6 @@ fn integer_type_suffix(dtype: DataType) -> Option<(&'static str, &'static str)> 
         DataType::Uint64 => ("unsigned long long", "u64"),
         _ => return None,
     })
-}
-
-/// The entry-point suffix for an unsigned integer dtype (BitShift operands).
-fn unsigned_suffix(dtype: DataType) -> Option<&'static str> {
-    match dtype {
-        DataType::Uint8 => Some("u8"),
-        DataType::Uint16 => Some("u16"),
-        DataType::Uint32 => Some("u32"),
-        DataType::Uint64 => Some("u64"),
-        _ => None,
-    }
 }
 
 // ===========================================================================
@@ -145,9 +131,31 @@ DEFINE_SHIFT_FOR_TYPE(unsigned char, u8, 8u)
 DEFINE_SHIFT_FOR_TYPE(unsigned short, u16, 16u)
 DEFINE_SHIFT_FOR_TYPE(unsigned int, u32, 32u)
 DEFINE_SHIFT_FOR_TYPE(unsigned long long, u64, 64u)
+
+// Keep the full signed count until it has been checked against the lane width.
+// The unsigned carrier avoids signed left-shift overflow and int promotion.
+#define DEFINE_SIGNED_SHIFT(name, type, carrier, suffix, bits, right) \
+extern "C" __global__ void name##_##suffix(const type* a, const type* b, type* y, const unsigned long long* m, int rank, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) { \
+        unsigned long long ai, bi; broadcast_indices(i, m, rank, &ai, &bi); \
+        type x = a[ai]; \
+        type amount = b[bi]; \
+        if (amount < 0 || amount >= bits) \
+            y[i] = right && x < 0 ? (type)-1 : (type)0; \
+        else \
+            y[i] = right ? (type)(x >> amount) : (type)((carrier)x << amount); \
+    } \
+}
+#define DEFINE_SIGNED_SHIFT_FOR_TYPE(type, carrier, suffix, bits) \
+DEFINE_SIGNED_SHIFT(shl, type, carrier, suffix, bits, false) \
+DEFINE_SIGNED_SHIFT(shr, type, carrier, suffix, bits, true)
+DEFINE_SIGNED_SHIFT_FOR_TYPE(signed char, unsigned int, i8, 8)
+DEFINE_SIGNED_SHIFT_FOR_TYPE(short, unsigned int, i16, 16)
+DEFINE_SIGNED_SHIFT_FOR_TYPE(int, unsigned int, i32, 32)
+DEFINE_SIGNED_SHIFT_FOR_TYPE(long long, unsigned long long, i64, 64)
 "#;
 
-const BITSHIFT_MODULE: &str = "bitwise_shift_uint";
+const BITSHIFT_MODULE: &str = "bitwise_shift_int";
 
 /// A supported bitwise binary op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,7 +204,6 @@ impl ShiftDirection {
 enum BinaryKind {
     /// Bitwise `&`/`|`/`^` across every integer dtype.
     Bitwise(BitwiseBinaryOp),
-    /// Unsigned-only shift with a fixed direction.
     Shift(ShiftDirection),
 }
 
@@ -204,7 +211,7 @@ impl BinaryKind {
     fn op_name(self) -> &'static str {
         match self {
             BinaryKind::Bitwise(op) => op.op_name(),
-            BinaryKind::Shift(_) => "BitShift",
+            BinaryKind::Shift(..) => "BitShift",
         }
     }
 
@@ -217,7 +224,7 @@ impl BinaryKind {
                 Some(format!("{}_{suffix}", op.stem()))
             }
             BinaryKind::Shift(dir) => {
-                let suffix = unsigned_suffix(dtype)?;
+                let (_, suffix) = integer_type_suffix(dtype)?;
                 Some(format!("{}_{suffix}", dir.stem()))
             }
         }
@@ -226,14 +233,14 @@ impl BinaryKind {
     fn module(self) -> &'static str {
         match self {
             BinaryKind::Bitwise(_) => BITWISE_BINARY_MODULE,
-            BinaryKind::Shift(_) => BITSHIFT_MODULE,
+            BinaryKind::Shift(..) => BITSHIFT_MODULE,
         }
     }
 
     fn src(self) -> &'static str {
         match self {
             BinaryKind::Bitwise(_) => BITWISE_BINARY_SRC,
-            BinaryKind::Shift(_) => BITSHIFT_SRC,
+            BinaryKind::Shift(..) => BITSHIFT_SRC,
         }
     }
 }
@@ -257,7 +264,7 @@ impl KernelFactory for BitwiseBinaryFactory {
     }
 }
 
-/// Factory for the unsigned `BitShift` kernel (reads the `direction` attribute).
+/// Factory for the versioned `BitShift` kernel.
 pub struct BitShiftFactory {
     pub runtime: Arc<CudaRuntime>,
 }
@@ -297,7 +304,7 @@ struct BinaryCaptureSignature {
 }
 
 /// NVRTC-backed integer binary kernel producing a **same-dtype** output. Covers
-/// both the bitwise family (every integer dtype) and unsigned `BitShift` via
+/// both the bitwise family (every integer dtype) and versioned `BitShift` via
 /// [`BinaryKind`], with NumPy-style right-aligned broadcasting and the same
 /// persistent-metadata capture seam as [`super::pointwise::BinaryPredKernel`].
 #[derive(Debug)]
@@ -581,17 +588,11 @@ impl Kernel for BitwiseNotKernel {
 /// partitioner routes an unsupported dtype to another EP instead of failing at
 /// kernel time.
 pub(crate) fn unsupported_reason(op: &str, input_dtypes: &[DataType]) -> Option<String> {
-    let shift = op == "BitShift";
     let unary = op == "BitwiseNot";
     let Some(&a) = input_dtypes.first() else {
         return Some(format!("{op}: missing operand dtype for CUDA EP"));
     };
-    let supported = if shift {
-        unsigned_suffix(a).is_some()
-    } else {
-        integer_type_suffix(a).is_some()
-    };
-    if !supported {
+    if integer_type_suffix(a).is_none() {
         return Some(format!(
             "{op}: operand dtype {a:?} not supported on CUDA EP"
         ));
@@ -636,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_entry_points_are_unsigned_only() {
+    fn shift_entry_points_cover_signed_and_unsigned() {
         assert_eq!(
             BinaryKind::Shift(ShiftDirection::Left).entry(DataType::Uint32),
             Some("shl_u32".to_string())
@@ -645,10 +646,9 @@ mod tests {
             BinaryKind::Shift(ShiftDirection::Right).entry(DataType::Uint8),
             Some("shr_u8".to_string())
         );
-        // Signed operands are unsupported for BitShift.
         assert_eq!(
             BinaryKind::Shift(ShiftDirection::Left).entry(DataType::Int32),
-            None
+            Some("shl_i32".to_string())
         );
     }
 
@@ -694,8 +694,14 @@ mod tests {
     }
 
     #[test]
-    fn bitshift_claim_requires_unsigned_operands() {
-        assert!(unsupported_reason("BitShift", &[DataType::Int32, DataType::Int32]).is_some());
+    fn bitshift_claim_accepts_matching_integer_operands() {
+        let signed = [DataType::Int32; 2];
+        assert!(
+            unsupported_reason("BitShift", &[DataType::Int32, DataType::Uint32])
+                .unwrap()
+                .contains("same dtype")
+        );
+        assert_eq!(unsupported_reason("BitShift", &signed), None);
         assert_eq!(
             unsupported_reason("BitShift", &[DataType::Uint16, DataType::Uint16]),
             None
