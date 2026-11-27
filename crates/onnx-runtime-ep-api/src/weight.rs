@@ -96,7 +96,7 @@ pub enum LazyWeightBoundary {
     /// `ai.onnx::MatMul`, the ordinary dense GEMM boundary used by unquantized
     /// decoder exports.
     MatMul,
-    /// `pkg.nxrt::BlockQuantizedMoE`, the Phase-3 offload binding boundary.
+    /// `pkg.nxrt._private::BlockQuantizedMoE`, the Phase-3 offload binding boundary.
     BlockQuantizedMoe,
     /// `com.microsoft::QMoE`, the boundary real DeepSeek/GLM/Qwen exports use.
     QMoe,
@@ -118,7 +118,7 @@ impl LazyWeightBoundary {
     fn identity(self) -> (&'static str, &'static str) {
         match self {
             Self::MatMul => ("", "MatMul"),
-            Self::BlockQuantizedMoe => ("pkg.nxrt", "BlockQuantizedMoE"),
+            Self::BlockQuantizedMoe => ("pkg.nxrt._private", "BlockQuantizedMoE"),
             Self::QMoe => ("com.microsoft", "QMoE"),
             Self::MatMulNBits => ("com.microsoft", "MatMulNBits"),
         }
@@ -429,7 +429,7 @@ impl NegotiatedWeight {
         }
     }
 
-    /// Phase 3b will call this at `pkg.nxrt::BlockQuantizedMoE` binding time.
+    /// Phase 3b will call this at `pkg.nxrt._private::BlockQuantizedMoE` binding time.
     pub fn try_bind_device<B: LazyDeviceWeightBinder>(
         &self,
         binder: &B,
@@ -1352,7 +1352,7 @@ mod tests {
             Some(LazyWeightBoundary::MatMul)
         );
         assert_eq!(
-            LazyWeightBoundary::for_op("pkg.nxrt", "BlockQuantizedMoE"),
+            LazyWeightBoundary::for_op("pkg.nxrt._private", "BlockQuantizedMoE"),
             Some(LazyWeightBoundary::BlockQuantizedMoe)
         );
         assert_eq!(
@@ -1361,12 +1361,15 @@ mod tests {
         );
         assert!(LazyWeightBoundary::matches_any("com.microsoft", "QMoE"));
         assert!(LazyWeightBoundary::matches_any(
-            "pkg.nxrt",
+            "pkg.nxrt._private",
             "BlockQuantizedMoE"
         ));
         assert!(LazyWeightBoundary::matches_any("", "MatMul"));
         // Wrong domain/op pairings and unrelated ops are not offload boundaries.
-        assert_eq!(LazyWeightBoundary::for_op("pkg.nxrt", "QMoE"), None);
+        assert_eq!(
+            LazyWeightBoundary::for_op("pkg.nxrt._private", "QMoE"),
+            None
+        );
         assert_eq!(
             LazyWeightBoundary::for_op("com.microsoft", "BlockQuantizedMoE"),
             None

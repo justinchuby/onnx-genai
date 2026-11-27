@@ -1,4 +1,4 @@
-//! `pkg.nxrt::SparseKvGather` v1: device-native sparse KV gather for the
+//! `pkg.nxrt._private::SparseKvGather` v1: device-native sparse KV gather for the
 //! DeepSeek/GLM compressed sparse-attention building block.
 //!
 //! Mirrors the CPU reference in

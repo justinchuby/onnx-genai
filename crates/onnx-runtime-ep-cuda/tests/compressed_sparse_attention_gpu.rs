@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity tests for `pkg.nxrt::CompressedSparseAttention` v1.
+//! GPU parity tests for `pkg.nxrt._private::CompressedSparseAttention` v1.
 //!
 //! Each case builds a single-node model with the `onnx-runtime-ir` graph API and
 //! runs the SAME inputs through both the CPU CSA kernel (the authoritative
@@ -47,7 +47,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 const DIM: usize = 512;
 const ROPE_DIM: usize = 64;
 const RATIO: usize = 128;
@@ -616,7 +616,10 @@ fn run_cpu(
 
     let strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -634,7 +637,10 @@ fn run_cpu(
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut out_bufs: Vec<Vec<u8>> = output_specs
         .iter()
@@ -710,7 +716,10 @@ fn run_gpu_observed(
     }
     let strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -728,7 +737,10 @@ fn run_gpu_observed(
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_lens: Vec<usize> = output_specs
         .iter()
@@ -2277,7 +2289,10 @@ fn run_gpu_capture_replay(
     }
     let strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<TensorView> = inputs
         .iter()
@@ -2295,7 +2310,10 @@ fn run_gpu_capture_replay(
 
     let out_strides: Vec<_> = output_specs
         .iter()
-        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .map(|spec| {
+            compute_contiguous_strides(&spec.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_lens: Vec<usize> = output_specs
         .iter()

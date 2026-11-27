@@ -925,7 +925,7 @@ impl HostNode {
             // Our own domain: this operator is invented here and Microsoft
             // never specified it. Matches `onnx_runtime_ir::RUNTIME_DOMAIN`,
             // spelled literally because a C string is needed here.
-            domain: c"pkg.nxrt".to_owned(),
+            domain: c"pkg.nxrt._private".to_owned(),
             since_version: 1,
             inputs,
             outputs,

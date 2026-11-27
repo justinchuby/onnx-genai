@@ -143,6 +143,12 @@ Logical text constraints check the decoded text directly for completion. Raw
 token grammars require declared EOS IDs. After a text ending, an all-false mask
 permits codec-only quanta to finish without admitting further text.
 
+Cancellation under an active text constraint sends a full vocabulary-sized
+all-false token mask. Native cancellation must remain executable even when an
+incomplete grammar has no tokenizer continuation; it cannot generate text or
+EOS. Output shape, usage, PCM and token-mask guards still apply. A successful
+terminal quantum clears the grammar; a failed quantum still requires reset.
+
 ## Response termination
 
 A token-limited response ends with upstream-compatible `status: completed`;
@@ -193,18 +199,33 @@ successful budgeted native response on the same connection.
 
 ## Remaining conformance work
 
-Turn-based tagged-json tool forcing is connected for workflows declaring
-`inputs.token_mask`, using canonical decoder text and declared EOS roles.
-Profiles without that binding retain protocol/parameter postconditions; native
-forcing for other protocols and duplex tool responses remains open. Tool
+Tagged-json tool forcing is connected for turn-based and input-driven duplex
+workflows declaring `inputs.token_mask`, using canonical decoder text and declared
+EOS roles. Automatic duplex responses arm the native owner once after conditioning
+and before the first Audio quantum; further Audio/Poll quanta retain grammar
+progress. Each active response shares an immutable compiled tool catalog, so
+sampling and final admission use the same schemas. Tools remain part of frozen
+conditioning and cannot change after the first audio/message. Later session
+updates can change response defaults (tool choice, modalities and budget); the
+active response keeps its admitted options. Cancellation/completion discard its
+sampling state.
+Duplex `tool_choice: required` rejects missing mask bindings or a protocol without
+a supported forcing plan before admitting PCM; unforced duplex remains available.
+Turn-based profiles without that binding retain protocol/parameter postconditions.
+Native forcing for other protocols, including Atem XML, remains open. Tool
 parameter schemas compile through the shared llguidance byte-grammar backend
 before configuration is installed. Provisional prefixes and the actual raw
 completed argument spelling must match that grammar; completed protocol parsing
 must describe the same JSON values before completion is published. Forced tagged
 JSON envelopes admit every ordering of `name`, optional `id`, and `arguments`,
 while retaining required fields, ID limits and rejection of extra fields. This uses the backend's supported schema language,
-not a claim of general JSON Schema validation. Protocol parsing, parameter
-admission and required-call postconditions do not substitute for
+not a claim of general JSON Schema validation. Supplied parameter schemas are
+intersected with the registered protocols' object-argument domain in both forced
+grammars and parameter admission. Omitted/null parameters, `true`, an empty
+schema and unions containing objects never authorize scalar/array call arguments.
+Composition retains existing constraints and root definitions/references; it does
+not replace an incompatible schema with a permissive object schema.
+Protocol parsing, parameter admission and required-call postconditions do not substitute for
 constraint-guided sampling.
 Expand wire acceptance for tools, malformed/pressure cases, overlapping turns,
 rate epochs, multimodel isolation and native device execution. The current

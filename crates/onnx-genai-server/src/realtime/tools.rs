@@ -2,11 +2,18 @@
 use anyhow::{Context, ensure};
 use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
 use onnx_genai_metadata::{ToolCall, ToolCallFragment};
-use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use serde_json::Value;
+use std::{collections::BTreeMap, sync::Arc};
 
+/// Immutable compiled catalog: active responses share its schemas and original
+/// definitions; updating session defaults creates a new catalog, never mutates it.
+#[derive(Clone, Default)]
+pub(super) struct ToolArguments(Arc<CompiledTools>);
 #[derive(Default)]
-pub(super) struct ToolArguments(BTreeMap<String, GrammarByteCursor>);
+struct CompiledTools {
+    definitions: Vec<Value>,
+    arguments: BTreeMap<String, GrammarByteCursor>,
+}
 
 /// Proof of provisional schema admission, not a completed executable call.
 /// The borrowed source cannot change while a renderer consumes this proof.
@@ -20,24 +27,32 @@ impl AdmittedFragment<'_> {
 impl ToolArguments {
     pub(super) fn compile(tools: &Value, max_bytes: usize) -> anyhow::Result<Self> {
         let mut compiled = BTreeMap::new();
-        for tool in tools
+        let definitions = tools
             .as_array()
-            .context("realtime tools must be an array")?
-        {
+            .context("realtime tools must be an array")?;
+        for tool in definitions {
             let name = tool
                 .get("name")
                 .and_then(Value::as_str)
                 .context("realtime function tool requires a name string")?;
-            let default_schema = json!({"type":"object"});
-            let schema = tool.get("parameters").unwrap_or(&default_schema);
-            let cursor = GrammarByteCursor::json_schema(schema, max_bytes)
+            let schema = crate::tool_protocol::object_argument_schema(tool.get("parameters"))
+                .with_context(|| {
+                    format!("resolve realtime tool {name:?} parameters object domain")
+                })?;
+            let cursor = GrammarByteCursor::json_schema(&schema, max_bytes)
                 .with_context(|| format!("compile realtime tool {name:?} parameters; use a schema supported by the constraint backend"))?;
             ensure!(
                 compiled.insert(name.to_owned(), cursor).is_none(),
                 "realtime tools contain duplicate function name {name:?}; declare each function once"
             );
         }
-        Ok(Self(compiled))
+        Ok(Self(Arc::new(CompiledTools {
+            definitions: definitions.clone(),
+            arguments: compiled,
+        })))
+    }
+    pub(super) fn definitions(&self) -> &[Value] {
+        &self.0.definitions
     }
     /// Admit the whole quantum before publishing any provisional item in it.
     /// Completed batch admission remains a separate operation below.
@@ -48,7 +63,7 @@ impl ToolArguments {
         fragments
             .iter()
             .map(|fragment| {
-                let cursor = self.0.get(&fragment.name).with_context(|| {
+                let cursor = self.0.arguments.get(&fragment.name).with_context(|| {
                     format!(
                         "model emitted undeclared realtime tool {:?}; repair model tool prompting/constraints",
                         fragment.name
@@ -94,7 +109,7 @@ impl ToolArguments {
     // The entire batch is admitted before completed call events or harness-result admission.
     pub(super) fn admit(&self, calls: &[ToolCall]) -> anyhow::Result<()> {
         for call in calls {
-            let cursor = self.0.get(&call.name).with_context(|| format!(
+            let cursor = self.0.arguments.get(&call.name).with_context(|| format!(
                 "model emitted undeclared realtime tool {:?}; repair model tool prompting/constraints", call.name))?;
             ensure!(
                 matches!(
@@ -117,6 +132,35 @@ impl ToolArguments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    #[test]
+    fn active_catalog_shares_immutable_schemas_while_defaults_are_replaced() {
+        let definition = |city| json!([{"name":"lookup","parameters":{"type":"object","properties":{"city":{"const":city}},"required":["city"],"additionalProperties":false}}]);
+        let mut defaults = ToolArguments::compile(&definition("Paris"), 4096).unwrap();
+        let active = defaults.clone();
+        assert!(Arc::ptr_eq(&defaults.0, &active.0));
+        defaults = ToolArguments::compile(&definition("Rome"), 4096).unwrap();
+        assert_eq!(
+            active.definitions(),
+            definition("Paris").as_array().unwrap()
+        );
+        assert_eq!(
+            defaults.definitions(),
+            definition("Rome").as_array().unwrap()
+        );
+        let call = |city| ToolCall {
+            id: "call1".into(),
+            name: "lookup".into(),
+            arguments: format!("{{\"city\":\"{city}\"}}"),
+        };
+        for _ in 0..2 {
+            active.admit(&[call("Paris")]).unwrap();
+            assert!(active.admit(&[call("Rome")]).is_err());
+            defaults.admit(&[call("Rome")]).unwrap();
+            assert!(defaults.admit(&[call("Paris")]).is_err());
+        }
+    }
+
     #[test]
     fn provisional_arguments_require_viable_schema_and_complete_envelopes_require_eof() {
         let tools = ToolArguments::compile(
@@ -157,6 +201,36 @@ mod tests {
             tools.admit_projected(&[forged], &complete).is_err(),
             "a viable projection cannot authorize a different completed value"
         );
+    }
+
+    #[test]
+    fn unconstrained_realtime_parameters_still_require_protocol_objects() {
+        for parameters in [
+            json!(true),
+            json!({}),
+            json!({"type":["array","object"]}),
+            Value::Null,
+        ] {
+            let tools =
+                ToolArguments::compile(&json!([{"name":"lookup","parameters":parameters}]), 4096)
+                    .unwrap();
+            for arguments in ["[]", "1", "null", r#""text""#] {
+                let fragments = [ToolCallFragment {
+                    index: 0,
+                    id: None,
+                    name: "lookup".into(),
+                    arguments: arguments.into(),
+                    envelope_complete: false,
+                }];
+                assert!(tools.admit_fragments(&fragments).is_err(), "{arguments}");
+            }
+            let call = ToolCall {
+                id: "call_0".into(),
+                name: "lookup".into(),
+                arguments: r#"{"x":1}"#.into(),
+            };
+            tools.admit(&[call]).unwrap();
+        }
     }
 
     #[test]

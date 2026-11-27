@@ -67,32 +67,149 @@ impl ToolProtocol {
         request: &ChatCompletionRequest,
     ) -> Result<ToolOutputConstraint, ToolProtocolError> {
         match self.0 {
-            ParsedToolProtocol::TaggedJsonV1 => {
-                let Some(schemas) = forced_tool_choice_schemas(request) else {
+            ParsedToolProtocol::TaggedJsonV1 | ParsedToolProtocol::AtemXmlV1 => {
+                let Some(mut schemas) = forced_tool_choice_schemas(request)? else {
                     return Ok(ToolOutputConstraint::Unchanged);
                 };
-                let schema = if schemas.len() == 1 {
-                    schemas.into_iter().next().expect("one schema")
+                if self.0 == ParsedToolProtocol::AtemXmlV1 {
+                    for (tool, schema) in &mut schemas {
+                        if tool.function.name.is_empty()
+                            || tool.function.name.len() > onnx_genai_metadata::MAX_TOOL_NAME_BYTES
+                        {
+                            return Err(ToolProtocolError("canonical XML generation requires nonempty function names within the UTF-8 byte limit".into()));
+                        }
+                        // Preserve the actual standalone root, including its
+                        // URI/dialect and existing compiler options. This owned
+                        // option only restricts root keys to the inbound XML
+                        // attribute encoding capability; nested JSON is intact.
+                        if schema == &serde_json::Value::Bool(false) {
+                            continue;
+                        }
+                        let root = schema.as_object_mut().ok_or_else(|| {
+                            ToolProtocolError("XML argument schema must have an object root".into())
+                        })?;
+                        let options = root
+                            .entry("x-guidance")
+                            .or_insert_with(|| serde_json::json!({}));
+                        let options = options.as_object_mut().ok_or_else(|| {
+                            ToolProtocolError(
+                                "XML argument schema x-guidance must be an options object".into(),
+                            )
+                        })?;
+                        for (key, standard) in [("item_separator", ","), ("key_separator", ":")] {
+                            if options
+                                .get(key)
+                                .is_some_and(|value| value.as_str() != Some(standard))
+                            {
+                                return Err(ToolProtocolError(format!(
+                                    "canonical XML generation requires standard JSON {key}; remove its x-guidance lexical override"
+                                )));
+                            }
+                        }
+                        if options
+                            .get("whitespace_pattern")
+                            .is_some_and(|value| !value.is_null())
+                        {
+                            return Err(ToolProtocolError("canonical XML generation requires the default JSON whitespace language; remove x-guidance.whitespace_pattern".into()));
+                        }
+                        options.insert("root_object_key_policy".into(), serde_json::json!({"min":1,"max":onnx_genai_metadata::MAX_TOOL_NAME_BYTES}));
+                    }
+                }
+                // JSON anyOf prunes backend-proven impossible branches. Retain
+                // that behavior when each alternative owns a standalone root.
+                // A single selected tool keeps its direct compilation path.
+                if schemas.len() > 1 || self.0 == ParsedToolProtocol::AtemXmlV1 {
+                    let mut viable = Vec::with_capacity(schemas.len());
+                    for (tool, schema) in schemas {
+                        let satisfiable =
+                            onnx_genai_engine::byte_grammar::json_schema_is_satisfiable(&schema)
+                                .map_err(|error| {
+                                    ToolProtocolError(format!(
+                                        "function {:?} parameters: {error:#}",
+                                        tool.function.name
+                                    ))
+                                })?;
+                        if satisfiable {
+                            viable.push((tool, schema));
+                        }
+                    }
+                    if viable.is_empty() {
+                        let reason = if self.0 == ParsedToolProtocol::AtemXmlV1 {
+                            "all required XML tool schemas have no instances within the named-parameter generation key-encoding capability (declared nonempty parameter names within the UTF-8 byte limit); revise tools[*].function.parameters or select a usable function"
+                        } else {
+                            "all required tool parameter schemas are unsatisfiable; revise tools[*].function.parameters or select a usable function"
+                        };
+                        return Err(ToolProtocolError(reason.into()));
+                    }
+                    schemas = viable;
+                }
+                // Every parameter document is compiled as its own %json root.
+                // Its dialect, base URI, pointers, anchors and registry remain
+                // exactly those of standalone parameter admission.
+                let names = (0..schemas.len())
+                    .map(|index| format!("tool_{index}"))
+                    .collect::<Vec<_>>();
+                let mut grammar = format!(
+                    "start: \"<tool_call>\\n\" ws tool ws \"\\n</tool_call>\"\ntool: {}\n",
+                    names.join(" | ")
+                );
+                grammar.push_str(concat!(
+                    "ws: /[ \\t\\r\\n]+/?\n",
+                    "name_key: %json {\"const\":\"name\"}\n",
+                    "arguments_key: %json {\"const\":\"arguments\"}\n",
+                    "id_key: %json {\"const\":\"id\"}\n",
+                    "id_field: id_key ws \":\" ws call_id\n",
+                ));
+                grammar.push_str(&format!(
+                    "call_id: %json {}\n",
+                    serde_json::json!({"type":"string","minLength":1,"maxLength":onnx_genai_metadata::MAX_TOOL_CALL_ID_BYTES})
+                ));
+                for (rule, (tool, schema)) in names.iter().zip(schemas) {
+                    let fields = [
+                        format!("{rule}_name"),
+                        "id_field".into(),
+                        format!("{rule}_arguments"),
+                    ];
+                    let mut alternatives = vec![
+                        format!("{} ws \",\" ws {}", fields[0], fields[2]),
+                        format!("{} ws \",\" ws {}", fields[2], fields[0]),
+                    ];
+                    for first in 0..fields.len() {
+                        for second in 0..fields.len() {
+                            for third in 0..fields.len() {
+                                if first != second && first != third && second != third {
+                                    alternatives.push(format!(
+                                        "{} ws \",\" ws {} ws \",\" ws {}",
+                                        fields[first], fields[second], fields[third]
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let schema = serde_json::to_string(&schema).map_err(|error| {
+                        ToolProtocolError(format!(
+                            "tagged-json@v1 cannot encode function {:?} parameter schema: {error}",
+                            tool.function.name
+                        ))
+                    })?;
+                    grammar.push_str(&format!(
+                        "{rule}: \"{{\" ws ({}) ws \"}}\"\n{rule}_name: name_key ws \":\" ws {rule}_name_value\n{rule}_arguments: arguments_key ws \":\" ws {rule}_arguments_value\n{rule}_name_value: %json {}\n{rule}_arguments_value: %json {schema}\n",
+                        alternatives.join(" | "), serde_json::json!({"enum":[tool.function.name]})
+                    ));
+                }
+                let constraint = if self.0 == ParsedToolProtocol::AtemXmlV1 {
+                    GenerateConstraint::XmlToolCall {
+                        grammar,
+                        prefix: String::new(),
+                    }
                 } else {
-                    serde_json::json!({ "anyOf": schemas })
+                    GenerateConstraint::Lark {
+                        grammar,
+                        prefix: String::new(),
+                    }
                 };
-                let schema = serde_json::to_string(&schema).map_err(|error| {
-                    ToolProtocolError(format!(
-                        "tagged-json@v1 cannot encode forced tool-choice schema: {error}"
-                    ))
-                })?;
-                Ok(ToolOutputConstraint::Set(Some(GenerateConstraint::Lark {
-                    grammar: format!(
-                        "start: \"<tool_call>\\n\" tool \"\\n</tool_call>\"\ntool: %json {schema}\n"
-                    ),
-                    prefix: String::new(),
-                })))
+                Ok(ToolOutputConstraint::Set(Some(constraint)))
             }
-            ParsedToolProtocol::AtemXmlV1 => Ok(if forced_tool_choice_schemas(request).is_some() {
-                ToolOutputConstraint::Set(None)
-            } else {
-                ToolOutputConstraint::Unchanged
-            }),
         }
     }
 
@@ -519,13 +636,38 @@ fn render_request(
     })
 }
 
-fn forced_tool_choice_schemas(request: &ChatCompletionRequest) -> Option<Vec<serde_json::Value>> {
-    let tools = request
-        .tools
-        .as_ref()?
-        .iter()
-        .filter(|tool| tool.kind == "function");
-    let selected = match request.tool_choice.as_ref()? {
+/// Both registered model protocols require object arguments. Constrain that
+/// domain without relocating the supplied schema or its root definitions/refs.
+pub(crate) fn object_argument_schema(
+    schema: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, ToolProtocolError> {
+    use serde_json::{Value, json};
+    let domain = json!({"type":"object"});
+    match schema {
+        None | Some(Value::Null | Value::Bool(true)) => Ok(domain),
+        Some(Value::Bool(false)) => Ok(Value::Bool(false)),
+        Some(Value::Object(original)) => {
+            let mut object = original.clone();
+            let needs_domain = !matches!(object.get("type"), Some(Value::String(kind)) if kind == "object");
+            match object.get_mut("allOf") {
+                Some(Value::Array(terms)) => { if needs_domain { terms.push(domain); } }
+                Some(_) => return Err(ToolProtocolError("tool parameters.allOf must be an array of schemas; supply a valid JSON Schema object or boolean".into())),
+                None => { if needs_domain { object.insert("allOf".into(), json!([domain])); } }
+            }
+            Ok(Value::Object(object))
+        }
+        Some(_) => Err(ToolProtocolError("tool parameters must be a JSON Schema object or boolean; omit it (or use null) for unconstrained object arguments".into())),
+    }
+}
+
+fn forced_tool_choice_schemas(
+    request: &ChatCompletionRequest,
+) -> Result<Option<Vec<(&ChatTool, serde_json::Value)>>, ToolProtocolError> {
+    let (Some(tools), Some(choice)) = (request.tools.as_ref(), request.tool_choice.as_ref()) else {
+        return Ok(None);
+    };
+    let tools = tools.iter().filter(|tool| tool.kind == "function");
+    let selected = match choice {
         ToolChoice::Mode(ToolChoiceMode::Required) => tools.collect::<Vec<_>>(),
         ToolChoice::Specific(choice) if choice.kind == "function" => tools
             .filter(|tool| tool.function.name == choice.function.name)
@@ -536,50 +678,18 @@ fn forced_tool_choice_schemas(request: &ChatCompletionRequest) -> Option<Vec<ser
     };
     let schemas = selected
         .into_iter()
-        .map(tool_call_schema_for_tool)
-        .collect::<Vec<_>>();
-    (!schemas.is_empty()).then_some(schemas)
+        .map(|tool| tool_argument_schema(tool).map(|schema| (tool, schema)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((!schemas.is_empty()).then_some(schemas))
 }
 
-fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
-    let arguments_schema = tool
-        .function
-        .parameters
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({"type":"object"}));
-    let fields = [
-        (
-            "name",
-            serde_json::json!({"enum":[tool.function.name.clone()]}),
-        ),
-        (
-            "id",
-            serde_json::json!({"type":"string","minLength":1,"maxLength":onnx_genai_metadata::MAX_TOOL_CALL_ID_BYTES}),
-        ),
-        ("arguments", arguments_schema),
-    ];
-    // The backend emits object properties in schema order. Every ordering of
-    // the protocol's fields denotes the same envelope; an optional ID may be
-    // present before or after the name/arguments without changing admission.
-    let mut alternatives = Vec::new();
-    for first in 0..fields.len() {
-        for second in 0..fields.len() {
-            for third in 0..fields.len() {
-                if first == second || first == third || second == third {
-                    continue;
-                }
-                let properties = [first, second, third]
-                    .into_iter()
-                    .map(|index| (fields[index].0.to_owned(), fields[index].1.clone()))
-                    .collect::<serde_json::Map<_, _>>();
-                alternatives.push(serde_json::json!({
-                    "type":"object","properties":properties,
-                    "required":["name","arguments"],"additionalProperties":false
-                }));
-            }
-        }
-    }
-    serde_json::json!({"anyOf":alternatives})
+fn tool_argument_schema(tool: &ChatTool) -> Result<serde_json::Value, ToolProtocolError> {
+    object_argument_schema(tool.function.parameters.as_ref()).map_err(|error| {
+        ToolProtocolError(format!(
+            "function {:?} parameters: {error}",
+            tool.function.name
+        ))
+    })
 }
 
 fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTool>> {
@@ -615,6 +725,232 @@ mod tests {
             Path::new("fixtures/inference_metadata.yaml"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn argument_object_domain_retains_union_constraints_and_root_definitions() {
+        use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+        for schema in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"type":["array","object"]})),
+        ] {
+            let constrained = object_argument_schema(schema.as_ref()).unwrap();
+            let cursor = GrammarByteCursor::json_schema(&constrained, 4096).unwrap();
+            assert!(matches!(
+                cursor.preview_json_root(r#"{"x":1}"#).unwrap(),
+                GrammarCandidate::Viable { complete: true }
+            ));
+            for scalar in ["[]", "1", "null", r#""text""#] {
+                assert!(
+                    matches!(
+                        cursor.preview_json_root(scalar).unwrap(),
+                        GrammarCandidate::Rejected { .. }
+                    ),
+                    "schema={schema:?} value={scalar}"
+                );
+            }
+        }
+        let schema = serde_json::json!({"$defs":{"Args":{"type":"object","properties":{"x":{"const":1}},"required":["x"],"additionalProperties":false}},"$ref":"#/$defs/Args","allOf":[{"minProperties":1}]});
+        let constrained = object_argument_schema(Some(&schema)).unwrap();
+        let cursor = GrammarByteCursor::json_schema(&constrained, 4096).unwrap();
+        assert!(matches!(
+            cursor.preview_json_root(r#"{"x":1}"#).unwrap(),
+            GrammarCandidate::Viable { complete: true }
+        ));
+        for invalid in ["[]", "{}", r#"{"x":2}"#, r#"{"x":1,"y":2}"#] {
+            assert!(
+                matches!(
+                    cursor.preview_json_root(invalid).unwrap(),
+                    GrammarCandidate::Rejected { .. }
+                ),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_object_domain_does_not_turn_impossible_or_invalid_schemas_into_valid_tools() {
+        use onnx_genai_engine::byte_grammar::GrammarByteCursor;
+        for schema in [
+            serde_json::json!(false),
+            serde_json::json!({"type":"string"}),
+            serde_json::json!({"const":[]}),
+        ] {
+            let constrained = object_argument_schema(Some(&schema)).unwrap();
+            assert!(
+                GrammarByteCursor::json_schema(&constrained, 4096).is_err(),
+                "{schema}"
+            );
+        }
+        for schema in [
+            serde_json::json!(3),
+            serde_json::json!([]),
+            serde_json::json!({"type":"object","allOf":false}),
+        ] {
+            assert!(object_argument_schema(Some(&schema)).is_err(), "{schema}");
+        }
+    }
+
+    #[test]
+    fn forced_argument_resources_preserve_reference_scope_and_tool_isolation() {
+        use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+        use serde_json::json;
+        let object = |city: &str| json!({"type":"object","properties":{"city":{"const":city}},"required":["city"],"additionalProperties":false});
+        let schemas = [
+            json!({"$defs":{"Args":object("Paris")},"$ref":"json-schema:///#/$defs/Args"}),
+            json!({"$defs":{"a/b~c":object("Paris")},"$ref":"#/$defs/a~1b~0c"}),
+            json!({"$id":"https://example.invalid/args","$defs":{"Args":object("Paris")},"$ref":"#/$defs/Args"}),
+            json!({"$defs":{"Args":{"$anchor":"Args","allOf":[object("Paris")]}},"$ref":"#Args"}),
+            json!({"$id":"https://example.invalid/root/","$defs":{"Args":{"$id":"args", "allOf":[object("Paris")]}},"$ref":"args"}),
+            json!({"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false,"default":{"$ref":"literal-instance-data"}}),
+            json!({"type":"object","properties":{"city":{"const":"Paris"},"next":{"anyOf":[{"type":"null"},{"$ref":"#"}]}},"required":["city"],"additionalProperties":false}),
+            json!({"$schema":"http://json-schema.org/draft-04/schema#","definitions":{"Args":{"type":"object","properties":{"city":{"enum":["Paris"]}},"required":["city"],"additionalProperties":false}},"$ref":"#/definitions/Args"}),
+        ];
+        for parameters in schemas {
+            // The explicit-ID case deliberately reuses the other tool's URI.
+            // Separate registries must retain each tool's city constraint.
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"fixture", "messages":[{"role":"user","content":"lookup"}],
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":parameters}},
+                         {"type":"function","function":{"name":"other","parameters":{"$id":"https://example.invalid/args","allOf":[object("Rome")]}}}],
+                "tool_choice":"required"
+            })).unwrap();
+            let ToolOutputConstraint::Set(Some(GenerateConstraint::Lark { grammar, .. })) =
+                protocol("tagged-json").output_constraint(&request).unwrap()
+            else {
+                panic!("missing forced grammar")
+            };
+            let cursor = GrammarByteCursor::lark(&grammar, 16384)
+                .unwrap_or_else(|e| panic!("{parameters}: {e:#}"));
+            for (name, city, valid) in [
+                ("lookup", "Paris", true),
+                ("lookup", "Rome", false),
+                ("other", "Rome", true),
+                ("other", "Paris", false),
+            ] {
+                let text = format!(
+                    "<tool_call>\n{}\n</tool_call>",
+                    json!({"name":name,"arguments":{"city":city}})
+                );
+                let result = cursor.preview_root(text.as_bytes()).unwrap();
+                assert_eq!(
+                    matches!(result, GrammarCandidate::Viable { complete: true }),
+                    valid,
+                    "{parameters}: {text}: {result:?}"
+                );
+            }
+            let spaced = "<tool_call>\n{ \"arguments\" : { \"city\" : \"Paris\" } , \"id\" : \"call_1\" , \"name\" : \"lookup\" }\n</tool_call>";
+            let spaced_result = cursor.preview_root(spaced.as_bytes()).unwrap();
+            assert!(
+                matches!(spaced_result, GrammarCandidate::Viable { complete: true }),
+                "{parameters}: {spaced_result:?}: {spaced}"
+            );
+            for body in [
+                r#"{"name":"lookup","arguments":[],"id":"call_1"}"#.to_owned(),
+                r#"{"name":"lookup","arguments":{"city":"Paris"},"extra":1}"#.to_owned(),
+                r#"{"name":"lookup","name":"lookup","arguments":{"city":"Paris"}}"#.to_owned(),
+                r#"{"name":"lookup"}"#.to_owned(),
+                r#"{"name":"lookup","arguments":{"city":"Paris"},"id":""}"#.to_owned(),
+                format!(
+                    r#"{{"name":"lookup","arguments":{{"city":"Paris"}},"id":"{}"}}"#,
+                    "x".repeat(onnx_genai_metadata::MAX_TOOL_CALL_ID_BYTES + 1)
+                ),
+            ] {
+                let text = format!("<tool_call>\n{body}\n</tool_call>");
+                assert!(
+                    !matches!(
+                        cursor.preview_root(text.as_bytes()).unwrap(),
+                        GrammarCandidate::Viable { complete: true }
+                    ),
+                    "admitted invalid envelope: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_tool_choice_retains_viable_tools_beside_impossible_schemas() {
+        use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+        use serde_json::json;
+        for impossible in [
+            json!(false),
+            json!({"type":"string"}),
+            json!({"type":"object","properties":{"x":false},"required":["x"]}),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "messages":[{"role":"user","content":"pick"}],"tool_choice":"required",
+                "tools":[{"type":"function","function":{"name":"impossible","parameters":impossible}},
+                         {"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}}]
+            })).unwrap();
+            let ToolOutputConstraint::Set(Some(GenerateConstraint::Lark { grammar, .. })) =
+                protocol("tagged-json").output_constraint(&request).unwrap()
+            else {
+                panic!("missing forced constraint")
+            };
+            let cursor = GrammarByteCursor::lark(&grammar, 4096)
+                .unwrap_or_else(|error| panic!("{impossible}: {error:#}"));
+            assert!(matches!(cursor.preview_root(b"<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>").unwrap(),GrammarCandidate::Viable{complete:true}));
+        }
+    }
+
+    #[test]
+    fn required_tool_schema_pruning_preserves_invalid_and_impossible_failures() {
+        use onnx_genai_engine::byte_grammar::GrammarByteCursor;
+        use serde_json::json;
+        let request = |parameters: serde_json::Value,
+                       choice: serde_json::Value,
+                       other: serde_json::Value|
+         -> ChatCompletionRequest {
+            serde_json::from_value(
+                json!({"messages":[{"role":"user","content":"pick"}],"tool_choice":choice,
+                "tools":[{"type":"function","function":{"name":"broken","parameters":parameters}},
+                         {"type":"function","function":{"name":"other","parameters":other}}]}),
+            )
+            .unwrap()
+        };
+        let error = protocol("tagged-json")
+            .output_constraint(&request(json!(false), json!("required"), json!(false)))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("all required tool parameter schemas are unsatisfiable"),
+            "{error}"
+        );
+        for invalid in [
+            json!({"$ref":"#/$defs/missing"}),
+            json!({"type":"not-a-json-type"}),
+            json!({"oneOf":[{"type":"object"},{"type":"object"}]}),
+        ] {
+            let error = protocol("tagged-json")
+                .output_constraint(&request(
+                    invalid,
+                    json!("required"),
+                    json!({"type":"object"}),
+                ))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("function \"broken\" parameters"),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("all required"), "{error}");
+        }
+        let selected = request(
+            json!(false),
+            json!({"type":"function","function":{"name":"broken"}}),
+            json!({"type":"object"}),
+        );
+        let ToolOutputConstraint::Set(Some(GenerateConstraint::Lark { grammar, .. })) =
+            protocol("tagged-json")
+                .output_constraint(&selected)
+                .unwrap()
+        else {
+            panic!("missing specific-tool constraint")
+        };
+        assert!(GrammarByteCursor::lark(&grammar, 4096).is_err());
     }
 
     #[test]
@@ -773,8 +1109,134 @@ mod tests {
         assert!(rendered.fallback_prefix.contains("<|tool_choice|>"));
         assert!(matches!(
             atem.output_constraint(&request).unwrap(),
-            ToolOutputConstraint::Set(None)
+            ToolOutputConstraint::Set(Some(GenerateConstraint::XmlToolCall { .. }))
         ));
+    }
+
+    #[test]
+    fn xml_forcing_rejects_only_backend_proven_unencodable_roots_and_keeps_auto_unforced() {
+        let request = |schema: serde_json::Value, choice: &str| {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({"messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}],"tool_choice":choice})).unwrap()
+        };
+        let xml = protocol("atem-xml");
+        let schema = serde_json::json!({"$defs":{"Args":{"const":{"":1}}},"$ref":"#/$defs/Args"});
+        let error = xml
+            .output_constraint(&request(schema.clone(), "required"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation key-encoding capability"),
+            "{error}"
+        );
+        assert!(matches!(
+            xml.output_constraint(&request(schema, "auto")).unwrap(),
+            ToolOutputConstraint::Unchanged
+        ));
+        for minimum in [1, 2] {
+            let dynamic = serde_json::json!({"type":"object","patternProperties":{"^a$":{"type":"integer"}},"additionalProperties":false,"minProperties":minimum});
+            let error = xml
+                .output_constraint(&request(dynamic, "required"))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("generation key-encoding capability"),
+                "{error}"
+            );
+        }
+        let lexical = serde_json::json!({"type":"object","x-guidance":{"key_separator":"="}});
+        let error = xml
+            .output_constraint(&request(lexical, "required"))
+            .unwrap_err();
+        assert!(error.to_string().contains("standard JSON"), "{error}");
+        let invalid = serde_json::json!({"$ref":"#/$defs/missing"});
+        let error = xml
+            .output_constraint(&request(invalid, "required"))
+            .unwrap_err();
+        assert!(
+            !error
+                .to_string()
+                .contains("generation key-encoding capability"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn xml_mixed_tools_do_not_prune_policy_or_unsupported_value_errors() {
+        let xml = protocol("atem-xml");
+        let request = |schema: serde_json::Value, mixed: bool| {
+            let mut tools = vec![
+                serde_json::json!({"type":"function","function":{"name":"broken","parameters":schema}}),
+            ];
+            if mixed {
+                tools.push(serde_json::json!({"type":"function","function":{"name":"usable","parameters":{"type":"object"}}}));
+            }
+            serde_json::from_value::<ChatCompletionRequest>(
+                serde_json::json!({"messages":[],"tools":tools,"tool_choice":"required"}),
+            )
+            .unwrap()
+        };
+        let unsupported = serde_json::json!({"oneOf":[{"type":"number"},{"type":"integer"}]});
+        for required in [false, true] {
+            for referenced in [false, true] {
+                let mut schema = serde_json::json!({"$id":"https://example.invalid/tool-policy","$defs":{"Value":unsupported},"type":"object","properties":{"":if referenced {serde_json::json!({"$ref":"#/$defs/Value"})} else {unsupported.clone()}},"additionalProperties":false});
+                if required {
+                    schema["required"] = serde_json::json!([""]);
+                }
+                let single = xml
+                    .output_constraint(&request(schema.clone(), false))
+                    .unwrap_err();
+                let mixed = xml.output_constraint(&request(schema, true)).unwrap_err();
+                assert_eq!(single.to_string(), mixed.to_string());
+                assert!(
+                    !mixed
+                        .to_string()
+                        .contains("generation key-encoding capability"),
+                    "{mixed}"
+                );
+            }
+        }
+        let policy_only = serde_json::json!({"type":"object","properties":{"":{"type":"integer"}},"required":[""],"additionalProperties":false});
+        let single = xml
+            .output_constraint(&request(policy_only.clone(), false))
+            .unwrap_err();
+        let mixed = xml
+            .output_constraint(&request(policy_only, true))
+            .unwrap_err();
+        assert_eq!(single.to_string(), mixed.to_string());
+        assert!(
+            mixed
+                .to_string()
+                .contains("generation key-encoding capability"),
+            "{mixed}"
+        );
+        assert!(matches!(
+            xml.output_constraint(&request(serde_json::Value::Bool(false), true))
+                .unwrap(),
+            ToolOutputConstraint::Set(Some(GenerateConstraint::XmlToolCall { .. }))
+        ));
+    }
+
+    #[test]
+    fn xml_mixed_tools_prune_only_original_empty_cardinality_languages() {
+        let xml = protocol("atem-xml");
+        for schema in [
+            serde_json::json!({"type":"object","additionalProperties":false,"minProperties":1}),
+            serde_json::json!({"type":"object","properties":{"ok":false},"additionalProperties":false,"minProperties":1}),
+            serde_json::json!({"type":"object","minProperties":2,"maxProperties":1}),
+            serde_json::json!({"anyOf":[false,{"type":"object","additionalProperties":false,"minProperties":1}]}),
+        ] {
+            let request = serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({"messages":[],"tools":[{"type":"function","function":{"name":"impossible","parameters":schema}},{"type":"function","function":{"name":"usable","parameters":{"type":"object"}}}],"tool_choice":"required"})).unwrap();
+            let ToolOutputConstraint::Set(Some(GenerateConstraint::XmlToolCall {
+                grammar, ..
+            })) = xml.output_constraint(&request).unwrap()
+            else {
+                panic!("usable tool was not retained");
+            };
+            assert!(grammar.contains("usable"));
+            assert!(!grammar.contains("impossible"));
+        }
     }
 
     #[test]

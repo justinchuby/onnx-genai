@@ -1,8 +1,8 @@
-//! CPU reference kernel for frozen `pkg.nxrt::DsaIndexSelect` v1.
+//! CPU reference kernel for frozen `pkg.nxrt._private::DsaIndexSelect` v1.
 //!
 //! `DsaIndexSelect` is the *index-selection* half of GLM-5.2 / DeepSeek Sparse
 //! Attention (DSA). Its output, `selected_indices`, is consumed by the
-//! *sparse-attention* half, `pkg.nxrt::IndexShare`. Together they express the
+//! *sparse-attention* half, `pkg.nxrt._private::IndexShare`. Together they express the
 //! query-dependent sparse attention that PagedAttention cannot (PagedAttention
 //! has no query-dependent sparse-index input).
 //!
@@ -515,7 +515,7 @@ mod tests {
 
     fn node(case: Case, dtype: DataType, out_dtype: DataType) -> (Graph, NodeId) {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let specs = [
             (
                 dtype,
@@ -547,7 +547,7 @@ mod tests {
             static_shape([case.batch, 1, case.q_seq, case.top_k]),
         );
         let mut n = Node::new(NodeId(0), OP, inputs, vec![output]);
-        n.domain = "pkg.nxrt".into();
+        n.domain = "pkg.nxrt._private".into();
         n.attributes
             .insert("top_k".into(), Attribute::Int(case.top_k as i64));
         n.attributes
@@ -1023,12 +1023,12 @@ mod tests {
     #[test]
     fn rejects_missing_top_k() {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let v = graph.create_named_value("q", DataType::Float32, static_shape([1, 1, 1, 2]));
         graph.add_input(v);
         let out = graph.create_named_value("o", DataType::Int64, static_shape([1, 1, 1, 2]));
         let mut n = Node::new(NodeId(0), OP, vec![Some(v)], vec![out]);
-        n.domain = "pkg.nxrt".into();
+        n.domain = "pkg.nxrt._private".into();
         n.attributes.insert("scale".into(), Attribute::Float(1.0));
         let id = graph.insert_node(n);
         let err = create_err(&graph, id);

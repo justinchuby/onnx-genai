@@ -188,7 +188,7 @@ fn load_onnxruntime() -> LoadState {
              Attempted:\n- {}\n\
              Fix: set ONNX_GENAI_ORT_LIB to the full library path, set ONNX_GENAI_ORT_LIB_DIR \
              to a directory containing {}, activate the conda environment that contains ONNX Runtime, \
-             or rebuild so ort-sys downloads ORT {ORT_VERSION}.",
+             or explicitly install an ORT {ORT_VERSION} runtime.",
             attempts.join("\n- "),
             primary_library_name()
         ),
@@ -274,7 +274,7 @@ fn api_version_mismatch_message(
          Fix: set ONNX_GENAI_ORT_LIB to the full path of an ORT {ORT_VERSION} library, \
          set ONNX_GENAI_ORT_LIB_DIR to its containing directory, activate the conda \
          environment that contains ORT {ORT_VERSION} and put its library directory first on \
-         PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or rebuild so ort-sys downloads ORT {ORT_VERSION}.",
+         PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or explicitly install an ORT {ORT_VERSION} runtime.",
         loaded_path.display(),
         loaded_version,
         loaded_api.map_or_else(|| "unknown".to_owned(), |version| version.to_string()),
@@ -328,7 +328,6 @@ fn auto_discovery_candidates(config: &onnx_genai_runtime_config::RuntimeConfig) 
             "active Python virtual environment from VIRTUAL_ENV",
         ));
     }
-    candidates.extend(candidates_from_target_cache());
     dedupe_candidates(candidates)
 }
 
@@ -359,65 +358,6 @@ fn candidates_from_install_prefix(prefix: &Path, reason: &str) -> Vec<Candidate>
     dirs.into_iter()
         .flat_map(|dir| candidates_from_dir(&dir, reason, false, true))
         .collect()
-}
-
-fn candidates_from_target_cache() -> Vec<Candidate> {
-    let mut roots = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        roots.extend(
-            exe.ancestors()
-                .filter(|path| path.file_name().is_some_and(|name| name == "target"))
-                .map(Path::to_path_buf),
-        );
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd.join("target"));
-        roots.extend(
-            cwd.ancestors()
-                .map(|ancestor| ancestor.join("target"))
-                .filter(|path| path.exists()),
-        );
-    }
-
-    let mut candidates = Vec::new();
-    for root in roots {
-        find_ort_prebuilt_lib_dirs(&root, &mut candidates, 0);
-    }
-    candidates
-}
-
-fn find_ort_prebuilt_lib_dirs(path: &Path, candidates: &mut Vec<Candidate>, depth: usize) {
-    if depth > 8 || !path.is_dir() {
-        return;
-    }
-    if path.ends_with(Path::new("ort-prebuilt").join("lib")) {
-        candidates.extend(candidates_from_dir(
-            path,
-            "ort-sys downloaded ORT under target build output",
-            false,
-            true,
-        ));
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if !child.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if depth < 2
-            || name.starts_with("onnx-genai-ort-sys-")
-            || name == "out"
-            || name == "ort-prebuilt"
-            || name == "lib"
-        {
-            find_ort_prebuilt_lib_dirs(&child, candidates, depth + 1);
-        }
-    }
 }
 
 fn candidates_from_dir(

@@ -16,6 +16,10 @@ pub struct PackageFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<TokenizerFacts>,
 
+    /// Explicit fill-in-the-middle control roles and extra-context serialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infill: Option<InfillSpec>,
+
     /// Constraint/grammar dialects this package's parser can interpret.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_languages: Vec<ConstraintLanguageFacts>,
@@ -25,6 +29,38 @@ pub struct PackageFacts {
     /// not support tool calls; it is intentionally not a boolean capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_protocol: Option<ToolProtocolDeclaration>,
+}
+
+/// Model-authored fill-in-the-middle wire facts; filenames are caller-owned labels.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InfillSpec {
+    #[schemars(length(min = 1))]
+    pub prefix_token: String,
+    #[schemars(length(min = 1))]
+    pub middle_token: String,
+    #[schemars(length(min = 1))]
+    pub suffix_token: String,
+    #[serde(default)]
+    pub order: InfillOrder,
+    /// Additional exact tokenizer spellings terminating FIM generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_stop_tokens: Vec<String>,
+    /// Bounded Jinja template over input_extra (ordered filename/text objects).
+    /// Native `/infill` prepends its result before the FIM control envelope, including
+    /// for an empty list. Other FIM entrypoints apply only the control roles.
+    /// No filesystem lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub extra_context_template: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InfillOrder {
+    #[default]
+    Psm,
+    Spm,
 }
 
 /// A portable tool-call protocol identity.  Implementations select only this

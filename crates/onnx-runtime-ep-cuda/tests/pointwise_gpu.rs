@@ -78,9 +78,12 @@ fn run_binary(
         rt.htod(&b_bytes, cuptr(b_buf.as_ptr())).unwrap();
     }
 
-    let a_strides = compute_contiguous_strides(a_shape);
-    let b_strides = compute_contiguous_strides(b_shape);
-    let y_strides = compute_contiguous_strides(out_shape);
+    let a_strides = compute_contiguous_strides(a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let y_strides = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(a_buf.as_ptr()),
@@ -124,7 +127,8 @@ fn run_unary(ep: &CudaExecutionProvider, op: &str, dtype: DataType, x: &[f32]) -
     let mut y_buf = ep.allocate(bytes.len(), 256).unwrap();
     unsafe { rt.htod(&bytes, cuptr(x_buf.as_ptr())).unwrap() };
     let shape = [x.len()];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let input = TensorView::new(
         DevicePtr(x_buf.as_ptr()),
         dtype,
@@ -160,7 +164,8 @@ fn run_rsqrt(ep: &CudaExecutionProvider, dtype: DataType, x: &[f32]) -> Vec<f32>
     let mut y_buf = ep.allocate(bytes.len(), 256).unwrap();
     unsafe { rt.htod(&bytes, cuptr(x_buf.as_ptr())).unwrap() };
     let shape = [x.len()];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let input = TensorView::new(
         DevicePtr(x_buf.as_ptr()),
         dtype,
@@ -205,9 +210,12 @@ fn run_predicate(
         rt.htod(a_bytes, cuptr(a_buf.as_ptr())).unwrap();
         rt.htod(b_bytes, cuptr(b_buf.as_ptr())).unwrap();
     }
-    let a_strides = compute_contiguous_strides(a_shape);
-    let b_strides = compute_contiguous_strides(b_shape);
-    let y_strides = compute_contiguous_strides(out_shape);
+    let a_strides = compute_contiguous_strides(a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let y_strides = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(a_buf.as_ptr()),
@@ -274,7 +282,8 @@ fn cpu_predicate<T: Copy>(
     op: impl Fn(T, T) -> bool,
 ) -> Vec<u8> {
     let strides = |shape: &[usize]| {
-        let contiguous = compute_contiguous_strides(shape);
+        let contiguous = compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides");
         let leading = out_shape.len() - shape.len();
         (0..out_shape.len())
             .map(|axis| {
@@ -311,7 +320,8 @@ fn cpu_broadcast(
     op: impl Fn(f32, f32) -> f32,
 ) -> Vec<f32> {
     let strides = |shape: &[usize]| {
-        let contiguous = compute_contiguous_strides(shape);
+        let contiguous = compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides");
         let leading = out_shape.len() - shape.len();
         (0..out_shape.len())
             .map(|axis| {
@@ -700,8 +710,10 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
     let device = ep.device_id();
     let decode_shape = [1, 1, 4];
     let bias_shape = [4];
-    let decode_strides = compute_contiguous_strides(&decode_shape);
-    let bias_strides = compute_contiguous_strides(&bias_shape);
+    let decode_strides = compute_contiguous_strides(&decode_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let bias_strides = compute_contiguous_strides(&bias_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_values = [1.0_f32, 2.0, 3.0, 4.0];
     let b_values = [0.5_f32, -1.0, 2.0, 3.0];
     let expected = [1.5_f32, 1.0, 5.0, 7.0];
@@ -869,7 +881,8 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
     assert!(runtime.reset_graph().unwrap());
 
     let prefill_shape = [1, 2, 4];
-    let prefill_strides = compute_contiguous_strides(&prefill_shape);
+    let prefill_strides = compute_contiguous_strides(&prefill_shape)
+        .expect("fixture shape has representable contiguous strides");
     let prefill_values = [1.0_f32; 8];
     let prefill_a = ep
         .allocate(std::mem::size_of_val(&prefill_values), 256)
@@ -958,8 +971,10 @@ fn seq_independent_static_shape_is_capture_eligible_via_metadata_flag() {
     // runtime-extent heuristic alone rejects this shape for capture.
     let shape = [32_usize, 128];
     let bias_shape = [128_usize];
-    let strides = compute_contiguous_strides(&shape);
-    let bias_strides = compute_contiguous_strides(&bias_shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
+    let bias_strides = compute_contiguous_strides(&bias_shape)
+        .expect("fixture shape has representable contiguous strides");
     let n: usize = shape.iter().product();
     let a_values = vec![1.0_f32; n];
     let b_values = vec![0.5_f32; bias_shape[0]];
@@ -1124,9 +1139,12 @@ fn execute_broadcast(
     output: &mut DeviceBuffer,
     output_shape: &[usize],
 ) -> onnx_runtime_ep_api::Result<()> {
-    let a_strides = compute_contiguous_strides(a_shape);
-    let b_strides = compute_contiguous_strides(b_shape);
-    let output_strides = compute_contiguous_strides(output_shape);
+    let a_strides = compute_contiguous_strides(a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(a.as_ptr()),

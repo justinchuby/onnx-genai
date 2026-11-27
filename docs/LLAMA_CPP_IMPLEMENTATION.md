@@ -2061,10 +2061,12 @@ optional keys, anyOf branches, Unicode/surrogate keys and literal backslashes.
 HTTP continuation forces valid/invalid competing suffixes through the actual
 model in buffered/SSE mode, with and without response projection.
 
-This workspace patch and bundled source-distribution path are distinct from a
-registry-only dependency install; publishing dependent crates to crates.io removes
-local dependency paths. Upstream or publish the compiler fix before claiming
-this extended key-escape behavior for registry-only crate distributions.
+The former external vendored-package identity did not supply these fixes to
+registry-only consumers after Cargo removed local dependency paths. The compiler
+is now the first-class `onnx-genai-llguidance` package, published before the engine
+with the same audited source and public typed distinction. See the
+[compiler artifact verification](GRAMMAR_COMPILER.md) for the exact packaged/local
+registry proof; configuring that release graph does not claim an upload occurred.
 
 Full server verification also exposed a realtime disconnect release race.
 Admission capacity now drops before the worker reservation advertises idle,
@@ -2603,3 +2605,270 @@ strict server Clippy with `--no-default-features --features metrics,cuda-13000`.
 Formatting/diff checks passed. These are CPU functional checks; device wire
 acceptance and performance remain unclaimed. Broader acceptance rows above stay
 open; this increment does not complete the overall compatibility objective.
+
+
+## Tool parameter object-domain consistency
+
+A real Native constrained-workflow counterexample showed `parameters: true`
+allowing a higher-ranked array-argument token, only for the declared model
+protocol to reject it after selection. Forced envelope grammars and realtime
+parameter admission now share object-domain composition. Missing/null/true
+schemas resolve to objects, while other documents retain their conditions and
+root definitions/references under conjunction with the object requirement.
+Existing object-only schemas stay unchanged; invalid allOf/documents and
+contradictory constraints are not replaced with permissive fallbacks.
+
+The former failing Native case now selects the lower-ranked valid object for
+true, empty, array/object-union and null declarations. Full server validation:
+625 passed, 2 inherited ignores. Grammar tests preserve local root references,
+required/constant/additional-property conditions and impossible-schema failures.
+Strict all-target engine/server Clippy and the explicit ORT reference server
+configuration passed, as did formatting/diff checks. This is CPU functional
+coverage, without device or performance claims; the overall acceptance list
+remains open.
+
+
+## Tool parameter reference scope
+
+Forced tagged-JSON calls compile each parameter document as its own `%json`
+rule. Its root URI, dialect, local pointers, anchors and recursive references
+therefore have the same meaning as in standalone parameter admission. Tool
+schemas may reuse resource IDs without sharing a registry. Absolute references
+to the standalone default root also retain their target.
+
+The outer Lark grammar owns only the call envelope: required name/arguments,
+optional bounded ID, exact fields and every field ordering. Keys and identity
+values use JSON rules; argument documents occur once and are never rewritten
+or embedded under another schema root. The backend's supported schema language
+and response byte bounds remain enforced, and no external retrieval is added.
+
+Validation: the Native websocket regression covers local and absolute default-root
+references, escaped JSON pointers and Draft 4. Compiled grammar cases additionally
+cover anchors, relative resources, recursive roots, duplicate IDs across tools,
+literal reference-like annotation data, JSON whitespace, invalid extra/duplicate
+fields, required arguments and ID limits. The complete server library passed
+627 tests (2 inherited ignores); strict all-target engine/server Clippy with
+defaults and strict server Clippy with explicit ORT-reference features
+`--no-default-features --features metrics,cuda-13000` passed. Formatting/diff
+checks passed. Evidence is functional macOS ARM64 Native CPU, with no device or
+performance claims; the broader compatibility acceptance list remains open.
+
+Independent review additionally reproduced a required-tool union regression:
+a backend-proven impossible parameter schema must not poison another viable
+tool. Multi-tool forced selection now uses the same compiler's typed
+unsatisfiability classification to prune only impossible branches. Invalid,
+unsupported and unresolved schemas still fail with function context; specifically
+selected or wholly impossible choices still fail. Single-tool forcing retains
+its direct compilation path. Vendor provenance records the minimal typed-error
+export used by this classification.
+
+Final validation including the reviewed union-pruning fix: engine library
+1115 passed (1 inherited ignore), server library 629 passed (2 inherited
+ignores), and complete HTTP integration target 39 passed. The Native HTTP
+case generates a valid tool call with an impossible competing schema. Strict
+all-target default engine/server and explicit ORT-reference server Clippy,
+format/diff and vendored compiler provenance checks passed. The compiler error
+export is available in the bundled source; registry-only Rust publication
+requires the patched compiler dependency to be published/upstreamed first.
+
+
+## Standalone power-spectrogram audio features
+
+Authored `spectrogram` operations now execute explicit power/Hann FFT geometry,
+preserve declared analysis rates and produce `[batch,bins,frames]` tensors with
+branch-local valid frames and masks. Shared streaming FFT/window analysis keeps
+log-mel projection and normalization intact; compiled Spectrum/Mel kinds reject
+Whisper normalization on linear power. Other DSP/window/centering conventions
+remain open. See [audio preprocessing](AUDIO_PREPROCESSING.md#linear-spectrograms).
+
+Independent review preserved checked mel dimension/allocation admission before
+FFT planning. Validation: all 120 preprocessing tests passed, including varied
+geometry against an independent f64 DFT; 6 Native spectrogram/waveform/reuse
+integration tests passed, including analytic spectrum energy at the actual head.
+Full server library: 629 passed, 2 inherited ignores. Strict all-target default
+preprocess/engine/server and explicit ORT-reference server Clippy, formatting and
+diff checks passed. This is functional macOS ARM64 CPU coverage; no device or
+performance claim and no completion of the broader acceptance list.
+
+
+## Executable behavioral acceptance inventory
+
+The [behavioral matrix](LLAMA_CPP_BEHAVIOR_MATRIX.md) accounts for all 55 pinned
+method/path contracts and nine original acceptance categories, including explicit
+external-harness exclusions and unfinished requirements. Its source-linked cases
+are not fresh execution claims. The optional POSIX receipt runner discovers an
+exact test identity before requiring one passed/zero ignored, binds clean source
+revision/tree/content plus explicit/implicit Cargo configuration and environment
+hashes, and invalidates evidence if inputs change. Timeout/interruption cleanup
+terminates the owned local process group before returning to the shared lock.
+
+New explicit Native CPU integration cases cover Responses and input-count aliases,
+pooled embedding aliases and full typed SSE ordering/identity/terminal consistency.
+The maintained browser driver accepts the chosen built binary and uses ephemeral
+fixture/proxy ports. Complete device/model/control cross-products, original CLI
+executable evidence and the other listed acceptance gaps remain open.
+
+Validation on the post-spectrogram production tree: all 23 Python checker/runner
+regressions and all four explicit Native CPU alias integration tests passed;
+strict default/reference server Clippy passed. Fresh Chrome chat/persistence,
+byte-exact completed replay, induced reader-disconnect recovery, genuinely active
+16,384-token refresh recovery and Stop/worker release passed without page errors.
+API-key onboarding rejected the wrong key, accepted and persisted the valid key,
+and protected replay. Browser evidence records the built binary/driver hashes;
+these fixture results do not close the full model/device/control acceptance list.
+
+
+## Explicit spectrum projections and periodic windows
+
+Standalone audio spectra now admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Magnitude projects finite complex FFT values
+with stable hypot, so squared-magnitude overflow does not reject representable
+amplitudes. Log-mel keeps the original power/Hann arithmetic, mel resource
+admission before planning and normalization; geometry/rate/branch/mask guards
+are unchanged. Uncentered/complex and other DSP conventions remain open.
+
+Validation: all 122 preprocessing tests passed, including independent f64 DFT
+for each projection/window, odd/short/length-one windows, and finite-input
+magnitude-vs-power overflow checks. Six Native audio tests passed; the spectrum
+case executes all six combinations at multiple amplitudes/lengths against
+analytic head outputs. Full server library: 629 passed, 2 inherited ignores.
+Strict all-target default preprocess/engine/server and explicit ORT-reference
+server Clippy, formatting and diff checks passed. Functional macOS ARM64 CPU
+coverage only; no device/performance or whole-goal parity claim.
+
+
+## Package-bound CLI behavioral evidence
+
+The behavioral inventory now binds each Rust case to an explicit workspace
+package manifest and enabled lib/integration target. The checker rejects
+mismatched package identities, excluded packages, escaped source paths and
+custom test harnesses; execution records the chosen package and target and
+binds the package manifests into its receipt. The inventory contains 47 Rust
+cases plus one browser case across the existing 55 contracts/nine categories.
+
+Five CLI cases establish removed REPL rejection, the Native default, retained
+generation CPU/context controls, transcription input/format/conditioning controls
+and global profiling flag parsing. These parser assertions do not establish
+end-to-end inference, emitted profiling files or packaged launcher behavior.
+
+Validation: all 78 CLI library tests and 29 Python checker/runner regressions
+passed. Strict all-target default CLI/server and explicit ORT-reference CLI
+(`--no-default-features --features onnx-genai-server/metrics,cuda-13000`)
+Clippy, inventory, Python lint, formatting and diff checks passed. No hardware
+performance claim or broader acceptance completion is implied.
+
+
+## Native duplex response-local constraints
+
+Input-driven duplex responses now arm the admitted constraint on the native
+owner after Configure and before their first Audio quantum. Arming performs no
+workflow quantum and does not consume usage; subsequent Audio/Poll retains the
+same grammar cursor. Active responses own immutable tool/schema snapshots. Mutable response
+default updates affect the following response rather than current sampling or
+result admission; tool definitions remain frozen after first input because they
+participate in session-start conditioning. Dynamic tool-definition updates need
+a separate conditioning/state design and remain open. Missing masks and unsupported forcing fail before PCM is
+queued. Tool execution remains owned by the external harness.
+
+The exact old-code Native counterexample was reproduced: a higher-ranked invalid
+city token was selected before schema rejection, failing the intended mask
+assertion (one failed, zero passed/ignored). Nine fixed-source regressions cover
+first-token selection, updates/cancel/rearm, cursor progress, admission failure,
+non-quantum arming, schema ownership, EOS masking/ignore-mask refusal and finite
+turn versus unlimited duplex budget behavior. The dedicated driver requires
+clean source trees, binds HEAD/tree/source/manifests/lock and Cargo inputs, and
+checks those bindings before and after every exact discovered/executed test.
+The broader compatibility acceptance rows remain open.
+
+
+## Native CLI process-boundary evidence
+
+The behavioral inventory now links five additional real Native CLI process
+cases: generation and its JSON profile, emitted CPU trace spans, file/WAV-stdin/
+raw-PCM transcription, authored MP3 feature windows, and language/prompt
+projection. The inventory has 52 Rust cases plus its separate browser driver.
+These fixture processes disable ORT discovery and check actual output/backend
+facts. Profiling uses OS temporary directories rather than repository target
+paths. Packaged console-launcher acceptance and the full model/device/control
+cross-product remain open; parser and process evidence are distinct.
+
+
+## Publishable maintained grammar dependency
+
+The single audited compiler tree now has the owned package identity
+`onnx-genai-llguidance`; engine imports use its canonical Rust name. Its exact
+versioned release dependency precedes the engine in the publish graph, retaining
+the original MIT source, archive hash and all 71 provenance records. There is no
+registry/path switch or duplicate compiler implementation. Two token-range
+vector constructions retain their values with lint-clean syntax.
+
+The compiler source passed 56 unit and 2 public-surface tests, strict all-target
+Clippy and 20 Python provenance/release/registry checks. An exact 77-file Cargo
+archive was served through a temporary sparse registry and consumed without
+path/git/patch overrides; its registry-only public tests passed locked/offline.
+This proves the artifact surface, not a crates.io publication. The standalone
+key-ownership regression uses legal raw DEL spelling; the engine normalizes
+arbitrary JSON Unicode escapes before backend recognition. See
+[compiler checks](GRAMMAR_COMPILER.md) for reproducible artifact evidence.
+
+### Canonical named-parameter XML generation wire strategy
+
+Forced `atem-xml@v1` generation uses exactly one canonical invoke envelope with
+double-quoted `name` attributes and parameter bodies containing serialized JSON.
+The five named entities `amp`, `quot`, `apos`, `lt`, and `gt` escape XML syntax;
+numeric entities are not assumed to decode. Strings use JSON quotes, for example
+`&quot;1&quot;` and `&quot;Paris&quot;`. Raw `1` denotes a number and is never
+reinterpreted as a string. Existing unforced inbound XML parsing still accepts
+its broader spelling, including raw `1x` as the string `"1x"`.
+
+The prefix projector translates canonical XML into the existing logical tool
+grammar. It retains the independent standalone parameter-schema roots. Partial
+XML delimiters/entities represent a bounded union of possible logical prefixes,
+checked using forks of the already-compiled byte cursor. Closing a parameter
+requires actual JSON and immediately checks its permitted object successors;
+`1</atem:parameter>` cannot continue a schema that requires the number `12`.
+Every completed canonical envelope is also checked by the authoritative inbound
+XML scanner. Generation does not promise every inbound raw-text spelling,
+optional XML attribute, whitespace spelling, or multi-invoke sequence.
+
+The compiler's opt-in root key policy generates only names explicitly declared
+in the normalized root object's `properties` or `required`, with nonempty names
+up to the inbound parser's UTF-8 byte limit. It follows normalized references at the
+same root and leaves nested JSON keys unchanged. Schemas with no instances under this declared-name generation policy receive
+a capability error only after the backend proves that restricted language empty;
+this does not assert semantic unsatisfiability of the original schema; invalid/unsupported/resource errors remain distinct.
+Controls and Unicode use the existing parser's actual string/entity semantics,
+rather than imposing a new standard XML parser. Existing explicit output stops
+and resource/token limits can still truncate a viable stream.
+
+Custom `x-guidance` item/key separator regexes and custom whitespace regexes are
+outside this canonical XML generation spelling and receive an explicit
+capability error. The default JSON lexical language and other supported compiler
+options remain attached to the original schema root.
+
+Dynamic root-name XML forcing remains open. Inbound unforced XML continues to
+accept dynamic parameter names under its existing admission rules. Nested JSON
+objects inside declared parameters retain their original dynamic-key semantics.
+
+Named parameter generation follows the compiler's existing schema-property
+ordering. Inbound XML parameter ordering is unchanged. This generation spelling
+preserves supported declared-field values without promising all inbound orders.
+
+Policy-only absence of encodable declared fields uses a distinct typed backend
+capability error. It cannot be mistaken for semantic schema unsatisfiability or
+used to silently discard a selected tool. Unsupported original value schemas,
+including optional/dynamic fields and referenced definitions, remain errors
+before policy filtering.
+
+The original normalized schema and pending definitions receive a complete
+original-compiler preflight on the same builder before root generation policy
+compilation. Thus an originally empty cardinality language remains semantic
+unsatisfiability and can be pruned normally; a language emptied only by the named
+parameter policy remains a distinct capability error. The caller's actual
+compiler resource limits apply to both stages; schema references are not
+retrieved a second time and no additional byte-token parser is built.
+
+Constrained native cancellation is a terminal control: it executes with a full
+all-false vocabulary mask rather than requiring another grammar continuation.
+This preserves cancellation and rearming of incomplete envelopes without allowing
+text/EOS to escape the existing Native output checks.

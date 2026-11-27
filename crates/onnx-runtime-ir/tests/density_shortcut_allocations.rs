@@ -57,7 +57,8 @@ fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
 fn the_density_shortcut_keeps_high_rank_queries_off_the_heap() {
     // Rank 9 > INLINE_RANK (8), contiguous, no empty extent: the shortcut fires.
     let shape = [2usize, 1, 2, 1, 2, 1, 2, 1, 2];
-    let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
+    let strides = onnx_runtime_ir::compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let (dense, allocs) = allocations_during(|| onnx_runtime_ir::is_dense(&shape, &strides));
     assert!(dense, "premise: this layout is dense");

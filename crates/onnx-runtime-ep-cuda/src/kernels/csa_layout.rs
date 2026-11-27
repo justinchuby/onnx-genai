@@ -159,7 +159,7 @@ mod tests {
             vec![Some(query), Some(cache)],
             vec![],
         );
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("max_seq_len".into(), Attribute::Int(1024));
         node.attributes

@@ -1,0 +1,369 @@
+{
+  "cells": [
+    {
+      "accepted": false,
+      "case": [
+        "relu",
+        12,
+        1,
+        "run"
+      ],
+      "failed_gates": [
+        "run-009: foreign process-average CPU",
+        "run-010: foreign process-average CPU",
+        "run-011: foreign process-average CPU",
+        "run-018: foreign process-average CPU",
+        "run-019: foreign process-average CPU",
+        "run-020: foreign process-average CPU",
+        "run-051: foreign process-average CPU",
+        "run-052: foreign process-average CPU",
+        "run-053: foreign process-average CPU"
+      ],
+      "process_medians_seconds_per_call": {
+        "baseline": {
+          "cpu": [
+            1.0443050847457592e-05,
+            1.0349966101694906e-05,
+            1.030291525423728e-05
+          ],
+          "wall": [
+            1.0443002847457626e-05,
+            1.0352689288135594e-05,
+            1.0302810711864407e-05
+          ]
+        },
+        "candidate": {
+          "cpu": [
+            1.0186169491525431e-05,
+            1.0117559322033889e-05,
+            1.0144338983050847e-05
+          ],
+          "wall": [
+            1.0186206237288136e-05,
+            1.011746047457627e-05,
+            1.0144353152542374e-05
+          ]
+        },
+        "null": {
+          "cpu": [
+            1.0623389830508477e-05,
+            1.043457627118644e-05,
+            1.0420813559322036e-05
+          ],
+          "wall": [
+            1.0623209016949151e-05,
+            1.0438172338983051e-05,
+            1.0420519796610168e-05
+          ]
+        }
+      },
+      "ratios": null,
+      "resolved_direction": null
+    },
+    {
+      "accepted": false,
+      "case": [
+        "q8",
+        1,
+        1,
+        "run"
+      ],
+      "failed_gates": [
+        "run-000: foreign process-average CPU",
+        "run-001: foreign process-average CPU",
+        "run-002: foreign process-average CPU",
+        "run-027: foreign process-average CPU",
+        "run-028: foreign process-average CPU",
+        "run-029: foreign process-average CPU",
+        "run-036: foreign process-average CPU",
+        "run-037: foreign process-average CPU",
+        "run-038: foreign process-average CPU"
+      ],
+      "process_medians_seconds_per_call": {
+        "baseline": {
+          "cpu": [
+            2.78321236983275e-06,
+            2.8006422512204585e-06,
+            2.804261875150816e-06
+          ],
+          "wall": [
+            2.7831582239711915e-06,
+            2.8006499916470215e-06,
+            2.8042355725502572e-06
+          ]
+        },
+        "candidate": {
+          "cpu": [
+            2.8082713047352093e-06,
+            2.8226941139346274e-06,
+            2.776492862844096e-06
+          ],
+          "wall": [
+            2.8104036344736694e-06,
+            2.822696434206374e-06,
+            2.7764835817570955e-06
+          ]
+        },
+        "null": {
+          "cpu": [
+            2.8364672470439735e-06,
+            2.8081228073431967e-06,
+            2.8142854491118007e-06
+          ],
+          "wall": [
+            2.836459506617415e-06,
+            2.808093423421751e-06,
+            2.814252965307297e-06
+          ]
+        }
+      },
+      "ratios": null,
+      "resolved_direction": null
+    },
+    {
+      "accepted": false,
+      "case": [
+        "q8",
+        3,
+        1,
+        "run"
+      ],
+      "failed_gates": [
+        "run-006: foreign process-average CPU",
+        "run-007: foreign process-average CPU",
+        "run-008: foreign process-average CPU",
+        "run-033: foreign process-average CPU",
+        "run-034: foreign process-average CPU",
+        "run-035: foreign process-average CPU",
+        "run-045: foreign process-average CPU",
+        "run-046: foreign process-average CPU",
+        "run-047: foreign process-average CPU"
+      ],
+      "process_medians_seconds_per_call": {
+        "baseline": {
+          "cpu": [
+            5.892403309449352e-06,
+            5.8158426032223495e-06,
+            5.832825303828035e-06
+          ],
+          "wall": [
+            5.892398361110011e-06,
+            5.8157716638296185e-06,
+            5.832793951149994e-06
+          ]
+        },
+        "candidate": {
+          "cpu": [
+            5.916947072562446e-06,
+            5.8730849926764595e-06,
+            5.831083488381302e-06
+          ],
+          "wall": [
+            5.918923122600055e-06,
+            5.874844938838526e-06,
+            5.831090059775939e-06
+          ]
+        },
+        "null": {
+          "cpu": [
+            5.893234630458017e-06,
+            5.8520644471715375e-06,
+            5.862515339851956e-06
+          ],
+          "wall": [
+            5.893031748545188e-06,
+            5.851988559439452e-06,
+            5.862967261786944e-06
+          ]
+        }
+      },
+      "ratios": null,
+      "resolved_direction": null
+    },
+    {
+      "accepted": false,
+      "case": [
+        "q8",
+        12,
+        1,
+        "run"
+      ],
+      "failed_gates": [
+        "run-015: foreign process-average CPU",
+        "run-016: foreign process-average CPU",
+        "run-017: foreign process-average CPU",
+        "run-021: foreign process-average CPU",
+        "run-022: foreign process-average CPU",
+        "run-023: foreign process-average CPU",
+        "run-048: foreign process-average CPU",
+        "run-049: foreign process-average CPU",
+        "run-050: foreign process-average CPU"
+      ],
+      "process_medians_seconds_per_call": {
+        "baseline": {
+          "cpu": [
+            1.9427505888510863e-05,
+            1.9163700601936643e-05,
+            1.9215388641716853e-05
+          ],
+          "wall": [
+            1.9427342318764723e-05,
+            1.9166099581261452e-05,
+            1.9215257785919918e-05
+          ]
+        },
+        "candidate": {
+          "cpu": [
+            1.9483643025386006e-05,
+            1.9061763936142368e-05,
+            1.9116985082439168e-05
+          ],
+          "wall": [
+            1.9483441245747188e-05,
+            1.9065362470557446e-05,
+            1.9116805155718398e-05
+          ]
+        },
+        "null": {
+          "cpu": [
+            1.940630724941116e-05,
+            1.924875686992932e-05,
+            1.9214341795341558e-05
+          ],
+          "wall": [
+            1.940623632556922e-05,
+            1.9254438236063858e-05,
+            1.921387843496467e-05
+          ]
+        }
+      },
+      "ratios": null,
+      "resolved_direction": null
+    },
+    {
+      "accepted": false,
+      "case": [
+        "q8",
+        3,
+        8,
+        "run"
+      ],
+      "failed_gates": [
+        "run-003: foreign process-average CPU",
+        "run-004: foreign process-average CPU",
+        "run-005: foreign process-average CPU",
+        "run-024: foreign process-average CPU",
+        "run-025: foreign process-average CPU",
+        "run-026: foreign process-average CPU",
+        "run-039: foreign process-average CPU",
+        "run-040: foreign process-average CPU",
+        "run-041: foreign process-average CPU"
+      ],
+      "process_medians_seconds_per_call": {
+        "baseline": {
+          "cpu": [
+            9.297014925373138e-06,
+            9.217164179104478e-06,
+            9.246455223880605e-06
+          ],
+          "wall": [
+            9.299406592039802e-06,
+            9.2182032960199e-06,
+            9.246413743781095e-06
+          ]
+        },
+        "candidate": {
+          "cpu": [
+            9.215796019900493e-06,
+            9.196455223880594e-06,
+            9.155597014925374e-06
+          ],
+          "wall": [
+            9.215244092039801e-06,
+            9.196385261194029e-06,
+            9.155519278606966e-06
+          ]
+        },
+        "null": {
+          "cpu": [
+            9.184390547263658e-06,
+            9.134390547263682e-06,
+            9.209888059701498e-06
+          ],
+          "wall": [
+            9.184320584577114e-06,
+            9.134286878109453e-06,
+            9.209825870646767e-06
+          ]
+        }
+      },
+      "ratios": null,
+      "resolved_direction": null
+    },
+    {
+      "accepted": false,
+      "case": [
+        "q8",
+        3,
+        1,
+        "prepare_run"
+      ],
+      "failed_gates": [
+        "run-012: foreign process-average CPU",
+        "run-013: foreign process-average CPU",
+        "run-014: foreign process-average CPU",
+        "run-030: foreign process-average CPU",
+        "run-031: foreign process-average CPU",
+        "run-032: foreign process-average CPU",
+        "run-042: foreign process-average CPU",
+        "run-043: foreign process-average CPU",
+        "run-044: foreign process-average CPU"
+      ],
+      "process_medians_seconds_per_call": {
+        "baseline": {
+          "cpu": [
+            6.058066315957262e-06,
+            6.042324246771876e-06,
+            6.007452574525752e-06
+          ],
+          "wall": [
+            6.0586425155428025e-06,
+            6.042239558424996e-06,
+            6.009514984855731e-06
+          ]
+        },
+        "candidate": {
+          "cpu": [
+            6.0551968754981755e-06,
+            5.966403634624576e-06,
+            6.035748445719749e-06
+          ],
+          "wall": [
+            6.055208512673362e-06,
+            5.96636545512514e-06,
+            6.035710266220309e-06
+          ]
+        },
+        "null": {
+          "cpu": [
+            6.092619161485733e-06,
+            6.03531005898295e-06,
+            6.0091264147935615e-06
+          ],
+          "wall": [
+            6.092846684202137e-06,
+            6.035384783994899e-06,
+            6.009058345289335e-06
+          ]
+        }
+      },
+      "ratios": null,
+      "resolved_direction": null
+    }
+  ],
+  "no_cuda_execution": true,
+  "schema_version": 1,
+  "scope": "optimized public InferenceSession run or prepare+run, including output destruction; one Rayon/decode thread; synthetic exact Q8 arithmetic; no model or GPU extrapolation",
+  "timed_node_dispatches": 126815868,
+  "timed_public_calls": 34675614
+}

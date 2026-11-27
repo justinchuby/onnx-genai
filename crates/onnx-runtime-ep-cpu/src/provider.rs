@@ -38,6 +38,7 @@ use crate::optimizer::cpu_optimization_passes;
 /// registry is also exposed to the session (Track D) so placement and kernel
 /// instantiation share one source of truth.
 pub struct CpuExecutionProvider {
+    standalone: bool,
     device: DeviceId,
     initialized: bool,
     registry: OpRegistry,
@@ -113,14 +114,14 @@ impl CpuExecutionProvider {
 
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
-        let mut ep = Self::shared_kernels(resources);
+        let mut ep = Self::shared_kernels(resources, true);
         ep.registry.register(
             onnx_runtime_ep_api::OpKey::new(
                 onnx_runtime_optimizer::affine_moe::OP,
                 onnx_runtime_ir::RUNTIME_DOMAIN,
                 1,
             ),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
             Box::new(crate::kernels::affine_moe::Factory),
         );
         ep
@@ -128,14 +129,15 @@ impl CpuExecutionProvider {
 
     /// CPU provider for the ORT plugin: exclude standalone-only registry entries and passes.
     pub fn for_ort_plugin() -> Self {
-        Self::shared_kernels(CpuMemoryResources::default())
+        Self::shared_kernels(CpuMemoryResources::default(), false)
     }
 
-    fn shared_kernels(resources: CpuMemoryResources) -> Self {
+    fn shared_kernels(resources: CpuMemoryResources, standalone: bool) -> Self {
         Self {
+            standalone,
             device: DeviceId::cpu(),
             initialized: false,
-            registry: build_cpu_registry_with_resources(resources.clone()),
+            registry: build_cpu_registry_with_resources(resources.clone(), standalone),
             resources,
             local_workspace: std::sync::OnceLock::new(),
             memory: default_cpu_memory(),
@@ -518,6 +520,38 @@ impl ExecutionProvider for CpuExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
+            onnx_runtime_ep_api::det::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if self.standalone
+            && op.op_type == "Mod"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) = onnx_runtime_ir::modulo::ModMode::parse(op).and_then(|mode| {
+                input_dtypes
+                    .first()
+                    .map_or(Ok(()), |&dtype| mode.validate_dtype(opset, dtype))
+            })
+        {
+            deny!("Mod: {reason}");
+        }
+        if op.op_type == "Equal"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && input_dtypes.contains(&DataType::String)
+        {
+            let since = crate::kernels::logical::EQUAL_STRING_SINCE;
+            if opset < since {
+                deny!(
+                    "Equal does not accept tensor(string) at opset {opset}; export at opset {since} or later, or supply matching non-string operands"
+                );
+            }
+            if input_dtypes != [DataType::String, DataType::String] {
+                deny!(
+                    "Equal requires two tensor(string) operands when either operand is String; got {input_dtypes:?}"
+                );
+            }
+        }
+        if let Some(reason) =
             onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
@@ -653,7 +687,17 @@ impl ExecutionProvider for CpuExecutionProvider {
         passes
     }
 
+    fn host_payload_funding(&self) -> Option<onnx_runtime_ep_api::HostPayloadFunding> {
+        self.resources
+            .buffer_memory()
+            .map(crate::CpuBufferMemory::host_payload_funding)
+    }
+
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
+        if let Some(memory) = self.resources.buffer_memory() {
+            return memory.allocate(size, alignment, self.device);
+        }
+
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
@@ -727,6 +771,28 @@ impl ExecutionProvider for CpuExecutionProvider {
         if buffer.is_borrowed() {
             return Ok(());
         }
+        let buffer = match buffer.into_bound_ownership() {
+            Ok(onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner)) => {
+                let outcome = owner.release_now().map_err(|source| EpError::Backend {
+                    operation: "release CPU ordinary managed Host payload",
+                    source: Box::new(source),
+                })?;
+                return if outcome.is_complete() {
+                    Ok(())
+                } else {
+                    Err(EpError::KernelFailed(format!(
+                        "CPU ordinary Host payload release retained funded ownership: {outcome:?}; inspect the process memory quarantine and resolve the backing release failure"
+                    )))
+                };
+            }
+            Ok(onnx_runtime_ep_api::BoundBufferOwnership::Binding(owner)) => {
+                // This provider never issues bare bound ordinary allocations.
+                // Dropping preserves the binding's unresolved ownership record.
+                drop(owner);
+                return Err(EpError::KernelFailed("CPU ordinary Host payload lacks a managed allocation token; return the complete owner issued by this provider".into()));
+            }
+            Err(buffer) => buffer,
+        };
         let size = buffer.len();
         let align = buffer.alignment();
         let ptr = buffer.into_raw() as *mut u8;
@@ -815,10 +881,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         let src_ptr = src.as_ptr() as *const u8;
         let dst_ptr = dst.as_mut_ptr() as *mut u8;
         // SAFETY: both pointers are valid host allocations of at least `size`
-        // bytes (checked above). They name distinct `DeviceBuffer`s — `dst` is
-        // borrowed `&mut`, so it cannot alias `src` — hence non-overlapping.
+        // bytes (checked above). Borrowed buffer descriptors may name the same
+        // backing or shifted ranges; their Rust borrows do not prove raw-range
+        // disjointness. memmove semantics preserve the source under overlap.
         unsafe {
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+            std::ptr::copy(src_ptr, dst_ptr, size);
         }
         Ok(())
     }
@@ -1151,7 +1218,7 @@ mod tests {
             })
             .collect();
         let mut node = Node::new(NodeId(0), "CompressedSparseAttention", inputs, outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(1));
         node.attributes
@@ -2068,6 +2135,7 @@ mod tests {
     #[test]
     fn qlinear_matmul_claim_gate_checks_quantized_dtypes() {
         let ep = CpuExecutionProvider::new();
+        let ort = CpuExecutionProvider::for_ort_plugin();
         let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
         let valid = [
             DataType::Uint8,
@@ -2083,6 +2151,41 @@ mod tests {
             ep.supports_op(&node, 10, &[], &valid, &[]).is_supported(),
             "valid QLinearMatMul types should be claimed"
         );
+        assert!(ort.supports_op(&node, 21, &[], &valid, &[]).is_supported());
+        let (_, descriptors) = crate::build_cpu_registry_with_descriptors();
+        let versions: Vec<_> = descriptors
+            .iter()
+            .filter(|op| op.op_type == "QLinearMatMul" && op.domain.is_empty())
+            .map(|op| (op.since_version, op.end_version))
+            .collect();
+        assert_eq!(versions, [(10, u64::MAX)]);
+
+        for half in [DataType::Float16, DataType::BFloat16] {
+            let mut types = valid;
+            for index in [1, 4, 6] {
+                types[index] = half;
+            }
+            assert!(!ep.supports_op(&node, 9, &[], &types, &[]).is_supported());
+            for opset in [10, 21] {
+                assert!(
+                    ep.supports_op(&node, opset, &[], &types, &[])
+                        .is_supported()
+                );
+                let legacy = ort.supports_op(&node, opset, &[], &types, &[]);
+                let reason = legacy.reason().unwrap();
+                assert!(
+                    reason.contains("half scales are only supported by standalone nxrt"),
+                    "{reason}"
+                );
+            }
+            types[6] = DataType::Float32;
+            let mixed = ep.supports_op(&node, 21, &[], &types, &[]);
+            let reason = mixed.reason().unwrap();
+            assert!(
+                reason.contains("y_scale dtype to match a_scale"),
+                "{reason}"
+            );
+        }
 
         let mut invalid = valid;
         invalid[0] = DataType::Float32;
@@ -2215,7 +2318,7 @@ mod tests {
         }
     }
 
-    /// Builds a `pkg.nxrt::DsaIndexSelect` node plus the `(shapes, dtypes)`
+    /// Builds a `pkg.nxrt._private::DsaIndexSelect` node plus the `(shapes, dtypes)`
     /// claim metadata for a compatible baseline: batch=1, q_seq=2, heads=2,
     /// head_dim=4, key_seq=3, top_k=2. Each shape/dtype axis matches
     /// `DsaIndexSelectKernel::derive_dims`'s cross-input contract exactly, so
@@ -2237,7 +2340,7 @@ mod tests {
             static_shape([]),
         );
         let mut node = Node::new(NodeId(0), "DsaIndexSelect", inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes.insert("top_k".into(), Attribute::Int(2));
         node.attributes
             .insert("scale".into(), Attribute::Float(1.0));
@@ -2408,5 +2511,34 @@ mod tests {
         );
         unknown.domain = "com.microsoft".to_string();
         assert!(!ep.supports_op(&unknown, 1, &[], &[], &[]).is_supported());
+    }
+    #[test]
+    fn copy_handles_identical_and_shifted_borrowed_buffer_ranges() {
+        let ep = CpuExecutionProvider::new();
+        for destination in [0usize, 4, 8] {
+            let mut backing = (0..24).map(|v| v as u8).collect::<Vec<_>>();
+            let mut expected = backing.clone();
+            expected.copy_within(4..12, destination);
+            let pointer = backing.as_mut_ptr();
+            // SAFETY: backing stays live; only the destination handle writes,
+            // and no owner access races the synchronous copy. Borrowed handles
+            // never free the allocation and raw ranges may overlap.
+            let (src, mut dst) = unsafe {
+                (
+                    DeviceBuffer::from_borrowed_parts(pointer.add(4).cast(), ep.device_id(), 8, 1),
+                    DeviceBuffer::from_borrowed_mut_parts(
+                        pointer.add(destination).cast(),
+                        ep.device_id(),
+                        8,
+                        1,
+                    )
+                    .unwrap(),
+                )
+            };
+            ep.copy(&src, &mut dst, 8).unwrap();
+            ep.deallocate(src).unwrap();
+            ep.deallocate(dst).unwrap();
+            assert_eq!(backing, expected);
+        }
     }
 }

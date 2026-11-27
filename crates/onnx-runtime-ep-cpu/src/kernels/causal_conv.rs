@@ -419,7 +419,8 @@ mod tests {
             let state_ptr = shared_state.as_ptr() as *const std::ffi::c_void;
             let present_ptr = shared_state.as_mut_ptr() as *mut std::ffi::c_void;
             let sshape = [batch, c, pad];
-            let sstrides = compute_contiguous_strides(&sshape);
+            let sstrides = compute_contiguous_strides(&sshape)
+                .expect("fixture shape has representable contiguous strides");
             let (x, w, bias) = (owned_x(), owned_w(), owned_bias());
             let mut y = Owned::zeros_f32(&[batch, c, s]);
             let state_view = TensorView::new(DevicePtr(state_ptr), f32c, &sshape, &sstrides, cpu);
@@ -441,7 +442,8 @@ mod tests {
             let x_ptr = shared_x.as_ptr() as *const std::ffi::c_void;
             let y_ptr = shared_x.as_mut_ptr() as *mut std::ffi::c_void;
             let xshape = [batch, c, s];
-            let xstrides = compute_contiguous_strides(&xshape);
+            let xstrides = compute_contiguous_strides(&xshape)
+                .expect("fixture shape has representable contiguous strides");
             let (w, bias, state) = (owned_w(), owned_bias(), owned_state());
             let mut present = Owned::zeros_f32(&[batch, c, pad]);
             let x_view = TensorView::new(DevicePtr(x_ptr), f32c, &xshape, &xstrides, cpu);

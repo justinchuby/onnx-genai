@@ -101,9 +101,9 @@ impl Kernel for ReduceMeanKernel {
             .product();
         let kept_count = numel(&kept_shape);
 
-        let in_strides = compute_contiguous_strides(in_shape);
+        let in_strides = compute_contiguous_strides(in_shape)?;
         // Row-major stride of each *kept* axis into the flat output buffer.
-        let kept_out_strides = compute_contiguous_strides(&kept_shape);
+        let kept_out_strides = compute_contiguous_strides(&kept_shape)?;
 
         let mut sums = vec![0.0f32; kept_count.max(1)];
         if numel(in_shape) > 0 {

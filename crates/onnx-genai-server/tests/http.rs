@@ -1236,6 +1236,64 @@ async fn chat_completions_rejects_malformed_json_schema() {
     }
 }
 
+#[cfg(feature = "native-backend")]
+#[tokio::test]
+async fn native_required_tool_choice_skips_an_impossible_alternative() {
+    let package = tempfile::tempdir().unwrap();
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-tool-call");
+    copy_tree(&source, package.path());
+    let path = package.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+    let previous = vocab
+        .iter()
+        .find(|(_, id)| id.as_u64() == Some(22))
+        .unwrap()
+        .0
+        .clone();
+    vocab.remove(&previous);
+    vocab.insert(
+        "<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>"
+            .into(),
+        json!(22),
+    );
+    std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    std::fs::write(
+        package.path().join("tokenizer_config.json"),
+        r#"{"chat_template":"assistant"}"#,
+    )
+    .unwrap();
+    let config = ServerConfig {
+        engine_config: onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let router =
+        app(
+            AppState::load_with_config(package.path(), Some("native-tools".into()), config)
+                .unwrap(),
+        );
+    let response=post_json(router,"/v1/chat/completions",json!({
+        "messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,"logit_bias":{"22":1000},"tool_choice":"required",
+        "tools":[{"type":"function","function":{"name":"impossible","parameters":false}},
+                 {"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}}]
+    })).await;
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let call = &body["choices"][0]["message"]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "weather", "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+        json!({"city":"Paris"})
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 1);
+}
+
 #[test]
 fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
     let request = chat_request(json!({
@@ -1275,19 +1333,41 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
     assert!(prefix.is_empty());
-    assert!(
-        grammar.contains("start: \"<tool_call>\\n\" tool \"\\n</tool_call>\""),
-        "{grammar}"
-    );
-    assert!(grammar.contains("tool: %json"), "{grammar}");
-    let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
-    let schema: Value = serde_json::from_str(schema_text).unwrap();
-    assert_eq!(schema["properties"]["name"]["enum"][0], "get_weather");
-    assert_eq!(schema["properties"]["arguments"]["required"][0], "location");
-    assert_eq!(
-        schema["properties"]["arguments"]["properties"]["location"]["type"],
-        "string"
-    );
+    use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+    let cursor = GrammarByteCursor::lark(&grammar, 4096).unwrap();
+    for (body, valid) in [
+        (
+            r#"{"name":"get_weather","arguments":{"location":"Paris"}}"#,
+            true,
+        ),
+        (
+            r#"{"arguments":{"location":"Paris"},"id":"call_1","name":"get_weather"}"#,
+            true,
+        ),
+        (
+            r#"{"name":"get_time","arguments":{"location":"Paris"}}"#,
+            false,
+        ),
+        (r#"{"name":"get_weather","arguments":{}}"#, false),
+        (
+            r#"{"name":"get_weather","arguments":{"location":3}}"#,
+            false,
+        ),
+        (
+            r#"{"name":"get_weather","arguments":{"location":"Paris"},"extra":1}"#,
+            false,
+        ),
+    ] {
+        let text = format!("<tool_call>\n{body}\n</tool_call>");
+        assert_eq!(
+            matches!(
+                cursor.preview_root(text.as_bytes()).unwrap(),
+                GrammarCandidate::Viable { complete: true }
+            ),
+            valid,
+            "{text}"
+        );
+    }
 }
 
 #[test]
@@ -1326,12 +1406,33 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
     assert!(prefix.is_empty());
-    let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
-    let schema: Value = serde_json::from_str(schema_text).unwrap();
-    let any_of = schema["anyOf"].as_array().unwrap();
-    assert_eq!(any_of.len(), 2);
-    assert_eq!(any_of[0]["properties"]["name"]["enum"][0], "get_weather");
-    assert_eq!(any_of[1]["properties"]["name"]["enum"][0], "get_time");
+    use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+    let cursor = GrammarByteCursor::lark(&grammar, 4096).unwrap();
+    for (body, valid) in [
+        (
+            r#"{"name":"get_weather","arguments":{"location":"Paris"}}"#,
+            true,
+        ),
+        (r#"{"name":"get_time","arguments":{"zone":"UTC"}}"#, true),
+        (
+            r#"{"name":"get_weather","arguments":{"zone":"UTC"}}"#,
+            false,
+        ),
+        (
+            r#"{"name":"get_time","arguments":{"location":"Paris"}}"#,
+            false,
+        ),
+    ] {
+        let text = format!("<tool_call>\n{body}\n</tool_call>");
+        assert_eq!(
+            matches!(
+                cursor.preview_root(text.as_bytes()).unwrap(),
+                GrammarCandidate::Viable { complete: true }
+            ),
+            valid,
+            "{text}"
+        );
+    }
 }
 
 #[test]
@@ -2177,4 +2278,357 @@ async fn native_http_generation_does_not_load_ort() {
         finished |= chunk["choices"][0]["finish_reason"].is_string();
     }
     assert!(finished, "{stream}");
+}
+
+#[cfg(feature = "native-backend")]
+mod infill_extra_context {
+    use super::*;
+    const TEMPLATE: &str =
+        "{% for file in input_extra %}{{ file.filename }} {{ file.text }} {% endfor %}";
+
+    fn package(template: Option<&str>) -> tempfile::TempDir {
+        let package = tempfile::tempdir().unwrap();
+        copy_tree(&fixture_dir(), package.path());
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (id, spelling, special) in [
+            (16, "alpha", false),
+            (17, "beta", false),
+            (20, "<CTX_PRE>", true),
+            (21, "<CTX_SUF>", true),
+            (22, "<CTX_MID>", true),
+        ] {
+            tokenizer["model"]["vocab"]
+                .as_object_mut()
+                .unwrap()
+                .remove(&format!("tok{id}"));
+            tokenizer["model"]["vocab"][spelling] = json!(id);
+            tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":id,"content":spelling,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":special}));
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        metadata["schema_version"] = serde_yaml::Value::String("1.18".into());
+        metadata["pipeline"]["workflow"]["publication_mode"] =
+            serde_yaml::Value::String("commit_only".into());
+        metadata["pipeline"]["workflow"]["outputs"]["tokens"]["family"] =
+            serde_yaml::to_value(json!({"kind":"materialized"})).unwrap();
+        metadata["package"]["tokenizer"]["special_tokens"] =
+            serde_yaml::to_value(json!({"bos_token_id":2,"pad_token_id":0,"eos_token_id":[3]}))
+                .unwrap();
+        metadata["package"]["infill"] = serde_yaml::to_value(json!({"prefix_token":"<CTX_PRE>","middle_token":"<CTX_MID>","suffix_token":"<CTX_SUF>","order":"psm","extra_context_template":template})).unwrap();
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(graph.matches("output: \"logits\"").count(), 1);
+        let mut graph = graph.replace("output: \"logits\"", "output: \"infill_base_logits\"");
+        let a = (0..32)
+            .map(|id| format!("float_data: {}", if id == 4 { 20 } else { -20 }))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let b = (0..32)
+            .map(|id| format!("float_data: {}", if id == 5 { 20 } else { -20 }))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let nodes = format!(
+            concat!(
+                "  initializer {{ name: \"ctx_padding\" data_type: 7 dims: 1 dims: 3 int64_data: 0 int64_data: 0 int64_data: 0 }}\n",
+                "  node {{ input: \"input_ids\" input: \"ctx_padding\" output: \"ctx_input\" op_type: \"Concat\" attribute {{ name: \"axis\" i: 1 type: INT }} }}\n",
+                "  initializer {{ name: \"ctx_first\" data_type: 7 int64_data: 1 }}\n",
+                "  initializer {{ name: \"ctx_second\" data_type: 7 int64_data: 2 }}\n",
+                "  initializer {{ name: \"ctx_alpha\" data_type: 7 int64_data: 16 }}\n",
+                "  initializer {{ name: \"ctx_hello\" data_type: 7 int64_data: 4 }}\n",
+                "  initializer {{ name: \"ctx_axes\" data_type: 7 dims: 2 int64_data: 1 int64_data: 2 }}\n",
+                "  initializer {{ name: \"ctx_zero\" data_type: 1 float_data: 0 }}\n",
+                "  initializer {{ name: \"ctx_good\" data_type: 1 dims: 1 dims: 1 dims: 32 {a} }}\n",
+                "  initializer {{ name: \"ctx_other\" data_type: 1 dims: 1 dims: 1 dims: 32 {b} }}\n",
+                "  node {{ input: \"ctx_input\" input: \"ctx_first\" output: \"ctx_name\" op_type: \"Gather\" attribute {{ name: \"axis\" i: 1 type: INT }} }}\n",
+                "  node {{ input: \"ctx_input\" input: \"ctx_second\" output: \"ctx_text\" op_type: \"Gather\" attribute {{ name: \"axis\" i: 1 type: INT }} }}\n",
+                "  node {{ input: \"ctx_name\" input: \"ctx_alpha\" output: \"ctx_name_ok\" op_type: \"Equal\" }}\n",
+                "  node {{ input: \"ctx_text\" input: \"ctx_hello\" output: \"ctx_text_ok\" op_type: \"Equal\" }}\n",
+                "  node {{ input: \"ctx_name_ok\" input: \"ctx_text_ok\" output: \"ctx_match\" op_type: \"And\" }}\n",
+                "  node {{ input: \"ctx_match\" input: \"ctx_axes\" output: \"ctx_condition\" op_type: \"Unsqueeze\" }}\n",
+                "  node {{ input: \"ctx_condition\" input: \"ctx_good\" input: \"ctx_other\" output: \"ctx_choice\" op_type: \"Where\" }}\n",
+                "  node {{ input: \"infill_base_logits\" input: \"ctx_zero\" output: \"ctx_zeros\" op_type: \"Mul\" }}\n",
+                "  node {{ input: \"ctx_zeros\" input: \"ctx_choice\" output: \"logits\" op_type: \"Add\" }}\n"
+            ),
+            a = a,
+            b = b
+        );
+        let insert = graph.find("  initializer {").unwrap();
+        graph.insert_str(insert, &nodes);
+        std::fs::write(path, graph).unwrap();
+        package
+    }
+    fn config() -> ServerConfig {
+        ServerConfig {
+            engine_config: onnx_genai_engine::EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                native_device: Some(onnx_genai_engine::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+    fn router(root: &std::path::Path, config: ServerConfig) -> axum::Router {
+        app(AppState::load_with_config(root, Some("context-fim".into()), config).unwrap())
+    }
+    async fn body(response: axum::response::Response) -> Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+    }
+    fn request(extra: Value, n: usize) -> Value {
+        json!({"input_prefix":"hello","input_suffix":"world","input_extra":extra,"n_predict":n,"return_tokens":true,"cache_prompt":false,"temperature":0})
+    }
+    #[tokio::test]
+    async fn native_infill_extra_context_drives_native_tokens_and_exact_prefill_accounting() {
+        let package = package(Some(TEMPLATE));
+        let router = router(package.path(), config());
+        let tokenizer =
+            onnx_genai_ort::Tokenizer::from_file(package.path().join("tokenizer.json")).unwrap();
+        for (extra, rendered, expected) in [
+            (
+                json!([{"filename":"alpha","text":"hello"},{"filename":"beta","text":"world"}]),
+                "alpha hello beta world ",
+                4,
+            ),
+            (
+                json!([{"filename":"beta","text":"world"},{"filename":"alpha","text":"hello"}]),
+                "beta world alpha hello ",
+                5,
+            ),
+            (
+                json!([{"filename":"alpha","text":"world"}]),
+                "alpha world ",
+                5,
+            ),
+            (
+                json!([{"filename":"beta","text":"hello"}]),
+                "beta hello ",
+                5,
+            ),
+            (json!([{"text":"hello"}]), "tmp hello ", 5),
+            (json!([{"filename":"","text":"hello"}]), " hello ", 5),
+            (json!([{"filename":"alpha","text":""}]), "alpha  ", 5),
+            (
+                json!([{"filename":"alpha","text":"hello","unknown":1}]),
+                "alpha hello ",
+                4,
+            ),
+            (
+                json!([{"filename":"/missing","text":"hello"}]),
+                "/missing hello ",
+                5,
+            ),
+        ] {
+            let prompt = format!("{rendered}<CTX_PRE>hello<CTX_SUF>world<CTX_MID>");
+            let tokens = tokenizer.encode(&prompt).unwrap();
+            let prefill =
+                body(post_json(router.clone(), "/infill", request(extra.clone(), 0)).await).await;
+            let generated =
+                body(post_json(router.clone(), "/infill", request(extra, 1)).await).await;
+            assert_eq!(prefill["tokens_evaluated"], tokens.len());
+            assert_eq!(prefill["tokens_predicted"], 0);
+            assert_eq!(generated["tokens_evaluated"], tokens.len());
+            assert_eq!(generated["tokens_predicted"], 1);
+            assert_eq!(generated["tokens"], json!([expected]));
+            assert_eq!(
+                generated["prompt"],
+                tokenizer.decode_with_special_tokens(&tokens).unwrap()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn native_infill_extra_context_errors_precede_sse_and_keep_valid_requests_usable() {
+        let package = package(Some(TEMPLATE));
+        let router = router(
+            package.path(),
+            ServerConfig {
+                max_infill_files: std::num::NonZeroUsize::new(2).unwrap(),
+                max_infill_filename_bytes: std::num::NonZeroUsize::new(8).unwrap(),
+                max_infill_context_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+                ..config()
+            },
+        );
+        for extra in [
+            json!({}),
+            json!([{"filename":"alpha"}]),
+            json!([{"filename":null,"text":"hello"}]),
+            json!([{"filename":1,"text":"hello"}]),
+            json!([{"filename":"longlabel","text":"hello"}]),
+            json!([{"filename":"alpha","text":"x".repeat(80)}]),
+            json!([{"filename":"alpha","text":1}]),
+            json!([{"filename":"a","text":"x"},{"filename":"b","text":"x"},{"filename":"c","text":"x"}]),
+        ] {
+            let mut invalid = request(extra, 1);
+            invalid["stream"] = json!(true);
+            let response = post_json(router.clone(), "/infill", invalid).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                !response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains("text/event-stream")
+            );
+            let valid = body(
+                post_json(
+                    router.clone(),
+                    "/infill",
+                    request(json!([{"filename":"alpha","text":"hello"}]), 1),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(valid["tokens"], json!([4]));
+        }
+    }
+    #[tokio::test]
+    async fn native_infill_explicit_stop_roles_do_not_guess_file_separator_semantics() {
+        for declared in [false, true] {
+            let package = package(Some(TEMPLATE));
+            let path = package.path().join("tokenizer.json");
+            let mut tokenizer: Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            tokenizer["model"]["vocab"]
+                .as_object_mut()
+                .unwrap()
+                .remove("tok18");
+            tokenizer["model"]["vocab"]["<|file_sep|>"] = json!(18);
+            tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":18,"content":"<|file_sep|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}));
+            std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+            let path = package.path().join("model.onnx.textproto");
+            let graph = std::fs::read_to_string(&path).unwrap();
+            let old = graph
+                .lines()
+                .find(|line| line.contains("name: \"ctx_good\""))
+                .unwrap();
+            let logits = (0..32)
+                .map(|id| format!("float_data: {}", if id == 18 { 20 } else { -20 }))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let replacement = format!(
+                "  initializer {{ name: \"ctx_good\" data_type: 1 dims: 1 dims: 1 dims: 32 {logits} }}"
+            );
+            std::fs::write(path, graph.replace(old, &replacement)).unwrap();
+            if declared {
+                let path = package.path().join("inference_metadata.yaml");
+                let mut metadata: serde_yaml::Value =
+                    serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                metadata["package"]["infill"]["additional_stop_tokens"] =
+                    serde_yaml::to_value(vec!["<|file_sep|>"]).unwrap();
+                std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+            }
+            let result = body(
+                post_json(
+                    router(package.path(), config()),
+                    "/infill",
+                    request(json!([{"filename":"alpha","text":"hello"}]), 2),
+                )
+                .await,
+            )
+            .await;
+            if declared {
+                assert_eq!(result["tokens_predicted"], 1, "{result}");
+                assert_eq!(result["stop_type"], "word", "{result}");
+            } else {
+                assert_eq!(result["tokens_predicted"], 2, "{result}");
+                assert_eq!(result["tokens"], json!([18, 5]), "{result}");
+                assert_eq!(result["stop_type"], "limit", "{result}");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_infill_extra_requires_authored_serialization_and_template_budgets() {
+        let unsupported = package(None);
+        let unsupported_router = router(unsupported.path(), config());
+        let response = post_json(
+            unsupported_router.clone(),
+            "/infill",
+            request(json!([{"filename":"alpha","text":"hello"}]), 1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let valid =
+            body(post_json(unsupported_router, "/infill", request(json!([]), 1)).await).await;
+        assert_eq!(valid["tokens"], json!([5]));
+        let fixed_header = package(Some("alpha hello "));
+        let header_router = router(fixed_header.path(), config());
+        for n in [0, 1] {
+            let response =
+                body(post_json(header_router.clone(), "/infill", request(json!([]), n)).await)
+                    .await;
+            let tokenizer =
+                onnx_genai_ort::Tokenizer::from_file(fixed_header.path().join("tokenizer.json"))
+                    .unwrap();
+            let expected = tokenizer
+                .encode("alpha hello <CTX_PRE>hello<CTX_SUF>world<CTX_MID>")
+                .unwrap();
+            assert_eq!(response["tokens_evaluated"], expected.len());
+            if n == 1 {
+                assert_eq!(response["tokens"], json!([4]));
+            }
+        }
+        let authored = "{% for file in input_extra %}{% if file.filename == 'slow' %}{% for i in range(1000) %}x{% endfor %}{% else %}{{file.filename}} {{file.text}} {% endif %}{% endfor %}";
+        let limited = package(Some(authored));
+        let limited_router = router(
+            limited.path(),
+            ServerConfig {
+                max_infill_template_operations: std::num::NonZeroU64::new(100).unwrap(),
+                ..config()
+            },
+        );
+        let response = post_json(
+            limited_router.clone(),
+            "/infill",
+            request(json!([{"filename":"slow","text":"hello"}]), 1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let valid = body(
+            post_json(
+                limited_router,
+                "/infill",
+                request(json!([{"filename":"alpha","text":"hello"}]), 1),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(valid["tokens"], json!([4]));
+        let expanding = "{% for file in input_extra %}{% if file.filename == 'large' %}{{file.text}}{{file.text}}{{file.text}}{{file.text}}{% else %}{{file.filename}} {{file.text}} {% endif %}{% endfor %}";
+        let package = package(Some(expanding));
+        let bounded_router = router(
+            package.path(),
+            ServerConfig {
+                max_infill_context_bytes: std::num::NonZeroUsize::new(16).unwrap(),
+                ..config()
+            },
+        );
+        let mut oversized = request(json!([{"filename":"large","text":"hello"}]), 1);
+        oversized["stream"] = json!(true);
+        let response = post_json(bounded_router.clone(), "/infill", oversized).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("text/event-stream")
+        );
+        let valid = body(
+            post_json(
+                bounded_router,
+                "/infill",
+                request(json!([{"filename":"alpha","text":"hello"}]), 1),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(valid["tokens"], json!([4]));
+    }
 }

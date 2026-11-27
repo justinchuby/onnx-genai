@@ -16,6 +16,7 @@ struct ValueId(usize);
 enum Kind {
     Wave(Option<u32>),
     Mel,
+    Spectrum,
     Length(LengthUnit),
     Mask,
 }
@@ -39,6 +40,7 @@ enum Op {
     },
     Trim(usize),
     Mel(Box<LogMelExtractor>),
+    Spectrum(Box<SpectrogramExtractor>),
     NormalizeMel,
     Samples,
     Frames(Option<NonZeroUsize>),
@@ -68,14 +70,14 @@ struct Wave {
     valid: Range<usize>,
 }
 #[derive(Clone, Debug)]
-struct Mel {
-    features: LogMelFeatures,
+struct Features {
+    features: FrequencyFeatures,
     valid: Range<usize>,
 }
 #[derive(Clone, Debug)]
 enum Data {
     Wave(Vec<Wave>),
-    Mel(Vec<Mel>),
+    Features(Vec<Features>),
     Length(Vec<usize>),
     Mask(Vec<Vec<i64>>),
 }
@@ -88,11 +90,11 @@ impl Data {
             )),
         }
     }
-    fn mels(&self) -> Result<&[Mel], AudioPreprocessError> {
+    fn features(&self) -> Result<&[Features], AudioPreprocessError> {
         match self {
-            Self::Mel(rows) => Ok(rows),
+            Self::Features(rows) => Ok(rows),
             _ => Err(invalid(
-                "compiled audio input is not log-mel; report this runtime invariant failure",
+                "compiled audio input is not frequency features; report this runtime invariant failure",
             )),
         }
     }
@@ -172,7 +174,7 @@ impl AudioProgram {
                         "whisper_log_mel" => {
                             if !matches!(kind, Kind::Mel) {
                                 return Err(invalid(
-                                    "log-mel normalization requires a preceding spectrogram; bind its named output",
+                                    "log-mel normalization requires log_mel input; bind its named output rather than a linear spectrogram",
                                 ));
                             }
                             (Op::NormalizeMel, Kind::Mel)
@@ -221,6 +223,26 @@ impl AudioProgram {
                             Kind::Wave(rate),
                         )
                     }
+                    "spectrogram" => {
+                        let input_rate = wave_rate()?;
+                        let projection = SpectrumProjection::from_declared(t.mode.as_deref())?;
+                        let window = AnalysisWindow::from_declared(t.window.as_deref())?;
+                        let rate = t.sample_rate.or(input_rate).ok_or_else(|| invalid("spectrogram needs sample_rate or a preceding declared resample; author the analysis rate explicitly"))?;
+                        if input_rate.is_some_and(|input| input != rate) {
+                            return Err(invalid(format!(
+                                "spectrogram sample_rate {rate} differs from input rate {input_rate:?}; insert an explicit resample"
+                            )));
+                        }
+                        let extractor = SpectrogramExtractor::new(
+                            rate,
+                            positive(t.n_fft, "n_fft")?,
+                            positive(t.hop_length, "hop_length")?,
+                            positive(t.win_length, "win_length")?,
+                            projection,
+                            window,
+                        )?;
+                        (Op::Spectrum(Box::new(extractor)), Kind::Spectrum)
+                    }
                     "log_mel" => {
                         let input_rate = wave_rate()?;
                         if t.window.as_deref().is_some_and(|v| v != "hann") {
@@ -255,19 +277,19 @@ impl AudioProgram {
                     "emit_valid_frames" => {
                         let hop = match kind {
                             Kind::Wave(_) => Some(NonZeroUsize::new(t.hop_length.unwrap_or(0)).ok_or_else(||invalid("waveform frame counts require positive hop_length; declare the frame geometry explicitly"))?),
-                            Kind::Mel => None,
+                            Kind::Mel | Kind::Spectrum => None,
                             _ => {
                                 return Err(invalid(
-                                    "frame counts require waveform or log-mel input",
+                                    "frame counts require waveform or frequency features",
                                 ));
                             }
                         };
                         (Op::Frames(hop), Kind::Length(LengthUnit::Frames))
                     }
                     "emit_validity_mask" => {
-                        if !matches!(kind, Kind::Wave(_) | Kind::Mel) {
+                        if !matches!(kind, Kind::Wave(_) | Kind::Mel | Kind::Spectrum) {
                             return Err(invalid(
-                                "validity masks require waveform or log-mel input",
+                                "validity masks require waveform or frequency features",
                             ));
                         }
                         (Op::Mask, Kind::Mask)
@@ -312,7 +334,7 @@ impl AudioProgram {
             }
             let (dtype, content) = match kinds[source.0] {
                 Kind::Wave(_) => ("float32", binding.content == "waveform"),
-                Kind::Mel => ("float32", matches!(binding.content.as_str(), "features" | "audio_features")),
+                Kind::Mel | Kind::Spectrum => ("float32", matches!(binding.content.as_str(), "features" | "audio_features")),
                 Kind::Length(unit) => {
                     let correct_unit = match unit {
                         LengthUnit::Samples => matches!(binding.content.as_str(), "valid_samples" | "sample_lengths"),
@@ -469,14 +491,32 @@ impl AudioProgram {
         }
         NonZeroUsize::new(lower).map(Some).ok_or_else(||invalid(format!("audio trimming windows cannot admit even one source sample at {source_rate} Hz without discarding valid audio; enlarge the authored window or change its resampling/padding order")))
     }
-    pub fn run(&self, encoded: &[&[u8]]) -> Result<Vec<NamedAudioTensor>, AudioPreprocessError> {
+    pub fn run(
+        &self,
+        encoded: &[&[u8]],
+        limits: AudioDecodeLimits,
+    ) -> Result<Vec<NamedAudioTensor>, AudioPreprocessError> {
         if encoded.is_empty() {
             return Err(invalid("audio preprocessing requires at least one clip"));
         }
+        let decodes = self
+            .steps
+            .iter()
+            .filter(|step| matches!(step.op, Op::Decode))
+            .count()
+            .checked_mul(encoded.len())
+            .ok_or_else(|| {
+                invalid(
+                    "audio decode invocation count overflows; reduce batch size or decode steps",
+                )
+            })?;
+        let limits = AudioDecodeLimits {
+            max_decoded_bytes: NonZeroUsize::new(limits.max_decoded_bytes.get()/decodes.max(1)).ok_or_else(||invalid(format!("audio preprocessing's {decodes} decode invocations exceed max_decoded_bytes={}; reduce the batch/decode steps or raise the caller PCM budget",limits.max_decoded_bytes)))?,
+        };
         let mut values = Vec::with_capacity(self.steps.len());
         for step in &self.steps {
             let input = step.input.map(|id| &values[id.0]);
-            let result = execute(&step.op, input, encoded).map_err(|e| {
+            let result = execute(&step.op, input, encoded, limits).map_err(|e| {
                 invalid(format!(
                     "{}: {e}; check the encoded clip and declared input/parameters",
                     step.context
@@ -507,12 +547,17 @@ fn epsilon(t: &AudioTransform) -> Result<f64, AudioPreprocessError> {
     }
     Ok(v)
 }
-fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, AudioPreprocessError> {
+fn execute(
+    op: &Op,
+    input: Option<&Data>,
+    encoded: &[&[u8]],
+    limits: AudioDecodeLimits,
+) -> Result<Data, AudioPreprocessError> {
     if matches!(op, Op::Decode) {
         return encoded
             .iter()
             .map(|bytes| {
-                let audio = decode_audio(bytes)?;
+                let audio = decode_audio(bytes, limits)?;
                 let len = audio.samples.len();
                 Ok(Wave {
                     samples: audio.samples,
@@ -624,23 +669,34 @@ fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, Aud
                     return Err(invalid(format!("log_mel analysis rate {} does not match input audio rate {}; declare resample before this transform", extractor.sample_rate, row.rate)));
                 }
                 let features = extractor.extract_log_resampled(&row.samples)?;
-                let valid = frame_range(&row.valid, features.n_frames, extractor.hop_length);
-                Ok(Mel { features, valid })
+                let valid = frame_range(&row.valid, features.n_frames, extractor.analysis.hop_length);
+                Ok(Features { features: features.into(), valid })
             }).collect::<Result<Vec<_>, _>>()?;
-            Ok(Data::Mel(rows))
+            Ok(Data::Features(rows))
+        }
+        Op::Spectrum(extractor) => {
+            let rows = input.waves()?.iter().map(|row| {
+                if row.rate != extractor.sample_rate {
+                    return Err(invalid(format!("spectrogram analysis rate {} does not match input audio rate {}; declare resample before this transform",extractor.sample_rate,row.rate)));
+                }
+                let features = extractor.extract(&row.samples)?;
+                let valid = frame_range(&row.valid,features.frames,extractor.analysis.hop_length);
+                Ok(Features { features, valid })
+            }).collect::<Result<Vec<_>, _>>()?;
+            Ok(Data::Features(rows))
         }
         Op::NormalizeMel => {
-            let mut rows = input.mels()?.to_vec();
+            let mut rows = input.features()?.to_vec();
             for row in &mut rows {
                 normalize_log_mel(&mut row.features.data);
             }
-            Ok(Data::Mel(rows))
+            Ok(Data::Features(rows))
         }
         Op::Samples => Ok(Data::Length(
             input.waves()?.iter().map(|row| row.valid.len()).collect(),
         )),
         Op::Frames(hop) => match input {
-            Data::Mel(rows) => Ok(Data::Length(
+            Data::Features(rows) => Ok(Data::Length(
                 rows.iter().map(|row| row.valid.len()).collect(),
             )),
             Data::Wave(rows) => {
@@ -665,10 +721,10 @@ fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, Aud
                     })
                     .collect(),
             )),
-            Data::Mel(rows) => Ok(Data::Mask(
+            Data::Features(rows) => Ok(Data::Mask(
                 rows.iter()
                     .map(|row| {
-                        (0..row.features.n_frames)
+                        (0..row.features.frames)
                             .map(|i| i64::from(row.valid.contains(&i)))
                             .collect()
                     })
@@ -710,10 +766,10 @@ fn tensor(name: &str, data: &Data) -> Result<NamedAudioTensor, AudioPreprocessEr
                     .collect(),
             ),
         ),
-        Data::Mel(rows) => {
-            let n = rectangular(rows.iter().map(|r| r.features.n_frames).collect())?;
+        Data::Features(rows) => {
+            let n = rectangular(rows.iter().map(|r| r.features.frames).collect())?;
             (
-                vec![rows.len(), rows[0].features.n_mels, n],
+                vec![rows.len(), rows[0].features.bins, n],
                 AudioTensorData::Fp32(
                     rows.iter()
                         .flat_map(|r| r.features.data.iter().copied())

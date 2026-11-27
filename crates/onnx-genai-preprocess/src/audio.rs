@@ -8,6 +8,46 @@ use std::sync::Arc;
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
+mod opus;
+
+// One private content probe; replace only Matroska's reader, never global codecs.
+fn audio_probe() -> &'static symphonia::core::formats::probe::Probe {
+    static PROBE: std::sync::LazyLock<symphonia::core::formats::probe::Probe> =
+        std::sync::LazyLock::new(|| {
+            let mut probe = symphonia::core::formats::probe::Probe::new();
+            symphonia::default::register_enabled_formats(&mut probe);
+            // Preferred also prevents external Cargo feature unification from making
+            // an old standard-tier MKV reader a silent fallback for rejected Opus.
+            probe.register_format_at_tier::<onnx_genai_symphonia_mkv::MkvReader<'_>>(
+                symphonia::core::common::Tier::Preferred,
+            );
+            probe
+        });
+    &PROBE
+}
+
+/// Caller-selected raw PCM work and resident PCM ceiling. This does not account
+/// for container metadata or a codec's private fixed-size state.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioDecodeLimits {
+    pub max_decoded_bytes: std::num::NonZeroUsize,
+}
+
+impl AudioDecodeLimits {
+    /// Finite application policy; the decoding API never selects a limit itself.
+    pub const APPLICATION_POLICY: Self = Self {
+        max_decoded_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+    };
+
+    /// Intersect application policy with actual host headroom. Zero is rejected.
+    pub fn within_host(self, headroom: u64) -> Result<Self, AudioPreprocessError> {
+        let headroom = usize::try_from(headroom).unwrap_or(usize::MAX);
+        let max_decoded_bytes = std::num::NonZeroUsize::new(headroom.min(self.max_decoded_bytes.get()))
+            .ok_or_else(|| AudioPreprocessError::Encoded("audio decoding has zero host-memory headroom; release host allocations or raise the configured host memory limit".into()))?;
+        Ok(Self { max_decoded_bytes })
+    }
+}
+
 /// Whisper's required waveform sample rate.
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 /// Whisper's FFT size (25 ms at 16 kHz).
@@ -100,29 +140,263 @@ pub struct LogMelConfig {
     pub win_length: usize,
 }
 
-/// Reusable configurable log-mel extractor.
-///
-/// The extractor uses a periodic Hann window, centered/reflected STFT,
-/// Slaney-normalized mel filters, power spectra, and Whisper's dynamic-range
-/// normalization.
-pub struct LogMelExtractor {
-    n_mels: usize,
-    sample_rate: u32,
+/// A compiled, explicit projection of the one-sided complex FFT.
+#[derive(Debug, Clone, Copy)]
+enum SpectrumProjection {
+    Power,
+    Magnitude,
+}
+impl SpectrumProjection {
+    fn from_declared(mode: Option<&str>) -> Result<Self, AudioPreprocessError> {
+        match mode {
+            Some("power") => Ok(Self::Power),
+            Some("magnitude") => Ok(Self::Magnitude),
+            other => Err(AudioPreprocessError::InvalidConfig(format!(
+                "spectrogram requires explicit mode: power or magnitude; got {other:?}; declare one supported projection"
+            ))),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Power => "power",
+            Self::Magnitude => "magnitude",
+        }
+    }
+}
+/// Window coefficients are sampled periodically over the authored win_length;
+/// the shorter window is zero-padded at the center of the FFT input.
+#[derive(Debug, Clone, Copy)]
+enum AnalysisWindow {
+    Hann,
+    Hamming,
+    Rectangular,
+}
+impl AnalysisWindow {
+    fn from_declared(window: Option<&str>) -> Result<Self, AudioPreprocessError> {
+        match window {
+            Some("hann") => Ok(Self::Hann),
+            Some("hamming") => Ok(Self::Hamming),
+            Some("rectangular") => Ok(Self::Rectangular),
+            other => Err(AudioPreprocessError::InvalidConfig(format!(
+                "spectrogram requires explicit window: hann, hamming or rectangular; got {other:?}; declare one supported analysis window"
+            ))),
+        }
+    }
+}
+
+/// Shared centered/reflected FFT analysis. The compiled window and projection
+/// are explicit; log-mel keeps its periodic-Hann/power recipe.
+struct SpectrumAnalysis {
     n_fft: usize,
     hop_length: usize,
     window: Vec<f32>,
-    mel_filters: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
 }
+impl fmt::Debug for SpectrumAnalysis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpectrumAnalysis")
+            .field("n_fft", &self.n_fft)
+            .field("hop_length", &self.hop_length)
+            .finish_non_exhaustive()
+    }
+}
+impl SpectrumAnalysis {
+    fn new(
+        n_fft: usize,
+        hop_length: usize,
+        win_length: usize,
+        window_kind: AnalysisWindow,
+    ) -> Result<Self, AudioPreprocessError> {
+        if n_fft < 2
+            || hop_length == 0
+            || win_length == 0
+            || win_length > n_fft
+            || n_fft > isize::MAX as usize
+        {
+            return Err(AudioPreprocessError::InvalidConfig(format!(
+                "spectral analysis requires n_fft >= 2, positive hop_length and 1 <= win_length <= n_fft; got n_fft={n_fft}, hop_length={hop_length}, win_length={win_length}; correct the declared analysis geometry"
+            )));
+        }
+        let mut window = Vec::new();
+        window.try_reserve_exact(n_fft).map_err(|error| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {n_fft}-point analysis window: {error}; reduce n_fft or free host memory"
+            ))
+        })?;
+        window.resize(n_fft, 0.0);
+        let offset = (n_fft - win_length) / 2;
+        for index in 0..win_length {
+            window[offset + index] = match window_kind {
+                AnalysisWindow::Hann => {
+                    0.5 - 0.5 * (2.0 * PI * index as f32 / win_length as f32).cos()
+                }
+                AnalysisWindow::Hamming => {
+                    0.54 - 0.46 * (2.0 * PI * index as f32 / win_length as f32).cos()
+                }
+                AnalysisWindow::Rectangular => 1.0,
+            };
+        }
+        Ok(Self {
+            n_fft,
+            hop_length,
+            window,
+            fft: FftPlanner::<f32>::new().plan_fft_forward(n_fft),
+        })
+    }
+    fn bins(&self) -> usize {
+        self.n_fft / 2 + 1
+    }
+    fn frames(&self, samples: &[f32]) -> usize {
+        samples.len() / self.hop_length
+    }
+    fn for_each_frame(
+        &self,
+        samples: &[f32],
+        projection: SpectrumProjection,
+        consume: impl FnMut(usize, &[f32]),
+    ) -> Result<(), AudioPreprocessError> {
+        // Dispatch once per analysis, not per bin. Each projection keeps its
+        // own arithmetic, including stable magnitude when squared power would
+        // overflow for otherwise finite FFT coefficients.
+        match projection {
+            SpectrumProjection::Power => {
+                self.projected_frames(samples, |value| value.norm_sqr(), projection, consume)
+            }
+            SpectrumProjection::Magnitude => self.projected_frames(
+                samples,
+                |value| value.re.hypot(value.im),
+                projection,
+                consume,
+            ),
+        }
+    }
+    fn projected_frames(
+        &self,
+        samples: &[f32],
+        project: impl Fn(Complex32) -> f32,
+        projection: SpectrumProjection,
+        mut consume: impl FnMut(usize, &[f32]),
+    ) -> Result<(), AudioPreprocessError> {
+        let mut fft_buffer = Vec::new();
+        fft_buffer.try_reserve_exact(self.n_fft).map_err(|e| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {}-point FFT buffer: {e}; reduce n_fft or free host memory",
+                self.n_fft
+            ))
+        })?;
+        fft_buffer.resize(self.n_fft, Complex32::default());
+        let mut values = Vec::new();
+        values.try_reserve_exact(self.bins()).map_err(|e| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {} spectral bins: {e}; reduce n_fft or free host memory",
+                self.bins()
+            ))
+        })?;
+        values.resize(self.bins(), 0.0);
+        for frame in 0..self.frames(samples) {
+            let frame_start = frame * self.hop_length;
+            for (index, value) in fft_buffer.iter_mut().enumerate() {
+                let sample_index =
+                    frame_start as isize + index as isize - (self.n_fft / 2) as isize;
+                value.re = reflected_sample(samples, sample_index) * self.window[index];
+                value.im = 0.0;
+            }
+            self.fft.process(&mut fft_buffer);
+            for (bin, value) in values.iter_mut().enumerate() {
+                *value = project(fft_buffer[bin]);
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(AudioPreprocessError::InvalidConfig(format!(
+                    "{} spectrum contains nonfinite values; reduce waveform amplitude or rescale before analysis",
+                    projection.name()
+                )));
+            }
+            consume(frame, &values);
+        }
+        Ok(())
+    }
+}
 
+/// Reusable configurable log-mel extractor using centered/reflected power
+/// analysis, Slaney-normalized mel filters and explicit normalization.
+pub struct LogMelExtractor {
+    n_mels: usize,
+    sample_rate: u32,
+    analysis: SpectrumAnalysis,
+    mel_filters: Vec<f32>,
+}
 impl fmt::Debug for LogMelExtractor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LogMelExtractor")
             .field("n_mels", &self.n_mels)
             .field("sample_rate", &self.sample_rate)
-            .field("n_fft", &self.n_fft)
-            .field("hop_length", &self.hop_length)
+            .field("analysis", &self.analysis)
             .finish_non_exhaustive()
+    }
+}
+
+/// Processor-local frequency-major feature matrix, shared by linear and mel
+/// projections without assigning mel units to linear FFT bins.
+#[derive(Clone, Debug)]
+struct FrequencyFeatures {
+    data: Vec<f32>,
+    bins: usize,
+    frames: usize,
+}
+impl From<LogMelFeatures> for FrequencyFeatures {
+    fn from(features: LogMelFeatures) -> Self {
+        Self {
+            data: features.data,
+            bins: features.n_mels,
+            frames: features.n_frames,
+        }
+    }
+}
+#[derive(Debug)]
+struct SpectrogramExtractor {
+    sample_rate: u32,
+    projection: SpectrumProjection,
+    analysis: SpectrumAnalysis,
+}
+impl SpectrogramExtractor {
+    fn new(
+        sample_rate: u32,
+        n_fft: usize,
+        hop_length: usize,
+        win_length: usize,
+        projection: SpectrumProjection,
+        window: AnalysisWindow,
+    ) -> Result<Self, AudioPreprocessError> {
+        if sample_rate == 0 {
+            return Err(AudioPreprocessError::InvalidSampleRate);
+        }
+        Ok(Self {
+            sample_rate,
+            projection,
+            analysis: SpectrumAnalysis::new(n_fft, hop_length, win_length, window)?,
+        })
+    }
+    fn extract(&self, samples: &[f32]) -> Result<FrequencyFeatures, AudioPreprocessError> {
+        let (bins, frames) = (self.analysis.bins(), self.analysis.frames(samples));
+        let count = bins.checked_mul(frames).ok_or_else(|| {
+            AudioPreprocessError::InvalidConfig(
+                "spectrogram dimensions overflow; shorten audio or reduce n_fft".into(),
+            )
+        })?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(count).map_err(|e| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {count} spectrogram values: {e}; shorten audio or free host memory"
+            ))
+        })?;
+        data.resize(count, 0.0);
+        self.analysis
+            .for_each_frame(samples, self.projection, |frame, values| {
+                for (bin, value) in values.iter().enumerate() {
+                    data[bin * frames + frame] = *value;
+                }
+            })?;
+        Ok(FrequencyFeatures { data, bins, frames })
     }
 }
 
@@ -160,28 +434,15 @@ impl LogMelExtractor {
                 "log-mel requires positive mel bins/sample rate/hop and 1 <= win_length <= n_fft (n_fft >= 2); got bins={n_mels}, sample_rate={sample_rate}, n_fft={n_fft}, hop_length={hop_length}, win_length={win_length}; correct the declared analysis geometry"
             )));
         }
-        let mut window = Vec::new();
-        window.try_reserve_exact(n_fft).map_err(|error| {
-            AudioPreprocessError::InvalidConfig(format!(
-                "allocate {n_fft}-point analysis window: {error}; reduce n_fft or free host memory"
-            ))
-        })?;
-        window.resize(n_fft, 0.0);
-        let offset = (n_fft - win_length) / 2;
-        for index in 0..win_length {
-            window[offset + index] =
-                0.5 - 0.5 * (2.0 * PI * index as f32 / win_length as f32).cos();
-        }
+        // Reject overflowing/unallocatable mel dimensions before constructing
+        // the FFT analysis plan and its scratch/window allocations.
         let mel_filters = create_mel_filterbank(n_mels, sample_rate, n_fft)?;
-        let fft = FftPlanner::<f32>::new().plan_fft_forward(n_fft);
+        let analysis = SpectrumAnalysis::new(n_fft, hop_length, win_length, AnalysisWindow::Hann)?;
         Ok(Self {
             n_mels,
             sample_rate,
-            n_fft,
-            hop_length,
-            window,
+            analysis,
             mel_filters,
-            fft,
         })
     }
 
@@ -237,7 +498,7 @@ impl LogMelExtractor {
         &self,
         frames: std::num::NonZeroUsize,
     ) -> Result<std::num::NonZeroUsize, AudioPreprocessError> {
-        frames.get().checked_mul(self.hop_length).and_then(std::num::NonZeroUsize::new)
+        frames.get().checked_mul(self.analysis.hop_length).and_then(std::num::NonZeroUsize::new)
             .ok_or_else(|| AudioPreprocessError::InvalidConfig("requested frames times analysis hop overflows the waveform window; reduce the frame count or hop".into()))
     }
     /// Exact source clip bound for fixed-frame extraction, through the same
@@ -275,7 +536,7 @@ impl LogMelExtractor {
         &self,
         samples: &[f32],
     ) -> Result<LogMelFeatures, AudioPreprocessError> {
-        let n_frames = samples.len() / self.hop_length;
+        let n_frames = self.analysis.frames(samples);
         let count = self.n_mels.checked_mul(n_frames).ok_or_else(|| {
             AudioPreprocessError::InvalidConfig(
                 "log-mel feature dimensions overflow; shorten audio or reduce num_mel_bins".into(),
@@ -284,33 +545,19 @@ impl LogMelExtractor {
         let mut features = Vec::new();
         features.try_reserve_exact(count).map_err(|error|AudioPreprocessError::InvalidConfig(format!("allocate {count} log-mel feature values: {error}; shorten audio or free host memory")))?;
         features.resize(count, 0.0);
-        let mut fft_buffer = vec![Complex32::default(); self.n_fft];
-        let mut power = vec![0.0; self.n_fft / 2 + 1];
-
-        for frame in 0..n_frames {
-            let frame_start = frame * self.hop_length;
-            for (index, value) in fft_buffer.iter_mut().enumerate() {
-                let sample_index =
-                    frame_start as isize + index as isize - (self.n_fft / 2) as isize;
-                value.re = reflected_sample(samples, sample_index) * self.window[index];
-                value.im = 0.0;
-            }
-            self.fft.process(&mut fft_buffer);
-            for (bin, magnitude) in power.iter_mut().enumerate() {
-                *magnitude = fft_buffer[bin].norm_sqr();
-            }
-
-            for mel in 0..self.n_mels {
-                let filter = &self.mel_filters[mel * power.len()..(mel + 1) * power.len()];
-                let energy = filter
-                    .iter()
-                    .zip(&power)
-                    .map(|(weight, magnitude)| weight * magnitude)
-                    .sum::<f32>()
-                    .max(1e-10);
-                features[mel * n_frames + frame] = energy.log10();
-            }
-        }
+        self.analysis
+            .for_each_frame(samples, SpectrumProjection::Power, |frame, power| {
+                for mel in 0..self.n_mels {
+                    let filter = &self.mel_filters[mel * power.len()..(mel + 1) * power.len()];
+                    let energy = filter
+                        .iter()
+                        .zip(power)
+                        .map(|(weight, magnitude)| weight * magnitude)
+                        .sum::<f32>()
+                        .max(1e-10);
+                    features[mel * n_frames + frame] = energy.log10();
+                }
+            })?;
 
         if features.iter().any(|value| !value.is_finite()) {
             return Err(AudioPreprocessError::InvalidConfig("log-mel power/log values are nonfinite; reduce waveform amplitude or rescale before analysis".into()));
@@ -336,7 +583,10 @@ fn normalize_log_mel(features: &mut [f32]) {
 /// Content determines the format, including WAV integer/float PCM and ADPCM.
 /// Channels are averaged to mono without resampling; codec delay/padding is
 /// removed when the stream supplies gapless metadata. hound is encoding-only.
-pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> {
+pub fn decode_audio(
+    bytes: &[u8],
+    limits: AudioDecodeLimits,
+) -> Result<DecodedAudio, AudioPreprocessError> {
     use symphonia::core::{
         codecs::audio::AudioDecoderOptions,
         formats::{FormatOptions, TrackType, probe::Hint},
@@ -345,7 +595,7 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> 
     };
     let invalid = AudioPreprocessError::Encoded;
     let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
-    let mut format = symphonia::default::get_probe()
+    let mut format = audio_probe()
         .probe(
             &Hint::new(),
             stream,
@@ -388,18 +638,69 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> 
     let track_id = track.id;
     let container = format.format_info().short_name;
     let codec = format!("{:?}", params.codec);
-    let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(params, &AudioDecoderOptions::default())
-        .map_err(|e| AudioPreprocessError::Codec {
-            context: format!(
-                "cannot initialize {container} audio track {track_id} decoder for codec {codec}"
-            ),
-            source: e,
-        })?;
+    let is_opus = params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
+    let mut opus = if is_opus {
+        Some(opus::Presentation::new(params, track, container)?)
+    } else {
+        None
+    };
+    let maximum_bytes = limits.max_decoded_bytes.get();
+    let budget_error = |required: usize| {
+        invalid(format!(
+            "audio decoded PCM requires {required} bytes, exceeding max_decoded_bytes={maximum_bytes}; shorten the recording or raise the caller's decoded-audio memory policy"
+        ))
+    };
+    // The published Opus decoder allocates its maximum 120 ms PCM buffer in
+    // construction. Admit that bounded allocation before calling its factory.
+    let opus_capacity = if is_opus {
+        let packet_bytes = params
+            .channels
+            .as_ref()
+            .and_then(|channels| {
+                channels
+                    .count()
+                    .checked_mul(onnx_genai_symphonia_mkv::opus::MAX_PACKET_FRAMES)
+            })
+            .and_then(|count| count.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| {
+                invalid(
+                    "Opus maximum packet PCM byte count overflows; repair its channel metadata"
+                        .into(),
+                )
+            })?;
+        if packet_bytes > maximum_bytes {
+            return Err(budget_error(packet_bytes));
+        }
+        packet_bytes
+    } else {
+        0
+    };
+    let mut decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder> = if is_opus {
+        let mut options = AudioDecoderOptions::default();
+        options.gapless = false;
+        Box::new(
+            symphonia_opus::OpusDecoder::try_new(params, &options).map_err(|source| {
+                AudioPreprocessError::Codec {
+                    context: format!("cannot initialize raw {container} Opus track {track_id}"),
+                    source,
+                }
+            })?,
+        )
+    } else {
+        symphonia::default::get_codecs()
+            .make_audio_decoder(params, &AudioDecoderOptions::default())
+            .map_err(|e| AudioPreprocessError::Codec {
+                context: format!(
+                    "cannot initialize {container} audio track {track_id} decoder for codec {codec}"
+                ),
+                source: e,
+            })?
+    };
     let mut specification = None;
     let mut samples = Vec::new();
     let mut interleaved = Vec::<f32>::new();
     let mut packet_index = 0usize;
+    let mut raw_bytes = 0usize;
     while let Some(packet) = format
         .next_packet()
         .map_err(|e| AudioPreprocessError::Codec {
@@ -411,6 +712,57 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> 
             continue;
         }
         packet_index += 1;
+        if packet_index > maximum_bytes / size_of::<f32>() {
+            return Err(invalid(format!(
+                "audio packet progress exceeds the {}-packet limit derived from max_decoded_bytes={maximum_bytes}; shorten the recording or raise its decoded-audio budget",
+                maximum_bytes / size_of::<f32>()
+            )));
+        }
+        if is_opus && packet.data.is_empty() {
+            return Err(invalid(format!(
+                "{container} Opus packet {packet_index} is empty; file decoding does not invent packet-loss concealment for malformed container packets"
+            )));
+        }
+        let opus_packet = if let Some(presentation) = opus.as_ref() {
+            let plan = presentation.plan(&packet)?;
+            let frames = plan.raw_frames;
+            let valid = frames;
+            let channels = empty_spec
+                .as_ref()
+                .map(|spec| spec.channels().count())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{container} Opus track has no complete output specification"
+                    ))
+                })?;
+            let bytes = frames
+                .checked_mul(channels)
+                .and_then(|count| count.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| budget_error(usize::MAX))?;
+            let work = raw_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| budget_error(usize::MAX))?;
+            let retained = samples
+                .len()
+                .checked_add(valid)
+                .and_then(|count| count.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| budget_error(usize::MAX))?;
+            let staged = interleaved
+                .capacity()
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| budget_error(usize::MAX))?
+                .max(bytes);
+            let peak = retained
+                .checked_add(staged)
+                .and_then(|bytes| bytes.checked_add(opus_capacity))
+                .ok_or_else(|| budget_error(usize::MAX))?;
+            if work > maximum_bytes || peak > maximum_bytes {
+                return Err(budget_error(work.max(peak)));
+            }
+            Some(plan)
+        } else {
+            None
+        };
         let decoded = decoder
             .decode(&packet)
             .map_err(|e| AudioPreprocessError::Codec {context:format!("cannot decode {container} audio track {track_id} packet {packet_index} ({codec})"),source:e})?;
@@ -429,8 +781,47 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> 
         }
         specification.get_or_insert_with(|| spec.clone());
         let count = decoded.samples_interleaved();
+        let packet_bytes = count
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| budget_error(usize::MAX))?;
+        raw_bytes = raw_bytes
+            .checked_add(packet_bytes)
+            .ok_or_else(|| budget_error(usize::MAX))?;
+        // Raw work includes samples later removed by delay/end padding. Resident
+        // accounting includes retained mono plus this interleaved packet and
+        // the codec's concurrently live output packet.
+        let retained = samples
+            .len()
+            .checked_add(decoded.frames())
+            .and_then(|count| count.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| budget_error(usize::MAX))?;
+        let codec_scalar_bytes = if matches!(
+            &decoded,
+            symphonia::core::audio::GenericAudioBufferRef::F64(_)
+        ) {
+            size_of::<f64>()
+        } else {
+            size_of::<f32>()
+        };
+        let codec_bytes = decoded
+            .capacity()
+            .checked_mul(channels)
+            .and_then(|count| count.checked_mul(codec_scalar_bytes))
+            .ok_or_else(|| budget_error(usize::MAX))?;
+        let staged = interleaved
+            .capacity()
+            .checked_mul(size_of::<f32>())
+            .ok_or_else(|| budget_error(usize::MAX))?
+            .max(packet_bytes);
+        let peak = retained
+            .checked_add(staged)
+            .and_then(|bytes| bytes.checked_add(codec_bytes))
+            .ok_or_else(|| budget_error(usize::MAX))?;
+        if raw_bytes > maximum_bytes || peak > maximum_bytes {
+            return Err(budget_error(raw_bytes.max(peak)));
+        }
         interleaved
-            .try_reserve(count.saturating_sub(interleaved.len()))
+            .try_reserve_exact(count.saturating_sub(interleaved.len()))
             .map_err(|e| {
                 invalid(format!(
                     "cannot allocate audio packet sample buffer: {e}; shorten the recording"
@@ -438,6 +829,9 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> 
             })?;
         interleaved.resize(count, 0.0);
         decoded.copy_to_slice_interleaved(&mut interleaved);
+        if let Some(opus) = opus.as_ref() {
+            opus.canonicalize(&mut interleaved);
+        }
         if !interleaved.len().is_multiple_of(channels)
             || interleaved.iter().any(|sample| !sample.is_finite())
         {
@@ -445,12 +839,26 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> 
                 "audio decoder produced partial-channel frames or nonfinite samples".into(),
             ));
         }
-        let presented = presented_frames(&packet, time_base, spec.rate(), decoded.frames())?;
+        let mut presented = if let Some(plan) = opus_packet {
+            let expected = plan.raw_frames;
+            if decoded.frames() != expected {
+                return Err(invalid(format!(
+                    "{container} Opus packet {packet_index} decoded {} raw frames but container declares {expected}; correct the packet duration/end trim metadata",
+                    decoded.frames()
+                )));
+            }
+            plan.range
+        } else {
+            presented_frames(&packet, time_base, spec.rate(), decoded.frames())?
+        };
+        if let Some(opus) = opus.as_mut() {
+            presented = opus.present(decoded.frames(), presented);
+        }
         let start=presented.start.checked_mul(channels).ok_or_else(||invalid("audio presentation start exceeds the packet buffer; provide consistent frame/channel metadata".into()))?;
         let end=presented.end.checked_mul(channels).ok_or_else(||invalid("audio presentation end exceeds the packet buffer; provide consistent frame/channel metadata".into()))?;
         let interleaved = &interleaved[start..end];
         samples
-            .try_reserve(interleaved.len() / channels)
+            .try_reserve_exact(interleaved.len() / channels)
             .map_err(|e| {
                 invalid(format!(
                     "cannot grow decoded audio waveform: {e}; shorten the recording"
@@ -462,6 +870,9 @@ pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> 
                     as f32,
             );
         }
+    }
+    if let Some(opus) = opus.as_ref() {
+        opus.finish()?;
     }
     let spec = specification.or_else(|| if declared_frames == Some(0) {empty_spec} else {None})
         .ok_or_else(|| invalid(format!("{container} audio track {track_id} contains no decoded audio packets (declared frames {declared_frames:?}); supply a complete recording")))?;
@@ -973,7 +1384,8 @@ mod tests {
             writer.finalize().unwrap();
         }
 
-        let decoded = decode_audio(&bytes).unwrap();
+        let decoded =
+            decode_audio(&bytes, crate::audio::AudioDecodeLimits::APPLICATION_POLICY).unwrap();
 
         assert_eq!(decoded.sample_rate, 8_000);
         assert_eq!(decoded.samples.len(), expected.len());
@@ -1269,7 +1681,10 @@ outputs:
 
     #[test]
     fn a_short_clip_is_padded_to_the_declared_window() {
-        let tensors = program(PROGRAM).unwrap().run(&[&clip(0.25)]).unwrap();
+        let tensors = program(PROGRAM)
+            .unwrap()
+            .run(&[&clip(0.25)], AudioDecodeLimits::APPLICATION_POLICY)
+            .unwrap();
 
         let (shape, data) = features_of(&tensors);
         // The window, not the clip, sets the row length: 16000 / 160 = 100 frames.
@@ -1282,7 +1697,10 @@ outputs:
 
     #[test]
     fn a_long_clip_is_trimmed_to_the_declared_window() {
-        let tensors = program(PROGRAM).unwrap().run(&[&clip(2.0)]).unwrap();
+        let tensors = program(PROGRAM)
+            .unwrap()
+            .run(&[&clip(2.0)], AudioDecodeLimits::APPLICATION_POLICY)
+            .unwrap();
 
         let (shape, _) = features_of(&tensors);
         assert_eq!(shape, [1, 80, 100]);
@@ -1296,9 +1714,15 @@ outputs:
         let long = clip(0.75);
         let resolved = program(PROGRAM).unwrap();
 
-        let batched = resolved.run(&[&short, &long]).unwrap();
-        let alone_short = resolved.run(&[&short]).unwrap();
-        let alone_long = resolved.run(&[&long]).unwrap();
+        let batched = resolved
+            .run(&[&short, &long], AudioDecodeLimits::APPLICATION_POLICY)
+            .unwrap();
+        let alone_short = resolved
+            .run(&[&short], AudioDecodeLimits::APPLICATION_POLICY)
+            .unwrap();
+        let alone_long = resolved
+            .run(&[&long], AudioDecodeLimits::APPLICATION_POLICY)
+            .unwrap();
 
         let (shape, data) = features_of(&batched);
         assert_eq!(shape, [2, 80, 100]);
@@ -1321,10 +1745,17 @@ outputs:
         let resolved = program(&text).unwrap();
 
         // One clip per call is still fine without a window.
-        assert!(resolved.run(&[&clip(0.25)]).is_ok());
+        assert!(
+            resolved
+                .run(&[&clip(0.25)], AudioDecodeLimits::APPLICATION_POLICY)
+                .is_ok()
+        );
 
         let error = resolved
-            .run(&[&clip(0.25), &clip(0.75)])
+            .run(
+                &[&clip(0.25), &clip(0.75)],
+                AudioDecodeLimits::APPLICATION_POLICY,
+            )
             .expect_err("ragged rows cannot form a rectangular feature tensor");
         assert!(
             error.to_string().contains("fixed analysis window"),
@@ -1372,7 +1803,7 @@ outputs:
     fn an_empty_batch_is_rejected() {
         let error = program(PROGRAM)
             .unwrap()
-            .run(&[])
+            .run(&[], AudioDecodeLimits::APPLICATION_POLICY)
             .expect_err("an empty submission has no rows to align");
 
         assert!(error.to_string().contains("at least one clip"), "{error}");
@@ -1475,18 +1906,23 @@ mod geometry_tests {
     }
     #[test]
     fn excessive_mel_dimensions_fail_without_allocation_or_panic() {
-        let error = LogMelExtractor::from_config(LogMelConfig {
-            n_mels: usize::MAX,
-            sample_rate: 8000,
-            n_fft: 16,
-            hop_length: 4,
-            win_length: 16,
-        })
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("filter dimensions overflow"),
-            "{error}"
-        );
+        // The modest FFT exercises ordinary early rejection. The second FFT
+        // would itself fail a window capacity check without allocating, so the
+        // reported error also pins mel admission before analysis construction.
+        for n_fft in [16, isize::MAX as usize] {
+            let error = LogMelExtractor::from_config(LogMelConfig {
+                n_mels: usize::MAX,
+                sample_rate: 8000,
+                n_fft,
+                hop_length: 4,
+                win_length: 16,
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("filter dimensions overflow"),
+                "n_fft={n_fft}: {error}"
+            );
+        }
     }
     #[test]
     fn thirty_second_padding_uses_the_declared_target_rate() {
@@ -1533,7 +1969,9 @@ outputs:
         .unwrap();
         let program = AudioProgram::from_program(&declared).unwrap();
         let wav = encode_wav_pcm16(&vec![0.0; 1600], 16000, 1).unwrap();
-        let tensors = program.run(&[&wav]).unwrap();
+        let tensors = program
+            .run(&[&wav], AudioDecodeLimits::APPLICATION_POLICY)
+            .unwrap();
         assert_eq!(tensors[0].shape, [1, 7, 12]);
         assert_eq!(tensors[1].data, AudioTensorData::Int64(vec![12]));
     }

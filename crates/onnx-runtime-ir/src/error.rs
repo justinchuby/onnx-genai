@@ -80,6 +80,12 @@ pub enum IrError {
     #[error("unknown node id: {0:?}")]
     UnknownNode(NodeId),
 
+    /// A physical stride relation cannot be represented for the supplied shape.
+    #[error(
+        "invalid tensor layout for shape {shape:?}: {reason}; use representable signed 64-bit element strides"
+    )]
+    InvalidLayout { shape: Vec<usize>, reason: String },
+
     /// Two shapes that were required to match did not.
     #[error("shape mismatch: expected {expected:?}, got {actual:?}")]
     ShapeMismatch {

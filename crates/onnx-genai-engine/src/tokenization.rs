@@ -1,6 +1,6 @@
 //! Lossless tokenizer pieces for protocol consumers and byte-oriented tooling.
 use anyhow::{Context, bail, ensure};
-use llguidance::toktrie::TokTrie;
+use onnx_genai_llguidance::toktrie::TokTrie;
 use onnx_genai_ort::Tokenizer;
 use std::{collections::BTreeSet, sync::Arc};
 use tokenizers::Decoder as _;
@@ -30,8 +30,61 @@ pub struct TokenTextDecoder {
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
+    byte_stream: Option<LiteralTextState>,
+    byte_stream_checked: bool,
+    byte_limit: Option<usize>,
+    _workspace: Option<Arc<onnx_runtime_memory_governor::MemoryLease>>,
+}
+#[derive(Clone)]
+struct LiteralTextState {
+    contract: Arc<crate::byte_stream::ByteStreamContract>,
+    state: crate::byte_stream::ByteStreamState,
+    utf8: Vec<u8>,
+    published: usize,
+}
+impl LiteralTextState {
+    fn text(&mut self, bytes: &[u8], terminal: bool) -> anyhow::Result<String> {
+        let mut joined = std::mem::take(&mut self.utf8);
+        joined.extend_from_slice(bytes);
+        match std::str::from_utf8(&joined) {
+            Ok(text)=>Ok(text.to_owned()),
+            Err(error) if error.error_len().is_none()&&!terminal=> {
+                let split=error.valid_up_to();let text=std::str::from_utf8(&joined[..split])?.to_owned();self.utf8.extend_from_slice(&joined[split..]);Ok(text)
+            }
+            Err(error)=>Err(error).context("literal Replace byte decoder produced invalid or incomplete UTF-8; repair tokenizer bytes or finish the pending scalar before EOS"),
+        }
+    }
 }
 impl TokenTextDecoder {
+    pub(crate) fn retain_shared_workspace(
+        &mut self,
+        lease: Option<Arc<onnx_runtime_memory_governor::MemoryLease>>,
+    ) {
+        self._workspace = lease;
+    }
+    pub(crate) fn retain_workspace(
+        &mut self,
+        lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+    ) {
+        self._workspace = lease.map(Arc::new);
+    }
+    pub(crate) fn bind_literal_decoder(
+        &mut self,
+        contract: Arc<crate::byte_stream::ByteStreamContract>,
+        limit: usize,
+    ) {
+        self.byte_stream = Some(LiteralTextState {
+            state: contract.new_state(),
+            contract,
+            utf8: Vec::new(),
+            published: 0,
+        });
+        self.byte_stream_checked = true;
+        self.byte_limit = Some(limit);
+    }
+    pub(crate) fn set_byte_limit(&mut self, limit: usize) {
+        self.byte_limit = Some(limit);
+    }
     pub fn new(special_tokens: SpecialTokenHandling) -> Self {
         Self {
             special_tokens,
@@ -63,7 +116,56 @@ impl TokenTextDecoder {
             return Ok(String::new());
         }
 
-        llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !self.byte_stream_checked {
+            if crate::byte_stream::ByteStreamContract::requests_literal_stream(tokenizer)? {
+                let preserved = if self.special_tokens == SpecialTokenHandling::Preserve {
+                    tokenizer
+                        .inner()
+                        .get_added_vocabulary()
+                        .get_added_tokens_decoder()
+                        .keys()
+                        .copied()
+                        .collect()
+                } else {
+                    self.preserved_tokens.as_ref().clone()
+                };
+                let contract = Arc::new(
+                    crate::byte_stream::ByteStreamContract::resolve_output(tokenizer, &preserved)?
+                        .context("literal Replace publication requires a resolved byte stream")?,
+                );
+                self.byte_stream = Some(LiteralTextState {
+                    state: contract.new_state(),
+                    contract,
+                    utf8: Vec::new(),
+                    published: 0,
+                });
+            }
+            self.byte_stream_checked = true;
+        }
+        if let Some(stream) = &mut self.byte_stream {
+            let piece = stream.contract.pieces.get(id as usize).with_context(|| {
+                format!("literal Replace token {id} is absent from tokenizer vocabulary")
+            })?;
+            let mut next = stream.clone();
+            let bytes = next
+                .state
+                .step(
+                    piece,
+                    next.contract.kinds[id as usize],
+                    self.byte_limit
+                        .unwrap_or(4 * 1024 * 1024)
+                        .saturating_sub(stream.published),
+                )?
+                .into_owned();
+            let text = next.text(&bytes, false)?;
+            next.published = next
+                .published
+                .checked_add(text.len())
+                .context("literal publication byte count overflow")?;
+            *stream = next;
+            return Ok(text);
+        }
+        onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokenizers::tokenizer::step_decode_stream(
                 tokenizer.inner(), vec![id], false, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
             ).map(|text| text.unwrap_or_default()).map_err(|error| {
@@ -78,14 +180,30 @@ impl TokenTextDecoder {
     /// Emit pending bytes at the terminal boundary, including the tokenizer's
     /// replacement text for an incomplete final UTF-8 sequence.
     pub fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<String> {
-        let decoded = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokenizer
-                .decode_with_special_tokens(&self.ids)
-                .map_err(anyhow::Error::from)
-        }))
-        .context(
-            "decode pending terminal token text; repair tokenizer.decoder if decoding panicked",
-        )?;
+        if let Some(stream) = &mut self.byte_stream {
+            let mut next = stream.clone();
+            let bytes = next.state.finish(
+                self.byte_limit
+                    .unwrap_or(4 * 1024 * 1024)
+                    .saturating_sub(stream.published),
+            )?;
+            let text = next.text(&bytes, true)?;
+            next.published = next
+                .published
+                .checked_add(text.len())
+                .context("literal EOF byte count overflow")?;
+            *stream = next;
+            return Ok(text);
+        }
+        let decoded =
+            onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokenizer
+                    .decode_with_special_tokens(&self.ids)
+                    .map_err(anyhow::Error::from)
+            }))
+            .context(
+                "decode pending terminal token text; repair tokenizer.decoder if decoding panicked",
+            )?;
         let tail = decoded
             .strip_prefix(&self.prefix)
             .ok_or(NonMonotonicText)?
@@ -102,7 +220,7 @@ pub fn decode_output(
     ids: &[u32],
     preserved: &BTreeSet<u32>,
 ) -> anyhow::Result<String> {
-    llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
     if preserved.is_empty() {
         return tokenizer.decode(ids).map_err(Into::into);
     }

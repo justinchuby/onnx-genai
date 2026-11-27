@@ -89,6 +89,7 @@ pub(super) struct TurnInput {
 /// against those contracts. Nothing here asks which executor runs the model.
 pub(super) struct Backend {
     engine: Engine,
+    audio_decode_limits: onnx_genai::preprocess::audio::AudioDecodeLimits,
     tokenizer: Option<Tokenizer>,
     multimodal: Option<MultimodalSpecs>,
     generation_defaults: Option<GenerationDefaults>,
@@ -105,6 +106,7 @@ impl Backend {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
+        let audio_decode_limits = config.audio_decode_limits;
         match multimodal::load(model_dir)? {
             Some(setup) => {
                 let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).map_err(|error| {
@@ -119,6 +121,7 @@ impl Backend {
                     Engine::from_dir_with_session_options(model_dir, config, session_options)?;
                 Ok(Self {
                     engine,
+                    audio_decode_limits,
                     tokenizer: Some(tokenizer),
                     multimodal: Some(setup.multimodal),
                     generation_defaults: setup.generation_defaults,
@@ -126,6 +129,7 @@ impl Backend {
             }
             None => Ok(Self {
                 engine: Engine::from_dir_with_session_options(model_dir, config, session_options)?,
+                audio_decode_limits,
                 tokenizer: None,
                 multimodal: None,
                 generation_defaults: None,
@@ -317,7 +321,12 @@ impl Backend {
         };
         let attachments = turn.images.len() + turn.audio.len();
         let required = multimodal.sole_modality();
-        let request = build_pipeline_request(tokenizer, multimodal, turn)?;
+        let audio_limits = if turn.audio.is_empty() {
+            self.audio_decode_limits
+        } else {
+            self.audio_decode_limits.within_host(self.engine.resource_snapshot().host_ram.headroom).context("admit CLI audio attachment under configured PCM policy and current host headroom")?
+        };
+        let request = build_pipeline_request(tokenizer, multimodal, turn, audio_limits)?;
         self.engine
             .generate_with_pipeline_callbacks(request, None, Some(callback))
             .map_err(|error| match required {
@@ -386,6 +395,7 @@ pub(super) fn build_pipeline_request(
     tokenizer: &Tokenizer,
     multimodal: &MultimodalSpecs,
     turn: TurnInput,
+    audio_limits: onnx_genai::preprocess::audio::AudioDecodeLimits,
 ) -> anyhow::Result<PipelineGenerateRequest> {
     let TurnInput {
         prompt,
@@ -401,15 +411,16 @@ pub(super) fn build_pipeline_request(
             .audio
             .as_ref()
             .expect("audio support checked before building the request");
-        let input = MultimodalInput::from_audio_bytes(spec, &read_attachment(path, "audio")?)
-            .with_context(|| {
-                format!(
-                    "What: the audio file {} could not be preprocessed. \
+        let input =
+            MultimodalInput::from_audio_bytes(spec, &read_attachment(path, "audio")?, audio_limits)
+                .with_context(|| {
+                    format!(
+                        "What: the audio file {} could not be preprocessed. \
                      Why: it is not usable as this model's declared audio input. \
                      How: provide a valid supported encoded audio file.",
-                    path.display()
-                )
-            })?;
+                        path.display()
+                    )
+                })?;
         // The model's transcription contract owns decoder conditioning; typed
         // text reaches its declared context prompt instead of being discarded.
         let contract=spec.transcription().context("audio generation requires transcription_config.json; declare the model decoder prompt instead of guessing start tokens")?;

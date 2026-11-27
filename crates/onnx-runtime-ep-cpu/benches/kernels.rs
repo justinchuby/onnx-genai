@@ -226,17 +226,20 @@ fn bench_matmul(c: &mut Criterion) {
     group.finish();
 }
 
-fn block_quantized_matmul_kernel(k: usize, n: usize) -> Box<dyn Kernel> {
+fn block_quantized_matmul_kernel(
+    cpu: &CpuExecutionProvider,
+    k: usize,
+    n: usize,
+) -> Box<dyn Kernel> {
     let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", vec![], vec![]);
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     node.attributes.insert("K".into(), Attribute::Int(k as i64));
     node.attributes.insert("N".into(), Attribute::Int(n as i64));
     node.attributes
         .insert("format".into(), Attribute::String(b"mxfp4".to_vec()));
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
-    CpuExecutionProvider::new()
-        .get_kernel(&node, &[], 1)
+    cpu.get_kernel(&node, &[], 1)
         .expect("CPU EP must register BlockQuantizedMatMul")
 }
 
@@ -287,6 +290,7 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
     // Idempotent, and called from every group member rather than just the
     // first so coverage does not silently ride on `criterion_group!` order.
     common::init_decode_topology();
+    let cpu = CpuExecutionProvider::new();
     let mut group = c.benchmark_group("block_quantized_matmul_cached_dense");
     group.sample_size(15);
     let (m, k, n) = (1usize, 1_024usize, 1_024usize);
@@ -299,7 +303,15 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
     // Forced-cold payload path: setup is outside Criterion, but every measured
     // iteration treats packed_B as nonconstant and re-expands it.
     let mut uncached_output = Tensor::zeros(FloatDType::F32, &[m, n]);
-    let uncached_kernel = block_quantized_matmul_kernel(k, n);
+    let mut uncached_kernel = common::PreparedKernel::new(
+        &cpu,
+        block_quantized_matmul_kernel(&cpu, k, n),
+        &[a.view(), b.view()],
+        &[uncached_output.view_mut()],
+    );
+    uncached_kernel
+        .execute(&[a.view(), b.view()], &mut [uncached_output.view_mut()])
+        .expect("prepare and launch uncached packed projection");
     group.bench_function(
         BenchmarkId::new("mxfp4_uncached_dequant_each_call", format!("{m}x{k}x{n}")),
         |bencher| {
@@ -346,8 +358,14 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
     );
 
     let mut cached_output = Tensor::zeros(FloatDType::F32, &[m, n]);
-    let mut cached_kernel = block_quantized_matmul_kernel(k, n);
+    let mut cached_kernel = block_quantized_matmul_kernel(&cpu, k, n);
     cached_kernel.set_constant_inputs(&[false, true]);
+    let mut cached_kernel = common::PreparedKernel::new(
+        &cpu,
+        cached_kernel,
+        &[a.view(), b.view()],
+        &[cached_output.view_mut()],
+    );
     // Warm boundary: the first hash/dequant/cache insertion completes before
     // Criterion starts; every measured iteration is a stable-identity LRU hit.
     cached_kernel
@@ -366,12 +384,17 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
             });
         },
     );
+    // Complete output controls stay outside Criterion's timed iteration. They
+    // also run when a selector excludes one arm, so no untouched zero buffer
+    // can make a cross-arm comparison vacuous.
+    common::assert_close(uncached_output.f32s(), once_like_output.f32s(), 1e-4);
+    common::assert_close(cached_output.f32s(), once_like_output.f32s(), 1e-4);
     group.finish();
 }
 
-fn block_quantized_moe_kernel(top_k: usize) -> Box<dyn Kernel> {
+fn block_quantized_moe_kernel(cpu: &CpuExecutionProvider, top_k: usize) -> Box<dyn Kernel> {
     let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", vec![], vec![]);
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     node.attributes
         .insert("k".into(), Attribute::Int(top_k as i64));
     node.attributes.insert(
@@ -384,8 +407,7 @@ fn block_quantized_moe_kernel(top_k: usize) -> Box<dyn Kernel> {
         .insert("fc2_format".into(), Attribute::String(b"mxfp4".to_vec()));
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
-    CpuExecutionProvider::new()
-        .get_kernel(&node, &[], 1)
+    cpu.get_kernel(&node, &[], 1)
         .expect("CPU EP must register BlockQuantizedMoE")
 }
 
@@ -394,6 +416,7 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
     // Idempotent, and called from every group member rather than just the
     // first so coverage does not silently ride on `criterion_group!` order.
     common::init_decode_topology();
+    let cpu = CpuExecutionProvider::new();
     let mut group = c.benchmark_group("block_quantized_moe_cached_dense");
     group.sample_size(15);
     let (rows, hidden, inter, experts, top_k) = (1usize, 256usize, 256usize, 4usize, 1usize);
@@ -421,11 +444,10 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
         fc2.view(),
     ];
     let mut uncached_kernel = common::PreparedKernel::new(
-        block_quantized_moe_kernel(top_k),
+        &cpu,
+        block_quantized_moe_kernel(&cpu, top_k),
         &views,
-        &[onnx_runtime_ep_api::OutputMetadata::from_view(
-            &uncached_output.view_mut(),
-        )],
+        &[uncached_output.view_mut()],
     );
     group.bench_function(
         BenchmarkId::new(
@@ -451,15 +473,10 @@ fn bench_block_quantized_moe_cache(c: &mut Criterion) {
     );
 
     let mut cached_output = Tensor::zeros(FloatDType::F32, &[rows, hidden]);
-    let mut cached_kernel = block_quantized_moe_kernel(top_k);
+    let mut cached_kernel = block_quantized_moe_kernel(&cpu, top_k);
     cached_kernel.set_constant_inputs(&[false, false, true, false, true]);
-    let mut cached_kernel = common::PreparedKernel::new(
-        cached_kernel,
-        &views,
-        &[onnx_runtime_ep_api::OutputMetadata::from_view(
-            &cached_output.view_mut(),
-        )],
-    );
+    let mut cached_kernel =
+        common::PreparedKernel::new(&cpu, cached_kernel, &views, &[cached_output.view_mut()]);
     // Prewarm the routed expert before Criterion; measured calls are cache hits.
     cached_kernel
         .execute(

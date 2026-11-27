@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU correctness tests for `pkg.nxrt::VarlenAttention` v1.
+//! GPU correctness tests for `pkg.nxrt._private::VarlenAttention` v1.
 //!
 //! `VarlenAttention` consumes the ONNX Attention-24 `nonpad_kv_seqlen` per-batch
 //! valid-KV-token count over a padded rectangular batch and runs attention over
@@ -40,7 +40,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct Tensor {
@@ -193,7 +193,10 @@ fn run_node(
         .collect::<Result<Vec<_>>>()?;
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -213,7 +216,8 @@ fn run_node(
     let out_elems: usize = out_shape.iter().product();
     let out_bytes = out_dtype.storage_bytes(out_elems);
     let mut output_buffer = ep.allocate(out_bytes.max(1), 256)?;
-    let output_strides = compute_contiguous_strides(&out_shape);
+    let output_strides = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         out_dtype,

@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) enum NativeCpuDecodeResult {
-    Logits(Vec<Vec<f32>>),
+    Logits(LogitsBatch),
     Token(TokenId),
 }
 
@@ -46,7 +46,83 @@ pub(super) struct CpuKvSnapshotEntry {
     pub(super) pair: (String, String),
     pub(super) shape: Vec<usize>,
     pub(super) dtype: DataType,
-    pub(super) rows: Vec<Vec<u8>>,
+    pub(super) rows: CpuKvSnapshotRows,
+}
+
+/// One allocation owns every live row; empty snapshots allocate no payload.
+#[derive(Debug)]
+pub(super) struct CpuKvSnapshotRows {
+    blocks: usize,
+    row_bytes: usize,
+    backing: Option<onnx_runtime_session::OwnedHostArray<u8>>,
+}
+impl PartialEq for CpuKvSnapshotRows {
+    fn eq(&self, other: &Self) -> bool {
+        self.blocks == other.blocks
+            && self.row_bytes == other.row_bytes
+            && self.bytes() == other.bytes()
+    }
+}
+impl Eq for CpuKvSnapshotRows {}
+impl CpuKvSnapshotRows {
+    pub(super) fn new(
+        allocator: &onnx_runtime_session::HostTensorAllocator,
+        blocks: usize,
+        row_bytes: usize,
+    ) -> anyhow::Result<Self> {
+        let bytes=blocks.checked_mul(row_bytes).context("CPU KV snapshot row allocation overflows; reduce live context or restore intact geometry")?;
+        let backing = if bytes == 0 {
+            None
+        } else {
+            Some(allocator.array(bytes).context("admit contiguous CPU KV snapshot rows before copying; release snapshots or increase Host headroom")?)
+        };
+        Ok(Self {
+            blocks,
+            row_bytes,
+            backing,
+        })
+    }
+    pub(super) fn len(&self) -> usize {
+        self.blocks
+    }
+    fn bytes(&self) -> &[u8] {
+        self.backing.as_ref().map_or(&[], |data| data.as_slice())
+    }
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        (0..self.blocks)
+            .map(|block| &self.bytes()[block * self.row_bytes..(block + 1) * self.row_bytes])
+    }
+    pub(super) fn fill(
+        &mut self,
+        mut write: impl FnMut(&mut [u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if let Some(data) = &mut self.backing {
+            for row in data.as_mut_slice().chunks_exact_mut(self.row_bytes) {
+                write(row)?;
+            }
+        }
+        Ok(())
+    }
+    fn capture(
+        allocator: &onnx_runtime_session::HostTensorAllocator,
+        binding: &mut DeviceIoBinding,
+        live: usize,
+    ) -> anyhow::Result<Self> {
+        let (blocks, capacity, row_bytes) = live_kv_geometry(binding, live)?;
+        let mut rows = Self::new(
+            allocator,
+            blocks,
+            live.checked_mul(row_bytes)
+                .context("CPU KV live row byte size overflow")?,
+        )?;
+        let mut block = 0;
+        rows.fill(|row| {
+            binding.read_bytes_range_into(block_offset(block, capacity, row_bytes), row)?;
+            block += 1;
+            Ok(())
+        })?;
+        Ok(rows)
+    }
 }
 
 impl DecodeCpuKvState {
@@ -71,21 +147,14 @@ impl DecodeCpuKvState {
         })
     }
 
-    pub(super) fn snapshot(&mut self) -> anyhow::Result<CpuKvSnapshot> {
+    pub(super) fn snapshot(
+        &mut self,
+        allocator: &onnx_runtime_session::HostTensorAllocator,
+    ) -> anyhow::Result<CpuKvSnapshot> {
         let mut entries = Vec::with_capacity(self.bindings.len());
         for (binding, pair) in self.bindings.iter_mut().zip(&self.pairs) {
-            let (blocks, capacity, row_bytes) = live_kv_geometry(binding, self.logical_len)?;
-            let mut rows = Vec::with_capacity(blocks);
-            for block in 0..blocks {
-                rows.push(
-                    binding
-                        .read_bytes_range(
-                            block_offset(block, capacity, row_bytes),
-                            self.logical_len * row_bytes,
-                        )
-                        .with_context(|| format!("snapshot live CPU KV input '{}'", pair.1))?,
-                );
-            }
+            let rows = CpuKvSnapshotRows::capture(allocator, binding, self.logical_len)
+                .with_context(|| format!("snapshot live CPU KV input '{}'", pair.1))?;
             entries.push(CpuKvSnapshotEntry {
                 pair: pair.clone(),
                 shape: binding.physical_shape().to_vec(),
@@ -242,9 +311,8 @@ impl DecodeCpuKvState {
     ///
     /// Growth doubles (bounded below by `needed`), so re-binding is amortised
     /// O(1) per token and a decode that runs to length `n` copies O(n) rows in
-    /// total rather than O(n) per step. Each old buffer is staged to host and
-    /// released before its replacement is allocated, so peak RSS is
-    /// `old + live_prefix` rather than `old + new`.
+    /// total rather than O(n) per step. Old binding, owned live-row staging
+    /// and replacement coexist until the copy succeeds; all retain their owners.
     ///
     /// `live` is the caller's history length, which is expected to equal
     /// `self.logical_len`; it is passed explicitly rather than read from the
@@ -300,17 +368,11 @@ impl DecodeCpuKvState {
         live: usize,
     ) -> anyhow::Result<DeviceIoBinding> {
         let physical = binding.physical_shape().to_vec();
-        let (blocks, old_capacity, head_dim) =
-            (physical[0] * physical[1], physical[2], physical[3]);
+        let head_dim = physical[3];
         let row_bytes = head_dim * dtype.byte_size();
-        // Stage the live rows out of the old buffer, one run per head.
-        let mut carried = Vec::with_capacity(blocks);
-        for block in 0..blocks {
-            carried.push(binding.read_bytes_range(
-                block_offset(block, old_capacity, row_bytes),
-                live * row_bytes,
-            )?);
-        }
+        // Both the old binding and owned live-row staging remain funded
+        // while the replacement is admitted and filled.
+        let carried = CpuKvSnapshotRows::capture(&session.host_tensor_allocator()?, binding, live)?;
         let mut grown_physical = physical;
         grown_physical[2] = capacity;
         let mut logical = grown_physical.clone();
@@ -322,8 +384,8 @@ impl DecodeCpuKvState {
             grown_physical,
             logical,
         )?;
-        for (block, rows) in carried.into_iter().enumerate() {
-            grown.write_bytes(block_offset(block, capacity, row_bytes), &rows)?;
+        for (block, rows) in carried.iter().enumerate() {
+            grown.write_bytes(block_offset(block, capacity, row_bytes), rows)?;
         }
         Ok(grown)
     }
@@ -458,10 +520,7 @@ impl NativeDecodeSession {
         total_len: usize,
         supplied_inputs: &[(String, Tensor)],
     ) -> anyhow::Result<Vec<(String, Tensor)>> {
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
+        let allocator = tensor::host_tensors_for_session(&self.session)?;
         let mut supplied = HashMap::with_capacity(supplied_inputs.len());
         for (name, tensor) in supplied_inputs {
             if supplied.insert(name.as_str(), tensor).is_some() {
@@ -473,17 +532,22 @@ impl NativeDecodeSession {
         for binding in &self.step_inputs {
             let tensor = match binding.source {
                 NativeStepInputSource::TokenIds => {
-                    Tensor::from_i64(&[1, token_ids.len()], &ids)?
+                    tensor::i64_tensor_with(&allocator, vec![1, token_ids.len()], |index| i64::from(token_ids[index]))
+                        .with_context(|| format!("construct native CPU token input '{}'", binding.name))?
                 }
                 NativeStepInputSource::AttentionMask => {
-                    Tensor::from_i64(&[1, total_len], &vec![1; total_len])?
+                    tensor::i64_tensor_with(&allocator, vec![1, total_len], |_| 1)
+                        .with_context(|| format!("construct native CPU attention-mask input '{}'", binding.name))?
                 }
                 NativeStepInputSource::PositionIds => {
-                    self.build_step_positions(past_len, total_len)?
+                    self.build_step_positions(past_len, total_len)
+                        .with_context(|| format!("construct native CPU position input '{}'", binding.name))?
                 }
                 NativeStepInputSource::InputsEmbeds => supplied
                     .remove(binding.name.as_str())
-                    .cloned()
+                    .map(|source| tensor::copy_step_tensor(&allocator, source)
+                        .with_context(|| format!("materialize native CPU step input '{}'", binding.name)))
+                    .transpose()?
                     .with_context(|| {
                         format!(
                             "declared inputs_embeds input '{}' was not supplied to the native decode step; route the current embedding component output to this exact decoder port",
@@ -492,7 +556,9 @@ impl NativeDecodeSession {
                     })?,
                 NativeStepInputSource::Routed => supplied
                     .remove(binding.name.as_str())
-                    .cloned()
+                    .map(|source| tensor::copy_step_tensor(&allocator, source)
+                        .with_context(|| format!("materialize native CPU step input '{}'", binding.name)))
+                    .transpose()?
                     .with_context(|| {
                         format!(
                             "native decode graph input '{}' has no generated role and no routed step tensor; declare a pipeline dataflow edge to this exact decoder port",
@@ -528,7 +594,10 @@ impl NativeDecodeSession {
             let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
             NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
         } else {
-            let logits = extract_logits(&logits)?;
+            let logits = tensor::extract_owned_logits(
+                logits,
+                &tensor::host_tensors_for_session(&self.session)?,
+            )?;
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
             }
@@ -536,7 +605,8 @@ impl NativeDecodeSession {
         };
         self.last_hidden = match (&self.hidden_output, hidden) {
             (Some(name), Some(tensor)) => Some(
-                extract_last_row(&tensor)
+                tensor::extract_owned_last_row(&tensor, &self.session.host_tensor_allocator()?)
+                    .map(NativeHidden::from_cpu)
                     .with_context(|| format!("read native decoder hidden output '{name}'"))?,
             ),
             (Some(name), None) => {

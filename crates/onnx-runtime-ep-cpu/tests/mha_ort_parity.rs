@@ -97,7 +97,8 @@ fn run_case(case: &Case) -> Vec<Vec<f32>> {
             InputData::I32(v) => Backing::I32(v.clone()),
         });
         shapes[input.slot] = input.shape.clone();
-        strides[input.slot] = compute_contiguous_strides(&input.shape);
+        strides[input.slot] = compute_contiguous_strides(&input.shape)
+            .expect("fixture shape has representable contiguous strides");
     }
 
     let input_shapes: Vec<Vec<usize>> = shapes.clone();
@@ -127,7 +128,10 @@ fn run_case(case: &Case) -> Vec<Vec<f32>> {
     let out_strides: Vec<Vec<i64>> = case
         .outputs
         .iter()
-        .map(|o| compute_contiguous_strides(&o.shape))
+        .map(|o| {
+            compute_contiguous_strides(&o.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut out_views: Vec<TensorMut> = out_storage
         .iter_mut()

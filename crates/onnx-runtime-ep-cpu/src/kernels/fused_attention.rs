@@ -173,7 +173,7 @@ impl Kernel for FusedAttentionKernel {
         // Stage 4: out = probs · V. Wrap the dense `probs` buffer (contiguous
         // over `scores_shape`) as a view so the shared GEMM handles the batched
         // multiply and leading-dim broadcast against V.
-        let probs_strides = compute_contiguous_strides(&scores_shape);
+        let probs_strides = compute_contiguous_strides(&scores_shape)?;
         let probs_view = TensorView::new(
             onnx_runtime_ep_api::DevicePtr(probs.as_ptr() as *const std::ffi::c_void),
             DataType::Float32,

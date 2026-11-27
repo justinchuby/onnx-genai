@@ -106,9 +106,12 @@ fn run_matmul_with_b_ptr(
     let a_shape = [m, k];
     let b_shape = [k, n];
     let out_shape = [m, n];
-    let a_strides = compute_contiguous_strides(&a_shape);
-    let b_strides = compute_contiguous_strides(&b_shape);
-    let out_strides = compute_contiguous_strides(&out_shape);
+    let a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_strides = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let a_view = TensorView::new(
         DevicePtr(a_buf.as_ptr()),
@@ -158,7 +161,7 @@ fn run_matmul_with_b_ptr(
     out_bytes
 }
 
-/// Build a `pkg.nxrt::BlockQuantizedMoE`-boundary lazy weight for `b` placed at
+/// Build a `pkg.nxrt._private::BlockQuantizedMoE`-boundary lazy weight for `b` placed at
 /// `offset` inside a fresh host mmap, plus that mmap.
 fn lazy_weight_for(b: &[f32], k: usize, n: usize, offset: usize) -> (LazyWeight, HostMmap) {
     lazy_weight_with_boundary(LazyWeightBoundary::BlockQuantizedMoe, b, k, n, offset)

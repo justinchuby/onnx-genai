@@ -1,4 +1,4 @@
-//! Checked reference implementation of `pkg.nxrt::SparseKvGather` v1.
+//! Checked reference implementation of `pkg.nxrt._private::SparseKvGather` v1.
 //!
 //! The reusable helper is also the indexing seam used by the Phase-1
 //! `CompressedSparseAttention` reference kernel. The public operator is strict:

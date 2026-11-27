@@ -1,0 +1,51 @@
+{
+  "package": "symphonia-format-mkv",
+  "version": "0.6.1",
+  "archive_url": "https://crates.io/api/v1/crates/symphonia-format-mkv/0.6.1/download",
+  "archive_sha256": "d015c5c0558864665894b3f4cbd95e10abb01b9c868e751c72670f326a56360e",
+  "repository": "https://github.com/pdeljanov/Symphonia",
+  "revision": "ee35874b571a35a9a6e15d3bc9a3aaf8f11fbeee",
+  "license": "MPL-2.0",
+  "files": [
+    {
+      "path": "LICENSE",
+      "upstream_sha256": "c76f740d1521b9bed9ca7a04ad526c310493c62621b1341d623b431736533b30"
+    },
+    {
+      "path": "README.md",
+      "upstream_sha256": "636ca6a9d915ed59e6f799edcdcac216b03d704b2de9cc92bdaad09cef77dfe1"
+    },
+    {
+      "path": "src/codecs.rs",
+      "upstream_sha256": "1957e49f93b22b622ec75a2f60613be0e79b458a39533ce1eca30ec548d744e1"
+    },
+    {
+      "path": "src/demuxer.rs",
+      "upstream_sha256": "5e2e921bcc0525dc09dce9f071f66b5fe31caa0759852c6eb64306c89cf33a6a"
+    },
+    {
+      "path": "src/ebml.rs",
+      "upstream_sha256": "057ceffcf879a7bbf8494724eb934b2284cd097be16a1762e5b31dce2049db58"
+    },
+    {
+      "path": "src/lacing.rs",
+      "upstream_sha256": "a6a8977b40f2be14496a8b9158891ef3a4e96a3a8740a75fe65527919a3f91ab"
+    },
+    {
+      "path": "src/lib.rs",
+      "upstream_sha256": "9aa009e89c507bb55bd51b4f1a53ef408bea6b2e2f28432d92c1002f69fa24c4"
+    },
+    {
+      "path": "src/schema.rs",
+      "upstream_sha256": "9ddcf60a9523515607abd5c804ef13b817bdd4b4880fc0a5508ab276dbd356ef"
+    },
+    {
+      "path": "src/segment.rs",
+      "upstream_sha256": "0bb8f5f44ac893be239a5bc46d403979453d058c49aafa77e3d212ab47c5bbbe"
+    },
+    {
+      "path": "src/tags.rs",
+      "upstream_sha256": "7e3bc88710ca6c15b05aca26ab0800d73732b54a3cd72daf667605718c5047ff"
+    }
+  ]
+}

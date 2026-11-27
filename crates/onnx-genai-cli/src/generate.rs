@@ -66,7 +66,11 @@ fn generate_text(
     };
 
     let load_started = std::time::Instant::now();
-    let mut backend = Backend::load(model_dir, args.engine.to_config())?;
+    let mut engine_config = args.engine.to_config();
+    engine_config.audio_decode_limits = onnx_genai::preprocess::audio::AudioDecodeLimits {
+        max_decoded_bytes: args.max_decoded_audio_bytes,
+    };
+    let mut backend = Backend::load(model_dir, engine_config)?;
     profile.execution_provider = backend.execution_provider_status();
     profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());

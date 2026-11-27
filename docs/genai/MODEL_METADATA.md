@@ -115,3 +115,38 @@ floating probabilities, independent of model architecture or execution provider.
 See [the SystemOne contract](../SYSTEMONE.md) and the executable
 `tests/fixtures/onnx_genai_workflows/decision` package for precise input/output
 roles, shape/resource admission, and remaining multimodal/entry-point work.
+
+### Explicit infill context (core schema v1.18)
+
+`package.infill` declares exact tokenizer control spellings and ordering.
+`extra_context_template` is optional; omit it when extra file context is not
+part of the model's prompt format. Budgets remain server configuration.
+
+```yaml
+schema_version: "1.18"
+package:
+  infill:
+    prefix_token: "<model-prefix>"
+    middle_token: "<model-middle>"
+    suffix_token: "<model-suffix>"
+    order: psm
+    additional_stop_tokens: []
+    extra_context_template: "{% for file in input_extra %}{{ file.filename }}\n{{ file.text }}\n{% endfor %}"
+```
+
+The example spellings are placeholders for exact registered package tokens,
+not defaults. The authored template receives ordered filename/text strings and
+renders only text; filenames never authorize filesystem access. Rendered context
+is prepended before either PSM or SPM framing on native `/infill`. A declared
+template renders the ordered file-context list even when that list is empty.
+Without a declared template, an absent or empty list preserves ordinary framing;
+a nonempty list requires an authored template.
+
+Explicit infill control roles terminate generated FIM output. Extra terminators
+come only from `additional_stop_tokens` and the package EOS facts; token spellings
+such as file separators have no implicit stopping meaning in this declaration.
+
+`extra_context_template` serializes the native `/infill` file-context list,
+including an empty list. OpenAI completion `suffix` and engine FIM convenience
+methods use the declared control roles without this wire-specific template.
+Prepared-token FIM execution can carry the already rendered context.

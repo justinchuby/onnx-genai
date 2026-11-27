@@ -893,7 +893,7 @@ fn bqmoe_without_real_telemetry_and_catalog_contract_typed_declines() {
     };
     let (mut graph, node, bank) = qmoe_graph_and_bank(41);
     let bqmoe = graph.nodes.get_mut(node).expect("QMoE node");
-    bqmoe.domain = "pkg.nxrt".into();
+    bqmoe.domain = "pkg.nxrt._private".into();
     bqmoe.op_type = "BlockQuantizedMoE".into();
     let artifact = artifact_scope(&provider);
 

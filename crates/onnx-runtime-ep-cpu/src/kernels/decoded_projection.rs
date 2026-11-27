@@ -36,6 +36,7 @@ impl<'a> ProjectionScratch<'a> {
     /// Nonempty workspace must be valid, Host-accessible, writable storage,
     /// exclusively lent for `'a`. It must outlive this dispatch and every
     /// short-lived initialized slice. No references may escape the dispatch.
+    #[cfg(test)]
     pub(super) unsafe fn bind(
         operation: &'static str,
         bytes: usize,
@@ -54,6 +55,23 @@ impl<'a> ProjectionScratch<'a> {
         let [scratch] =
             unsafe { Self::bind_layout(operation, WorkspaceLayout::new([region])?, workspace)? };
         Ok(scratch)
+    }
+
+    /// Lend an exact bounded byte prefix without reading or clearing backing.
+    /// Arbitrary byte writes can invalidate every previous f32 initialization
+    /// proof, so the next float borrow must initialize its prefix anew. The
+    /// caller must fill all bytes before publishing an initialized byte slice.
+    pub(super) fn byte_storage(&mut self, bytes: usize) -> Result<&mut [MaybeUninit<u8>]> {
+        let capacity = std::mem::size_of_val(self.storage);
+        if bytes > capacity {
+            return Err(EpError::KernelFailed(format!(
+                "projection byte storage needs {bytes} bytes, but its admitted region has {capacity}; prepare and admit the complete operation workspace before accessing payloads"
+            )));
+        }
+        self.initialized_prefix = 0;
+        // SAFETY: MaybeUninit permits arbitrary initialized/uninitialized bytes.
+        // This exclusive short borrow covers exactly the checked live prefix.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), bytes) })
     }
 
     /// Bind one checked composite layout, validating f32 regions before any
@@ -197,6 +215,30 @@ impl<'a> ProjectionScratch<'a> {
             target.as_mut_ptr().write_bytes(0, elements);
         }
         Ok(unsafe { std::slice::from_raw_parts_mut(target.as_mut_ptr().cast(), elements) })
+    }
+
+    /// Split this lane into initialized float columns and an exact byte prefix.
+    /// The covering tail f32 is initialized too; byte writes preserve valid f32
+    /// bit patterns. Short exclusive borrows prevent mixed typed access.
+    pub(super) fn split_initialized_bytes(
+        &mut self,
+        columns: usize,
+        bytes: usize,
+    ) -> Result<(&mut [f32], &mut [u8])> {
+        let elements = columns
+            .checked_add(bytes.div_ceil(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EpError::KernelFailed(
+                    "packed projection scratch count overflows; reduce projection dimensions"
+                        .into(),
+                )
+            })?;
+        let (columns, values) = self.initialized_prefix(elements)?.split_at_mut(columns);
+        // SAFETY: every covering byte is initialized in disjoint exclusive Host
+        // storage, including the final partial f32. All u8 writes remain valid
+        // f32 bit patterns, and neither returned borrow outlives this owner loan.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), bytes) };
+        Ok((columns, bytes))
     }
 
     /// Borrow an initialized prefix, clearing only a previously uninitialized
@@ -761,6 +803,37 @@ mod tests {
     }
 
     #[test]
+    fn packed_byte_loan_invalidates_float_proof_and_short_loan_is_transactional() {
+        let mut backing = [37.0f32; 8];
+        let mut scratch = ProjectionScratch::test_binding(&mut backing);
+        scratch.initialized_prefix(4).unwrap().fill(7.0);
+        let message = scratch.byte_storage(33).unwrap_err().to_string();
+        assert!(
+            message.contains("33 bytes") && message.contains("32"),
+            "{message}"
+        );
+        assert_eq!(scratch.initialized_prefix(4).unwrap(), &[7.0; 4]);
+        // A partial float's bytes may become arbitrary or uninitialized. No
+        // prior float proof may survive even a byte loan left partly unwritten.
+        let bytes = scratch.byte_storage(5).unwrap();
+        bytes[0].write(0xff);
+        bytes[4] = MaybeUninit::uninit();
+        assert_eq!(scratch.initialized_prefix, 0);
+        assert_eq!(scratch.initialized_prefix(4).unwrap(), &[0.0; 4]);
+        assert_eq!(
+            scratch.storage[4..]
+                .iter()
+                .map(|n| unsafe { n.assume_init() })
+                .collect::<Vec<_>>(),
+            vec![37.0; 4]
+        );
+        scratch.initialized_prefix(4).unwrap().fill(9.0);
+        assert!(scratch.byte_storage(0).unwrap().is_empty());
+        assert_eq!(scratch.initialized_prefix, 0);
+        assert_eq!(scratch.initialized_prefix(4).unwrap(), &[0.0; 4]);
+    }
+
+    #[test]
     fn scratch_initialization_extends_only_the_live_prefix_and_refusal_is_transactional() {
         let mut backing = [MaybeUninit::new(37.0f32); 32];
         let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 32 * 4);
@@ -1073,5 +1146,54 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod packed_byte_scratch_tests {
+    use super::*;
+    use onnx_runtime_ep_api::DevicePtrMut;
+    #[test]
+    fn odd_block_tail_is_initialized_and_float_byte_float_reuse_preserves_proof() {
+        let mut backing = [MaybeUninit::new(91f32); 12];
+        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 48);
+        {
+            // SAFETY: live aligned Host backing is lent exclusively for this scope.
+            let mut scratch =
+                unsafe { ProjectionScratch::bind("packed-byte test", 48, Some(view)).unwrap() };
+            let (columns, bytes) = scratch.split_initialized_bytes(2, 34).unwrap();
+            assert_eq!(columns, [0.; 2]);
+            assert_eq!(bytes, [0; 34]);
+            bytes.fill(255);
+            let floats = scratch.initialized_prefix(11).unwrap();
+            assert!(floats[2..10].iter().all(|v| v.to_bits() == u32::MAX));
+            assert_eq!(floats[10].to_bits(), u32::from_ne_bytes([255, 255, 0, 0]));
+            assert!(scratch.zeroed_prefix(11).unwrap().iter().all(|&v| v == 0.));
+        }
+        // SAFETY: every value was initialized by the original fixture.
+        assert_eq!(unsafe { backing[11].assume_init() }, 91.);
+    }
+    #[test]
+    fn fresh_uninitialized_backing_and_failed_capacity_do_not_publish_invalid_views() {
+        let mut fresh = [MaybeUninit::<f32>::uninit(); 9];
+        let view = WorkspaceView::new(DevicePtrMut(fresh.as_mut_ptr().cast()), 36);
+        {
+            // SAFETY: valid exclusive aligned Host allocation, intentionally uninitialized.
+            let mut scratch = unsafe {
+                ProjectionScratch::bind("fresh packed-byte test", 36, Some(view)).unwrap()
+            };
+            let (_, bytes) = scratch.split_initialized_bytes(0, 34).unwrap();
+            assert_eq!(bytes, [0; 34]);
+            bytes.fill(7);
+            assert_eq!(
+                scratch.initialized_prefix(9).unwrap()[8].to_bits(),
+                u32::from_ne_bytes([7, 7, 0, 0])
+            );
+        }
+        let mut short = [31f32; 8];
+        let mut scratch = ProjectionScratch::test_binding(&mut short);
+        assert!(scratch.split_initialized_bytes(0, 34).is_err());
+
+        assert_eq!(short, [31.; 8]);
     }
 }

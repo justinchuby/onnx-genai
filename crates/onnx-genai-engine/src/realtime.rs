@@ -65,6 +65,7 @@ struct RealtimeGrammar {
     vocabulary: usize,
     endings: Vec<u32>,
     text_ended: bool,
+    _decoder_workspace: Option<onnx_runtime_memory_governor::MemoryLease>,
 }
 enum RealtimeConstraint {
     Logical(Box<crate::response_constraint::ContentConstraint>),
@@ -157,6 +158,37 @@ impl Engine {
 }
 
 impl RealtimeSession<'_> {
+    /// Prepare transport publication on the native owner without consuming a quantum.
+    /// The returned decoder owns its admitted workspace through all publication forks.
+    pub fn prepare_text_decoder(
+        &self,
+        preserved: &std::collections::BTreeSet<u32>,
+        max_bytes: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::tokenization::TokenTextDecoder> {
+        let tokenizer = self
+            .engine
+            .workflow_runtime()
+            .package_tokenizer()
+            .context("realtime text output requires the admitted package tokenizer")?;
+        let options = GenerateOptions {
+            max_constraint_bytes: max_bytes.get(),
+            preserved_tokens: preserved.clone(),
+            ..Default::default()
+        };
+        let lease = self
+            .engine
+            .reserve_literal_decoder_workspace(tokenizer, &options)?;
+        let contract = crate::byte_stream::prepare_literal_output(tokenizer, preserved)
+            .map_err(crate::ProcessorConfigurationError::classify)?;
+        let mut decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(preserved);
+        decoder.set_byte_limit(max_bytes.get());
+        if let Some(contract) = contract {
+            decoder.bind_literal_decoder(contract, max_bytes.get());
+        }
+        decoder.retain_workspace(lease);
+        Ok(decoder)
+    }
+
     /// Install a fresh response-local grammar before Generate. Native graphs
     /// must explicitly consume the declared token mask before selecting tokens.
     pub fn set_constraint(
@@ -195,6 +227,14 @@ impl RealtimeSession<'_> {
             // Realtime publishes canonical streaming decoder text. Token-local
             // byte approximations cannot model contextual whitespace or prove
             // completion, so text grammars use the shared logical cursor.
+            let decoder_workspace = self
+                .engine
+                .reserve_literal_decoder_workspace(tokenizer, &options)?;
+            let decoder = crate::byte_stream::prepare_literal_output(
+                tokenizer,
+                &options.effective_preserved_tokens(),
+            )
+            .map_err(crate::ProcessorConfigurationError::classify)?;
             let text = |grammar: &crate::config::TextGrammar, prefix: &str| {
                 crate::response_constraint::ContentConstraint::text(
                     tokenizer,
@@ -202,8 +242,11 @@ impl RealtimeSession<'_> {
                     crate::text_projection::ProjectionKind::Plain,
                     prefix,
                     options.max_constraint_bytes,
-                    endings.clone(),
-                    &options.effective_preserved_tokens(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings.clone(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )
             };
             let json = |schema: &serde_json::Value, prefix: &str| {
@@ -213,11 +256,28 @@ impl RealtimeSession<'_> {
                     crate::text_projection::ProjectionKind::Plain,
                     prefix,
                     options.max_constraint_bytes,
-                    endings.clone(),
-                    &options.effective_preserved_tokens(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings.clone(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )
             };
             let logical = match options.constraint.as_ref() {
+                Some(crate::GenerateConstraint::XmlToolCall { grammar, prefix }) => Some(
+                    crate::response_constraint::ContentConstraint::xml_tool_call(
+                        tokenizer,
+                        grammar,
+                        crate::text_projection::ProjectionKind::Plain,
+                        prefix,
+                        options.max_constraint_bytes,
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings.clone(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
+                    )?,
+                ),
                 Some(crate::GenerateConstraint::Regex { pattern, prefix }) => Some(text(
                     &crate::config::TextGrammar::Regex(pattern.clone()),
                     prefix,
@@ -248,9 +308,11 @@ impl RealtimeSession<'_> {
                     &options,
                     Some(tokenizer),
                     false,
+                    None,
                 )?)
             };
             let grammar = RealtimeGrammar {
+                _decoder_workspace: decoder_workspace,
                 constraint,
                 context: Default::default(),
                 vocabulary: usize::try_from(
@@ -364,7 +426,16 @@ impl RealtimeSession<'_> {
         let mask = self
             .grammar
             .as_ref()
-            .map(RealtimeGrammar::mask)
+            .map(|grammar| {
+                if operation == RealtimeOperation::Cancel {
+                    // Terminal control must remain executable even if an unfinished
+                    // grammar has no continuation in this tokenizer's vocabulary.
+                    // No text/EOS is permitted; the normal output guard still runs.
+                    Ok(vec![false; grammar.vocabulary])
+                } else {
+                    grammar.mask()
+                }
+            })
             .transpose()?;
         let inputs = &self.contract.spec().inputs;
         let budget_wire = budget.wire()?;
@@ -584,7 +655,7 @@ mod tests {
                 );
             }
             std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-            let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+            let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
             let (mut session, _) = engine.open_realtime_session(
                 RealtimeMode::Realtime,
                 &[],
@@ -635,7 +706,7 @@ mod tests {
             .replace("node { input: \"generating\" output: \"candidate_tokens\"", "node { input: \"decoding\" output: \"candidate_tokens\"")
             .replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"tokens_out\" output: \"emitted_id\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" i: 0 type: INT } }\nnode { input: \"emitted_id\" input: \"three\" output: \"ending\" op_type: \"Equal\" }\nnode { input: \"ending\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -681,7 +752,7 @@ mod tests {
                 "node { input: \"zero\" output: \"count\" op_type: \"Identity\" }",
             );
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -730,7 +801,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
 }"#)
             .replace("output: \"audio_out\" op_type: \"Add\"", "output: \"raw_audio\" op_type: \"Add\"");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -773,7 +844,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
         let metadata = std::fs::read_to_string(root.join("inference_metadata.yaml"))?
             .replace("eos_token_id: [3]", "eos_token_id: []");
         std::fs::write(package.path().join("inference_metadata.yaml"), metadata)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -837,7 +908,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -868,7 +939,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
         }
         let graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?.replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"output_token_budget\" input: \"count\" output: \"limit_equal\" op_type: \"Equal\" }\nnode { input: \"limit_equal\" input: \"responding\" output: \"limit_done\" op_type: \"And\" }\nnode { input: \"limit_done\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }");
         std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -905,7 +976,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
     -> anyhow::Result<()> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -947,7 +1018,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
     fn native_realtime_applies_response_grammar_before_selecting_tokens() -> anyhow::Result<()> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config())?;
         let (mut session, _) = engine.open_realtime_session(
             RealtimeMode::Realtime,
             &[],
@@ -984,7 +1055,7 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
     fn native_realtime_quanta_keep_state_and_drop_closes_the_session() -> anyhow::Result<()> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config())?;
         let closed_id;
         {
             let (mut session, initial) = engine.open_realtime_session(
@@ -1138,6 +1209,201 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
             .audio,
             [0.1]
         );
+        Ok(())
+    }
+    #[cfg(feature = "native-backend")]
+    fn logical_cancel_native_package(
+        piece: &str,
+        cancel_token: Option<u32>,
+    ) -> anyhow::Result<tempfile::TempDir> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let package = tempfile::tempdir()?;
+        std::fs::copy(
+            root.join("inference_metadata.yaml"),
+            package.path().join("inference_metadata.yaml"),
+        )?;
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("tokenizer.json"))?)?;
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok16");
+        tokenizer["model"]["vocab"][piece] = serde_json::json!(16);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(serde_json::json!({"id":16,"content":piece,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        tokenizer["decoder"] = serde_json::json!({"type":"Fuse"});
+        std::fs::write(
+            package.path().join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer)?,
+        )?;
+        let mut graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?;
+        let done =
+            "node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }";
+        assert!(graph.contains(done));
+        // The authored Cancel branch also checks the actual mask input. This
+        // proves transport of a full-width all-false vocabulary mask, rather
+        // than merely disabling host-side continuation validation.
+        graph = graph.replace(done, concat!(
+            "initializer { name: \"cancel_mask_width\" data_type: 7 int64_data: 32 }\n",
+            "node { input: \"cancelling\" output: \"done\" op_type: \"If\"\n",
+            "attribute { name: \"then_branch\" type: GRAPH g { name: \"cancel_mask_contract\"\n",
+            "node { input: \"token_mask\" output: \"width\" op_type: \"Size\" }\n",
+            "node { input: \"width\" input: \"cancel_mask_width\" output: \"width_ok\" op_type: \"Equal\" }\n",
+            "node { input: \"token_mask\" output: \"bits\" op_type: \"Cast\" attribute { name: \"to\" i: 7 type: INT } }\n",
+            "node { input: \"bits\" output: \"allowed_count\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" i: 0 type: INT } }\n",
+            "node { input: \"allowed_count\" input: \"zero\" output: \"none_allowed\" op_type: \"Equal\" }\n",
+            "node { input: \"width_ok\" input: \"none_allowed\" output: \"result\" op_type: \"And\" }\n",
+            "output { name: \"result\" type { tensor_type { elem_type: 9 shape {} } } } } }\n",
+            "attribute { name: \"else_branch\" type: GRAPH g { name: \"ongoing_response\" node { input: \"cancelling\" output: \"result\" op_type: \"Identity\" } output { name: \"result\" type { tensor_type { elem_type: 9 shape {} } } } } }\n",
+            "}"
+        ));
+        if let Some(id) = cancel_token {
+            let slice = "node { input: \"candidate_tokens\" input: \"axis\" input: \"ends\" input: \"axis\" output: \"tokens_out\" op_type: \"Slice\" }";
+            assert!(graph.contains(slice));
+            let attack = format!(
+                concat!(
+                    "node {{ input: \"candidate_tokens\" input: \"axis\" input: \"ends\" input: \"axis\" output: \"normal_tokens\" op_type: \"Slice\" }}\n",
+                    "initializer {{ name: \"cancel_token\" data_type: 7 dims: 1 int64_data: {} }}\n",
+                    "node {{ input: \"cancelling\" output: \"tokens_out\" op_type: \"If\"\n",
+                    "attribute {{ name: \"then_branch\" type: GRAPH g {{ name: \"illegal_cancel_text\" node {{ input: \"cancel_token\" output: \"result\" op_type: \"Identity\" }} output {{ name: \"result\" type {{ tensor_type {{ elem_type: 7 shape {{ dim {{ dim_value: 1 }} }} }} }} }} }} }}\n",
+                    "attribute {{ name: \"else_branch\" type: GRAPH g {{ name: \"ordinary_output\" node {{ input: \"normal_tokens\" output: \"result\" op_type: \"Identity\" }} output {{ name: \"result\" type {{ tensor_type {{ elem_type: 7 shape {{ dim {{ dim_param: \"emitted_tokens\" }} }} }} }} }} }} }}\n",
+                    "}}"
+                ),
+                id
+            );
+            graph = graph.replace(slice, &attack);
+        }
+        std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
+        Ok(package)
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_cancel_config() -> crate::EngineConfig {
+        crate::EngineConfig {
+            decode_backend: crate::EngineDecodeBackend::Native,
+            native_device: Some(crate::NativeDecodeDevice::Cpu),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn logical_hello_constraint() -> crate::GenerateConstraint {
+        crate::GenerateConstraint::JsonSchema {
+            schema: serde_json::json!({"const":"hello"}).to_string(),
+            prefix: String::new(),
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_realtime_cancels_logical_prefix_without_any_continuation_and_rearms()
+    -> anyhow::Result<()> {
+        let package = logical_cancel_native_package("\"hello", None)?;
+        let mut engine = Engine::from_dir(package.path(), native_cancel_config())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        for _ in 0..2 {
+            session.set_constraint(Some(logical_hello_constraint()))?;
+            assert!(matches!(
+                &session.grammar.as_ref().unwrap().constraint,
+                RealtimeConstraint::Logical(_)
+            ));
+            let first = session.step(
+                RealtimeInput::Generate(&[]),
+                RealtimeTokenBudget::Unlimited,
+                crate::GenerationControl::new(),
+            )?;
+            assert_eq!(first.tokens, [16]);
+            assert_eq!(first.output_tokens, 1);
+            assert!(!first.done);
+            let grammar = session.grammar.as_ref().unwrap();
+            assert!(!grammar.can_finish()?);
+            // The real tokenizer has no closing-quote token. Ordinary sampling
+            // cannot continue; cancellation must still execute its native graph.
+            let exhausted = grammar.mask().unwrap_err();
+            assert!(
+                exhausted
+                    .to_string()
+                    .contains("admits no token before logical completion"),
+                "{exhausted:#}"
+            );
+            let cancelled = session.step(
+                RealtimeInput::Cancel,
+                RealtimeTokenBudget::Unlimited,
+                crate::GenerationControl::new(),
+            )?;
+            assert!(cancelled.done);
+            assert!(cancelled.tokens.is_empty());
+            assert_eq!(cancelled.output_tokens, 0);
+            assert!(session.grammar.is_none());
+            assert!(matches!(session.health, SessionHealth::Ready));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_realtime_rejects_cancel_text_and_eos_even_when_grammar_would_allow_them()
+    -> anyhow::Result<()> {
+        for (id, piece) in [(16_u32, "\"hello"), (3, "\"hello\"")] {
+            let package = logical_cancel_native_package(piece, Some(id))?;
+            let mut engine = Engine::from_dir(package.path(), native_cancel_config())?;
+            let (mut session, _) = engine.open_realtime_session(
+                RealtimeMode::Realtime,
+                &[],
+                crate::GenerationControl::new(),
+            )?;
+            session.set_constraint(Some(logical_hello_constraint()))?;
+            if id == 3 {
+                let complete = session.step(
+                    RealtimeInput::Generate(&[]),
+                    RealtimeTokenBudget::Unlimited,
+                    crate::GenerationControl::new(),
+                )?;
+                assert_eq!(complete.tokens, [16]);
+                assert!(!complete.done);
+                assert!(session.grammar.as_ref().unwrap().can_finish()?);
+            }
+            // Distinguish a truly non-generating Cancel mask from simply
+            // reusing the ordinary allowed grammar mask (text or ending).
+            assert_eq!(
+                session.grammar.as_ref().unwrap().mask()?.get(id as usize),
+                Some(&true)
+            );
+            let failure = session
+                .step(
+                    RealtimeInput::Cancel,
+                    RealtimeTokenBudget::Unlimited,
+                    crate::GenerationControl::new(),
+                )
+                .unwrap_err();
+            assert!(
+                format!("{failure:#}").contains(&format!("token {id} forbidden by token_mask")),
+                "{failure:#}"
+            );
+            assert!(matches!(session.health, SessionHealth::RequiresReset));
+            assert!(session.grammar.is_some());
+            let blocked = session
+                .step(
+                    RealtimeInput::Poll,
+                    RealtimeTokenBudget::Unlimited,
+                    crate::GenerationControl::new(),
+                )
+                .unwrap_err();
+            assert!(blocked.to_string().contains("requires native reset"));
+            session.configure(RealtimeMode::Realtime, &[], crate::GenerationControl::new())?;
+            assert!(session.grammar.is_none());
+            assert!(matches!(session.health, SessionHealth::Ready));
+            let recovered = session.step(
+                RealtimeInput::Generate(&[]),
+                RealtimeTokenBudget::Unlimited,
+                crate::GenerationControl::new(),
+            )?;
+            assert_eq!(recovered.tokens, [31]);
+        }
         Ok(())
     }
 }

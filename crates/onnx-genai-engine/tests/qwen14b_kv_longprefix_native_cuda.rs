@@ -45,7 +45,7 @@
 //! 1. **Seq-major multi-token prefill above 512 is unconverted.**
 //!    `selected_backend_for_shape` only auto-selects the fused/flash prefill path
 //!    when `valid_sequence_length <= 512`; a longer *prompt* falls to the
-//!    Phase2a unfused-decode-prep path, which `require_converted_path_support`
+//!    unfused decode preparation path, which `require_converted_path_support`
 //!    rejects for BSNH (hard `KernelFailed`). So seq-major cannot be driven to a
 //!    long prefix by a long **prompt**. Single-token **decode** always takes the
 //!    converted `FusedDecodePrep` + `Fp16DecodeRead` BSNH path, so the seq-major

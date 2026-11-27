@@ -220,7 +220,7 @@ fn fpcr() -> u64 {
         0
     }
 }
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     assert_eq!(
         args.len(),
@@ -276,9 +276,9 @@ fn main() {
     let shapes = vec![xs.clone(), ws.clone(), vec![c.w[0]]];
     let node = c.node();
     let (sx, sw, sy) = (
-        compute_contiguous_strides(&xs),
-        compute_contiguous_strides(&ws),
-        compute_contiguous_strides(&ys),
+        compute_contiguous_strides(&xs)?,
+        compute_contiguous_strides(&ws)?,
+        compute_contiguous_strides(&ys)?,
     );
     let bs = [c.w[0]];
     let x = values(c.x.iter().product(), 71);
@@ -413,4 +413,5 @@ fn main() {
         args[2],
         factories.len() == 2
     );
+    Ok(())
 }

@@ -347,6 +347,16 @@ pub(crate) fn to_dense_into<T: NumericElem>(
     Ok(())
 }
 
+/// Visit typed storage without a payload copy. The owning EP proves complete
+/// backing bounds/address span and keeps the source disjoint from the sink.
+pub(crate) fn try_visit_storage<T: NumericElem>(
+    op: &str,
+    view: &TensorView,
+    consume: impl FnMut(usize, T) -> Result<()>,
+) -> Result<()> {
+    StorageRead::<T>::new(op, view, T::DTYPE)?.try_visit(consume)
+}
+
 /// Validated storage-read geometry, shared by allocating and admitted copies.
 struct StorageRead<'view, 'storage, T> {
     view: &'view TensorView<'storage>,
@@ -400,15 +410,28 @@ impl<'view, 'storage, T: Copy> StorageRead<'view, 'storage, T> {
     }
     #[inline]
     fn visit(self, mut consume: impl FnMut(usize, T)) {
+        match self.try_visit::<std::convert::Infallible>(|i, v| {
+            consume(i, v);
+            Ok(())
+        }) {
+            Ok(()) => (),
+            Err(never) => match never {},
+        }
+    }
+    #[inline]
+    fn try_visit<E>(
+        self,
+        mut consume: impl FnMut(usize, T) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         if self.count == 0 {
-            return;
+            return Ok(());
         }
         let origin = self.view.data_ptr::<T>();
         if self.view.is_contiguous() {
             for index in 0..self.count {
                 // SAFETY: validated Host view and matching element type. The
                 // owning EP supplies backing bounds; byte origins may be unaligned.
-                consume(index, unsafe { origin.add(index).read_unaligned() });
+                consume(index, unsafe { origin.add(index).read_unaligned() })?;
             }
         } else {
             let mut coordinates = smallvec::SmallVec::<[usize; 8]>::new();
@@ -418,10 +441,11 @@ impl<'view, 'storage, T: Copy> StorageRead<'view, 'storage, T> {
                 // SAFETY: each coordinate lies inside the validated logical
                 // shape. Backing bounds, including negative strides, are owned
                 // by the EP. Copy raw T bits; no arithmetic conversion occurs.
-                consume(index, unsafe { origin.offset(offset).read_unaligned() });
+                consume(index, unsafe { origin.offset(offset).read_unaligned() })?;
                 next_index(self.view.shape, &mut coordinates);
             }
         }
+        Ok(())
     }
 }
 fn read_strided<T: Copy>(view: &TensorView, want: DataType) -> Result<Vec<T>> {
@@ -942,8 +966,8 @@ pub fn narrow_bf16_slice_into(src: &[f32], dst: &mut [u16]) {
 /// Storage geometry used by widening and address-only execution refinement.
 /// Callers separately validate view geometry and Host accessibility.
 #[inline]
-pub(crate) fn can_borrow_dense_f32(view: &TensorView<'_>) -> bool {
-    view.dtype == DataType::Float32 && view.is_contiguous() && view.data_ptr::<f32>().is_aligned()
+pub(crate) fn can_borrow_dense<T: NumericElem>(view: &TensorView<'_>) -> bool {
+    view.dtype == T::DTYPE && view.is_contiguous() && view.data_ptr::<T>().is_aligned()
 }
 
 /// Borrow a contiguous f32 view zero-copy, or materialize/widen any other
@@ -952,7 +976,7 @@ pub(crate) fn can_borrow_dense_f32(view: &TensorView<'_>) -> bool {
 pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
     validate_f32_widen_input(op, view)?;
     let len = view.numel();
-    if can_borrow_dense_f32(view) {
+    if can_borrow_dense::<f32>(view) {
         if len == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
@@ -1658,7 +1682,8 @@ mod tests {
         let mut buf = vec![0.0f32; 10];
         let base = buf.as_ptr() as usize;
         let shape = [2usize, 4];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut out = TensorMut::new(
             DevicePtrMut(buf.as_mut_ptr() as *mut std::ffi::c_void),
             DataType::Float32,

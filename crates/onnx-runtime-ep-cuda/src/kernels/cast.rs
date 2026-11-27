@@ -11,6 +11,8 @@
 //!
 //! * **float → int** truncates toward zero and **saturates** to the target
 //!   integer's range (NaN → 0);
+//! * **float → packed int** truncates and wraps modulo the packed width,
+//!   matching ONNX's `ml_dtypes` reference conversion (NaN/inf → 0);
 //! * **int → int** is a width-narrowing/widening two's-complement reinterpret;
 //! * **any numeric → bool** is `x != 0` (NaN → true);
 //! * **float ↔ float** rounds to nearest representable.
@@ -29,19 +31,24 @@
 //! ## Dtype coverage & limits (actionable errors — RULES.md #1)
 //!
 //! Supported: `Float32`, `Float64`, `Float16`, `BFloat16`, `Int8`, `Uint8`,
-//! `Int16`, `Uint16`, `Int32`, `Uint32`, `Int64`, `Uint64`, `Bool`. Packed 4-bit
-//! and the float8 types are rejected, naming the dtype. `Int64`/`Uint64` values
-//! beyond 2⁵³ lose precision when routed through the `double` conversion lane
-//! (documented; the common token-id range is exact); `Uint64` above 2⁶³ is not
-//! representable in the signed lane.
+//! `Int16`, `Uint16`, `Int32`, `Uint32`, `Int64`, `Uint64`, `Bool`, plus
+//! FP8, `Uint4`/`Int4`, and `Uint2`/`Int2`. Packed integers cannot be cast
+//! directly to or from FP8. `Int64`/`Uint64`
+//! values beyond 2⁵³ lose precision when routed through the `double` conversion
+//! lane (documented; the common token-id range is exact); `Uint64` above 2⁶³ is
+//! not representable in the signed lane.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 
+use onnx_runtime_ep_api::float8_cast::{self, CastAttributes, CastOptions, Float8};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{
+    DataType, Node, Shape,
+    packed_integer::{cast_unsupported_reason, packed_cast_peer_supported, packed_integer},
+};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
@@ -79,9 +86,9 @@ __device__ long long f_to_ll_sat(double f, double lo, double hi) {
     if (f > hi) return (long long)hi;
     return (long long)f;               // truncate toward zero
 }
-__device__ unsigned long long f_to_ull_sat(double f, double hi) {
+__device__ unsigned long long f_to_ull_sat(double f) {
     if (isnan(f) || f <= 0.0) return 0ULL;
-    if (f > hi) return (unsigned long long)hi;
+    if (f >= 18446744073709551616.0) return 0xffffffffffffffffULL; // 2^64
     return (unsigned long long)f;
 }
 // Load element `i` (non-half tags). `is_float` selects the exact lane: floats in
@@ -100,6 +107,16 @@ __device__ void load_core(const unsigned char* x, int i, int tag,
         case 7:  *iv = ((const long long*)x)[i];                  *is_float = 0; break; // i64
         case 13: *iv = (long long)((const unsigned long long*)x)[i]; *is_float = 0; break; // u64
         case 9:  *iv = (((const unsigned char*)x)[i] != 0) ? 1 : 0;  *is_float = 0; break; // bool
+        case 21: *iv = (long long)((x[i >> 1] >> ((i & 1) * 4)) & 15); *is_float = 0; break; // u4
+        case 22: {
+            const int code = (x[i >> 1] >> ((i & 1) * 4)) & 15;
+            *iv = (long long)(code >= 8 ? code - 16 : code); *is_float = 0; break; // i4
+        }
+        case 25: *iv = (long long)((x[i >> 2] >> ((i & 3) * 2)) & 3); *is_float = 0; break; // u2
+        case 26: {
+            const int code = (x[i >> 2] >> ((i & 3) * 2)) & 3;
+            *iv = (long long)(code >= 2 ? code - 4 : code); *is_float = 0; break; // i2
+        }
         case 27:
         case 28: *fv = load_float6(x, i, tag); *is_float = 1; break;
         default: *fv = 0.0; *iv = 0; *is_float = 1; break;
@@ -126,26 +143,91 @@ __device__ void store_core(unsigned char* y, int i, int tag,
         case 12: ((unsigned int*)y)[i] =
                  (unsigned int)(is_float ? f_to_ll_sat(fv, 0.0, 4294967295.0) : iv); break; // u32
         case 7:  ((long long*)y)[i] =
-                 (is_float ? f_to_ll_sat(fv, -9223372036854775808.0, 9223372036854775807.0) : iv);
+                 (is_float ? (fv >= 9223372036854775808.0 ? 0x7fffffffffffffffLL
+                            : f_to_ll_sat(fv, -9223372036854775808.0, 9223372036854775808.0)) : iv);
                  break;                                                                      // i64
         case 13: ((unsigned long long*)y)[i] =
-                 (is_float ? f_to_ull_sat(fv, 18446744073709551615.0)
+                 (is_float ? f_to_ull_sat(fv)
                            : (unsigned long long)iv); break;                                // u64
         case 9:  ((unsigned char*)y)[i] =
                  ((is_float ? (fv != 0.0) : (iv != 0)) ? 1 : 0); break;                     // bool
         default: break;
     }
 }
+__device__ __forceinline__ bool load_cast_fp8(const unsigned char* x, int i, int fp8_src,
+                               double* fv, int* is_float) {
+#ifdef CAST_FLOAT8
+    if (fp8_src >= 0) {
+        *fv = decode_fp8(fp8_src, x[i]);
+        *is_float = 1;
+        return true;
+    }
+#endif
+    return false;
+}
+__device__ __forceinline__ bool store_cast_fp8(unsigned char* y, int i, int fp8_dst, int src_tag,
+                                double fv, long long iv, int is_float, int saturate) {
+#ifdef CAST_FLOAT8
+    if (fp8_dst >= 0) {
+        // The E8M0 reference uses f32 for integer inputs; floating inputs use
+        // their exact value. In particular, do not round binary64 to binary32.
+        const double value = is_float ? fv :
+            (fp8_dst >= FP8_E8_FIRST_ROW ? (double)(src_tag == 13 ? (float)(unsigned long long)iv : (float)iv)
+                          : (src_tag == 13 ? (double)(unsigned long long)iv : (double)iv));
+        y[i] = encode_fp8(fp8_dst, value, saturate);
+        return true;
+    }
+#endif
+    return false;
+}
+__device__ int packed_bits(int tag) {
+    return (tag == 21 || tag == 22) ? 4 : ((tag == 25 || tag == 26) ? 2 : 0);
+}
+__device__ unsigned int encode_packed(int tag, double fv, long long iv, int is_float) {
+    const int bits = packed_bits(tag);
+    const unsigned int mask = (1U << bits) - 1U;
+    if (is_float) {
+        if (!isfinite(fv)) return 0;
+        const double modulus = (double)(mask + 1U);
+        double wrapped = fmod(trunc(fv), modulus);
+        if (wrapped < 0.0) wrapped += modulus;
+        return (unsigned int)wrapped;
+    }
+    return (unsigned int)((unsigned long long)iv & mask);
+}
 "#;
 
 /// Header-free core cast entry (no half types).
 const CAST_CORE_ENTRY: &str = r#"
 extern "C" __global__ void cast_core(const unsigned char* x, unsigned char* y,
-                                     const int n, const int src_tag, const int dst_tag) {
+                                     const int n, const int src_tag, const int dst_tag,
+                                     const int fp8_src, const int fp8_dst, const int saturate) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+#ifdef CAST_FLOAT8
+        if (src_tag == dst_tag) { y[i] = x[i]; continue; }
+#endif
         double fv = 0.0; long long iv = 0; int isf = 1;
-        load_core(x, i, src_tag, &fv, &iv, &isf);
-        store_core(y, i, dst_tag, fv, iv, isf);
+        if (!load_cast_fp8(x, i, fp8_src, &fv, &isf)) load_core(x, i, src_tag, &fv, &iv, &isf);
+        if (!store_cast_fp8(y, i, fp8_dst, src_tag, fv, iv, isf, saturate)) {
+            store_core(y, i, dst_tag, fv, iv, isf);
+        }
+    }
+}
+extern "C" __global__ void cast_to_packed(const unsigned char* x, unsigned char* y,
+                                          const int n, const int src_tag, const int dst_tag) {
+    const int bits = packed_bits(dst_tag);
+    const int lanes = 8 / bits;
+    const int bytes = n / lanes + (n % lanes != 0 ? 1 : 0);
+    for (int byte = blockIdx.x * blockDim.x + threadIdx.x; byte < bytes;
+         byte += gridDim.x * blockDim.x) {
+        unsigned int packed = 0;
+        const int base = byte * lanes;
+        for (int lane = 0; lane < lanes && base + lane < n; ++lane) {
+            double fv = 0.0; long long iv = 0; int isf = 1;
+            load_core(x, base + lane, src_tag, &fv, &iv, &isf);
+            packed |= encode_packed(dst_tag, fv, iv, isf) << (lane * bits);
+        }
+        y[byte] = (unsigned char)packed;
     }
 }
 "#;
@@ -167,11 +249,31 @@ __device__ void store_any(unsigned char* y, int i, int tag,
     store_core(y, i, tag, fv, iv, isf);
 }
 extern "C" __global__ void cast_half(const unsigned char* x, unsigned char* y,
-                                     const int n, const int src_tag, const int dst_tag) {
+                                     const int n, const int src_tag, const int dst_tag,
+                                     const int fp8_src, const int fp8_dst, const int saturate) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         double fv = 0.0; long long iv = 0; int isf = 1;
-        load_any(x, i, src_tag, &fv, &iv, &isf);
-        store_any(y, i, dst_tag, fv, iv, isf);
+        if (!load_cast_fp8(x, i, fp8_src, &fv, &isf)) load_any(x, i, src_tag, &fv, &iv, &isf);
+        if (!store_cast_fp8(y, i, fp8_dst, src_tag, fv, iv, isf, saturate)) {
+            store_any(y, i, dst_tag, fv, iv, isf);
+        }
+    }
+}
+extern "C" __global__ void cast_half_to_packed(const unsigned char* x, unsigned char* y,
+                                               const int n, const int src_tag, const int dst_tag) {
+    const int bits = packed_bits(dst_tag);
+    const int lanes = 8 / bits;
+    const int bytes = n / lanes + (n % lanes != 0 ? 1 : 0);
+    for (int byte = blockIdx.x * blockDim.x + threadIdx.x; byte < bytes;
+         byte += gridDim.x * blockDim.x) {
+        unsigned int packed = 0;
+        const int base = byte * lanes;
+        for (int lane = 0; lane < lanes && base + lane < n; ++lane) {
+            double fv = 0.0; long long iv = 0; int isf = 1;
+            load_any(x, base + lane, src_tag, &fv, &iv, &isf);
+            packed |= encode_packed(dst_tag, fv, iv, isf) << (lane * bits);
+        }
+        y[byte] = (unsigned char)packed;
     }
 }
 "#;
@@ -180,7 +282,7 @@ const CAST_CORE_MODULE: &str = "cast_core_f32";
 const CAST_HALF_MODULE: &str = "cast_half_f32";
 
 /// The dtypes this cast kernel supports, keyed by their ONNX code.
-fn is_supported(dt: DataType) -> bool {
+fn is_fixed_width_supported(dt: DataType) -> bool {
     matches!(
         dt,
         DataType::Float32
@@ -204,13 +306,16 @@ fn is_half(dt: DataType) -> bool {
 }
 
 fn cast_pair_supported(src: DataType, dst: DataType) -> bool {
-    if src.is_float6() {
+    if packed_integer(src).is_some() || packed_integer(dst).is_some() {
+        packed_cast_peer_supported(src) && packed_cast_peer_supported(dst)
+    } else if src.is_float6() {
         matches!(
             dst,
             DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
         )
     } else {
-        is_supported(src) && is_supported(dst)
+        let supported = |dtype| is_fixed_width_supported(dtype) || Float8::of(dtype).is_some();
+        supported(src) && supported(dst)
     }
 }
 
@@ -226,14 +331,39 @@ fn grid_for(n: usize) -> u32 {
 /// kernel.
 pub struct CastFactory {
     pub runtime: Arc<CudaRuntime>,
-    pub float6: bool,
+    pub opset: u64,
 }
 
 impl KernelFactory for CastFactory {
-    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        opset: u64,
+        _input_shapes: &[Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        if node.op_type == "CastLike" && opset < 15 {
+            return Some(format!(
+                "CastLike requires opset 15 or newer, got opset {opset}; export the model with a supported CastLike revision"
+            ));
+        }
+        let target = if node.op_type == "Cast" {
+            node.attr("to")
+                .and_then(|attribute| attribute.as_int())
+                .and_then(|raw| DataType::from_onnx(raw as i32))
+        } else {
+            input_dtypes.get(1).copied()
+        };
+        let source = input_dtypes.first().copied();
+        cast_unsupported_reason(&node.op_type, opset, self.opset >= 28, source, target)
+            .or_else(|| float8_cast::unsupported_reason(&node.op_type, self.opset, source, target))
+    }
+
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(CastKernel {
             runtime: self.runtime.clone(),
-            float6: self.float6,
+            float6: self.opset >= 28,
+            attributes: CastAttributes::from_node(node, self.opset),
         }))
     }
 }
@@ -243,6 +373,7 @@ impl KernelFactory for CastFactory {
 pub struct CastKernel {
     runtime: Arc<CudaRuntime>,
     float6: bool,
+    attributes: CastAttributes,
 }
 
 impl CastKernel {
@@ -259,6 +390,17 @@ impl CastKernel {
         let x = &inputs[0];
         let src = x.dtype;
         let dst = outputs[0].dtype;
+        let op = if let Some(like) = inputs.get(1) {
+            if like.dtype != dst {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep CastLike: output dtype {dst:?} must match type-source dtype {:?}",
+                    like.dtype
+                )));
+            }
+            "CastLike"
+        } else {
+            "Cast"
+        };
         if src.is_float6() && !self.float6 {
             return Err(not_implemented(
                 "FLOAT6 widening requires standard Cast at opset 28 or newer",
@@ -266,9 +408,10 @@ impl CastKernel {
         }
         if !cast_pair_supported(src, dst) {
             return Err(not_implemented(format!(
-                "Cast {src:?} to {dst:?}; use f32/f64/f16/bf16/int8-64/uint8-64/bool, or widen a FLOAT6 source to f16, bf16, f32, or f64"
+                "{op} {src:?} to {dst:?}; cast FP8 or packed integers through an ordinary numeric dtype, or widen FLOAT6 to f16, bf16, f32, or f64"
             )));
         }
+        let options = self.attributes.resolve(op, src, dst)?;
         if !x.is_contiguous() || !outputs[0].is_contiguous() {
             return Err(not_implemented(
                 "Cast with a non-contiguous (strided) input/output; \
@@ -288,7 +431,7 @@ impl CastKernel {
         }
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        launch_cast_raw(&self.runtime, x_ptr, src, y_ptr, dst, n)?;
+        launch_cast(&self.runtime, x_ptr, src, y_ptr, dst, n, options)?;
         if self.runtime.is_capturing()? {
             Ok(())
         } else {
@@ -317,6 +460,26 @@ pub(crate) fn launch_cast_raw(
     dst_dtype: DataType,
     n: usize,
 ) -> Result<()> {
+    launch_cast(
+        runtime,
+        src_ptr,
+        src_dtype,
+        dst_ptr,
+        dst_dtype,
+        n,
+        CastOptions::defaults(28),
+    )
+}
+
+fn launch_cast(
+    runtime: &CudaRuntime,
+    src_ptr: CUdeviceptr,
+    src_dtype: DataType,
+    dst_ptr: CUdeviceptr,
+    dst_dtype: DataType,
+    n: usize,
+    options: CastOptions,
+) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
@@ -329,22 +492,51 @@ pub(crate) fn launch_cast_raw(
         .map_err(|_| EpError::KernelFailed(format!("cuda_ep Cast: {n} elements exceed i32")))?;
     let src_tag = src_dtype as i32;
     let dst_tag = dst_dtype as i32;
+    let fp8_src = Float8::of(src_dtype).map_or(-1, Float8::decode_row);
+    let fp8_dst = Float8::of(dst_dtype).map_or(-1, |fmt| fmt.row(options.round));
+    let uses_fp8 = fp8_src >= 0 || fp8_dst >= 0;
+    let saturate = i32::from(options.saturate);
 
     let use_half = is_half(src_dtype) || is_half(dst_dtype);
-    let (module, entry, source) = if use_half {
+    let packed_dst = packed_integer(dst_dtype).is_some();
+    let (module, entry, includes, kernel) = if use_half {
         (
-            CAST_HALF_MODULE,
-            "cast_half",
-            format!(
-                "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n{CAST_HELPERS}{CAST_HALF_ENTRY}"
-            ),
+            if uses_fp8 {
+                "cast_fp8_half"
+            } else {
+                CAST_HALF_MODULE
+            },
+            if packed_dst {
+                "cast_half_to_packed"
+            } else {
+                "cast_half"
+            },
+            "#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n",
+            CAST_HALF_ENTRY,
         )
     } else {
         (
-            CAST_CORE_MODULE,
-            "cast_core",
-            format!("{CAST_HELPERS}{CAST_CORE_ENTRY}"),
+            if uses_fp8 {
+                "cast_fp8_core"
+            } else {
+                CAST_CORE_MODULE
+            },
+            if packed_dst {
+                "cast_to_packed"
+            } else {
+                "cast_core"
+            },
+            "",
+            CAST_CORE_ENTRY,
         )
+    };
+    let source = if uses_fp8 {
+        format!(
+            "{includes}#define CAST_FLOAT8\n{}{CAST_HELPERS}{kernel}",
+            float8_cast::cuda_source()
+        )
+    } else {
+        format!("{includes}{CAST_HELPERS}{kernel}")
     };
 
     let func = runtime.nvrtc_function(module, &source, entry)?;
@@ -360,8 +552,11 @@ pub(crate) fn launch_cast_raw(
         .arg(&n_i)
         .arg(&src_tag)
         .arg(&dst_tag);
-    // SAFETY: `func` is the compiled cast entry; the (const uchar*, uchar*, int,
-    // int, int) argument list matches its signature; the caller guarantees
+    if !packed_dst {
+        builder.arg(&fp8_src).arg(&fp8_dst).arg(&saturate);
+    }
+    // SAFETY: `func` is the compiled cast entry and the arguments match
+    // its signature; the caller guarantees
     // `src_ptr`/`dst_ptr` are live device allocations of `n` elements.
     unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch cast_raw", e))?;
     Ok(())
@@ -413,10 +608,13 @@ mod tests {
 
     #[test]
     fn unsupported_dtypes_are_rejected() {
-        assert!(!is_supported(DataType::Int4));
-        assert!(!is_supported(DataType::Uint4));
-        assert!(is_supported(DataType::Float32));
-        assert!(is_supported(DataType::BFloat16));
+        assert!(cast_pair_supported(DataType::Uint8, DataType::Int4));
+        assert!(cast_pair_supported(DataType::Int2, DataType::Float32));
+        assert!(cast_pair_supported(DataType::Float8E8M0, DataType::Float32));
+        assert!(!cast_pair_supported(DataType::Float8E4M3FN, DataType::Int4));
+        assert!(!cast_pair_supported(DataType::Int2, DataType::Float8E8M0));
+        assert!(is_fixed_width_supported(DataType::Float32));
+        assert!(is_fixed_width_supported(DataType::BFloat16));
     }
 
     #[test]

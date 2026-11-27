@@ -96,7 +96,7 @@ pub fn view_in_bounds(
         });
     }
     // An empty tensor addresses no bytes; the origin itself need not be valid.
-    if numel(shape) == 0 {
+    if shape.contains(&0) {
         return Ok(());
     }
     let (min_elem, max_elem) = addressed_elem_range(shape, strides);
@@ -133,6 +133,84 @@ pub fn view_in_bounds(
         });
     }
     Ok(())
+}
+
+/// Validate fixed-width numeric Host storage before raw scalar/row reads.
+/// Returns the checked logical count; allocation bounds and lifetime remain the
+/// owning EP's contract. No tensor data is read and no payload is allocated.
+pub(crate) fn validate_host_storage<T: crate::dtype::NumericElem>(
+    op: &str,
+    name: &str,
+    view: &onnx_runtime_ep_api::TensorView,
+) -> Result<usize> {
+    view.validate().map_err(|e| {
+        EpError::KernelFailed(format!(
+            "{op}: invalid {name}: {e}; bind valid Host storage"
+        ))
+    })?;
+    if view.dtype != T::DTYPE || !view.device.is_host_accessible() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: {name} must be Host-accessible {:?}, got {:?} on {:?}; explicitly transfer and bind the matching storage type",
+            T::DTYPE,
+            view.dtype,
+            view.device
+        )));
+    }
+    let invalid = || {
+        EpError::KernelFailed(format!(
+            "{op}: {name} shape {:?}, strides {:?}, byte_offset {} has an unaddressable span; bind valid Host backing with representable strides and offsets",
+            view.shape, view.strides, view.byte_offset
+        ))
+    };
+    if size_of::<T>() == 0 {
+        return Err(invalid());
+    }
+    let count = if view.shape.contains(&0) {
+        0
+    } else {
+        view.shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(invalid)?
+    };
+    std::alloc::Layout::array::<T>(count).map_err(|_| invalid())?;
+    let origin = (view.data.0 as usize)
+        .checked_add(view.byte_offset)
+        .ok_or_else(invalid)?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let (mut low, mut high) = (0i128, 0i128);
+    for (&dim, &stride) in view.shape.iter().zip(view.strides) {
+        let extent = ((dim - 1) as i128)
+            .checked_mul(i128::from(stride))
+            .ok_or_else(invalid)?;
+        if extent < 0 {
+            low = low.checked_add(extent).ok_or_else(invalid)?;
+        } else {
+            high = high.checked_add(extent).ok_or_else(invalid)?;
+        }
+    }
+    let span = high
+        .checked_sub(low)
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(size_of::<T>() as i128))
+        .ok_or_else(invalid)?;
+    if span > isize::MAX as i128 {
+        return Err(invalid());
+    }
+    let offset = |n: i128| {
+        n.checked_mul(size_of::<T>() as i128)
+            .and_then(|n| isize::try_from(n).ok())
+            .ok_or_else(invalid)
+    };
+    origin
+        .checked_add_signed(offset(low)?)
+        .ok_or_else(invalid)?;
+    origin
+        .checked_add_signed(offset(high.checked_add(1).ok_or_else(invalid)?)?)
+        .ok_or_else(invalid)?;
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -193,6 +271,12 @@ mod tests {
     #[test]
     fn empty_tensor_is_in_bounds() {
         assert!(view_in_bounds(&[0, 5], &[5, 1], 0, 4, 0).is_ok());
+        for shape in [[0, usize::MAX, 2], [usize::MAX, 0, 2], [usize::MAX, 2, 0]] {
+            assert!(view_in_bounds(&shape, &[i64::MIN; 3], usize::MAX, 4, 0).is_ok());
+            assert!(view_in_bounds(&shape, &[0; 2], 0, 4, 0).is_err());
+        }
+        assert!(view_in_bounds(&[], &[], 0, 4, 0).is_err());
+        assert!(view_in_bounds(&[], &[], 0, 4, 4).is_ok());
     }
 
     /// H-D1 (bounds layer): a view whose `max_elem * esize` would overflow i64

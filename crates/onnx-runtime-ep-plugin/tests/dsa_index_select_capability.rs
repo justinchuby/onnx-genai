@@ -1,4 +1,4 @@
-//! Session-load capability integration for `pkg.nxrt::DsaIndexSelect` v1.
+//! Session-load capability integration for `pkg.nxrt._private::DsaIndexSelect` v1.
 //!
 //! These tests drive the **full** cpu-plugin capability path end-to-end — the
 //! same predicate ORT's `ep_get_capability` applies at session load:
@@ -72,7 +72,7 @@ impl DsaSpec {
     /// and the mandatory `Float32` `attention_bias`.
     fn valid(storage: DataType) -> Self {
         Self {
-            domain: "pkg.nxrt".into(),
+            domain: "pkg.nxrt._private".into(),
             imported_version: 1,
             resolved_schema_version: Some(1),
             query_dtype: storage,
@@ -365,7 +365,7 @@ fn dsa_index_select_capability_rejects_wrong_domain() {
     );
     assert!(
         cap.shape_declined,
-        "plugin shape rule dispatches only pkg.nxrt, so a foreign domain must decline"
+        "plugin shape rule dispatches only pkg.nxrt._private, so a foreign domain must decline"
     );
     assert!(
         !cap.cabi_claimed,
