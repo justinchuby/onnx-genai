@@ -422,13 +422,14 @@ fn every_registered_op_has_a_kernel_registry_entry() {
     use onnx_runtime_ir::is_default_domain;
 
     let (registry, descriptors) = build_cpu_registry_with_descriptors();
-    let is_standalone_roi_align =
-        |domain: &str, op: &str| is_default_domain(domain) && op == "RoiAlign";
+    let is_standalone_roi = |domain: &str, op: &str| {
+        is_default_domain(domain) && matches!(op, "RoiAlign" | "MaxRoiPool")
+    };
     assert!(
         descriptors
             .iter()
-            .all(|d| !is_standalone_roi_align(&d.domain, &d.op_type)),
-        "standalone-only ONNX RoiAlign must not be advertised by the ORT CPU plugin"
+            .all(|d| !is_standalone_roi(&d.domain, &d.op_type)),
+        "standalone-only ONNX ROI kernels must not be advertised by the ORT CPU plugin"
     );
     let described: std::collections::BTreeSet<(String, String)> = descriptors
         .iter()
@@ -437,7 +438,7 @@ fn every_registered_op_has_a_kernel_registry_entry() {
 
     let missing: Vec<String> = registry
         .keys()
-        .filter(|k| !is_standalone_roi_align(&k.domain, &k.op_type))
+        .filter(|k| !is_standalone_roi(&k.domain, &k.op_type))
         .filter(|k| !described.contains(&(k.domain.clone(), k.op_type.clone())))
         .map(|k| format!("{}::{}", k.domain, k.op_type))
         .collect();

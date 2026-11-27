@@ -126,6 +126,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `AveragePool` | `` | ✅ | **cuDNN** / **NVRTC** | Unit dilation keeps the 2-D NCHW cuDNN path (symmetric padding and floor mode only). Non-unit dilation uses a native N-D CUDA kernel (opset ≥19), with explicit or automatic padding, ceil mode, and both divisors. Contiguous f32/f16, plus bf16 in opset ≥22; f64 is not supported. |
 | `LpPool` | `` | ✅ | **NVRTC-custom** | N-D Lp window reduction with positive integer `p`, strides, dilation, explicit/automatic padding, and `ceil_mode`. f16/f32/f64 since opset 18; bf16 since 22. f16 and bf16 accumulate in f32; f64 stays in f64 (`pooling.rs`). |
 | `GlobalAveragePool`, `GlobalMaxPool`, `GlobalLpPool` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank NCHW-style f32/f16/bf16 global spatial reduction. Average, max, and integer-`p` Lp semantics match the CPU EP (`global_reduction.rs`). |
+| `MaxRoiPool` | `` | ✅ | **NVRTC-custom** | NCHW f16/f32/f64 and bf16 from opset 22; quantized ROI bins, clipping, and zero-filled empty bins. Device ROI validation reads back a status word, so CUDA graph capture is not supported. |
 
 ### Elementwise — unary / activations
 
