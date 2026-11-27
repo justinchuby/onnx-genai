@@ -47,6 +47,7 @@ pub mod one_hot;
 pub mod packed_routed;
 pub mod provider;
 pub mod registry;
+pub mod rnn;
 pub mod standard_activation;
 pub mod standard_math;
 pub mod tensor;

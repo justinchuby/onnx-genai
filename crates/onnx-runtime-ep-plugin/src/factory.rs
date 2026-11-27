@@ -1423,6 +1423,92 @@ mod tests {
         assert_eq!(claims[1].node_ids, [nodes[2]]);
     }
 
+    #[test]
+    fn standalone_rnn_exclusion_removes_registry_revisions_and_splits_claims() {
+        use crate::ep::{KernelRegistryEntry, STANDALONE_RNN_EXCLUSION, query_plugin_capabilities};
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, NodeId, static_shape};
+
+        let entry = |domain, op_type, since_version| KernelRegistryEntry {
+            domain,
+            op_type,
+            since_version,
+            end_version: i32::MAX,
+            supported_dtypes: &[DataType::Float32],
+            input_dtype_constraints: &[],
+            output_dtype_constraints: &[],
+        };
+        let mut factory = build_factory(
+            CString::new("test_rnn_factory").unwrap(),
+            Box::new(|| Box::new(CpuExecutionProvider::new())),
+        );
+        factory.kernel_registry_entries = vec![
+            entry("", "RNN", 14),
+            entry("ai.onnx", "RNN", 22),
+            entry("example", "RNN", 1),
+            entry("", "Identity", 19),
+        ];
+        let raw: *mut ExportedFactory = &mut *factory;
+        // SAFETY: the owned factory is live, configured, and has not been exposed.
+        unsafe { exclude_operators(raw.cast(), STANDALONE_RNN_EXCLUSION) };
+        assert_eq!(
+            factory
+                .kernel_registry_entries
+                .iter()
+                .map(|entry| (entry.domain, entry.op_type, entry.since_version))
+                .collect::<Vec<_>>(),
+            [("example", "RNN", 1), ("", "Identity", 19)]
+        );
+
+        let ep = CpuExecutionProvider::new();
+        for revision in [14, 22] {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), revision as u64);
+            let mut value = |name, shape| graph.create_named_value(name, DataType::Float32, shape);
+            let x = value("x", static_shape([1, 1, 1]));
+            let w = value("w", static_shape([1, 1, 1]));
+            let r = value("r", static_shape([1, 1, 1]));
+            let prepared = value("prepared", static_shape([1, 1, 1]));
+            let recurrent = value("recurrent", static_shape([1, 1, 1, 1]));
+            let output = value("output", static_shape([1, 1, 1, 1]));
+            for input in [x, w, r] {
+                graph.add_input(input);
+            }
+            let before = graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(x)],
+                vec![prepared],
+            ));
+            let mut rnn = Node::new(
+                NodeId(1),
+                "RNN",
+                vec![Some(prepared), Some(w), Some(r)],
+                vec![recurrent],
+            );
+            rnn.version = Some(revision);
+            let rnn = graph.insert_node(rnn);
+            let after = graph.insert_node(Node::new(
+                NodeId(2),
+                "Identity",
+                vec![Some(recurrent)],
+                vec![output],
+            ));
+            graph.add_output(output);
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+            let unfiltered = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+            assert!(unfiltered.iter().any(|claim| claim.node_ids.contains(&rnn)));
+
+            let claims =
+                query_plugin_capabilities(&view, &ep, factory.operator_exclusions, |_, _| true)
+                    .unwrap();
+            assert_eq!(claims.len(), 2);
+            assert!(claims.iter().any(|claim| claim.node_ids == [before]));
+            assert!(claims.iter().any(|claim| claim.node_ids == [after]));
+        }
+    }
+
     /// Counts `shutdown()` and `Drop` so a test can tell the explicit teardown
     /// path apart from the Drop-only fallback, and can catch a double shutdown.
     struct CountingEp {
