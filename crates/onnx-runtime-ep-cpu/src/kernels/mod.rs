@@ -596,7 +596,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
-        ("Conv", "") => FLOAT_COMPUTE_DTYPES,
+        ("Conv", "") => onnx_runtime_ir::conv::DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
         ("MaxRoiPool", "") => onnx_runtime_ir::max_roi_pool::DTYPES,
         ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
@@ -1024,8 +1024,14 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
             Box::new(max_roi_pool::Factory(version)),
         );
     }
-    registry.register(
+    registry.register_through(
         OpKey::new("Conv", "", 1),
+        onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET - 1,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(conv::ConvFactory),
+    );
+    registry.register(
+        OpKey::new("Conv", "", onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(conv::ConvFactory),
     );
@@ -1159,12 +1165,20 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                         .iter()
                         .any(|dtype| !matches!(dtype, DataType::String | DataType::Undefined))
                 });
+            let supported_dtypes = if key.op_type == "Conv"
+                && key.domain.is_empty()
+                && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
+            {
+                onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
+            } else {
+                supported_dtypes_for_op(&key.op_type, &key.domain)
+            };
             CpuOpDescriptor {
                 op_type: key.op_type.clone(),
                 domain: key.domain.clone(),
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
-                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+                supported_dtypes,
                 supports_raw_tensor_abi,
             }
         })
@@ -3719,8 +3733,10 @@ mod tests {
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed). Standard
-        // Conv is always registered, using the pure-Rust reference kernel without
-        // `mlas` and the optimized implementation with it.
+        // Conv is registered twice so schema-governed plugin descriptors can
+        // advertise opsets 1-21 and 22+ accurately. Standalone execution uses
+        // the same factory for both ranges and may accept additional
+        // kernel-supported dtypes when the operator semantics are unchanged.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
@@ -3737,7 +3753,7 @@ mod tests {
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 131
+                + 132
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
@@ -4084,6 +4100,23 @@ mod tests {
         for want in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert!(dtypes.contains(&want), "Conv must still advertise {want:?}");
         }
+    }
+
+    #[test]
+    fn conv_descriptors_advertise_bf16_only_from_opset_22() {
+        let (_, descriptors) = shared_registry_with_descriptors();
+        let conv = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.domain.is_empty() && descriptor.op_type == "Conv")
+            .collect::<Vec<_>>();
+        assert_eq!(conv.len(), 2);
+        assert_eq!((conv[0].since_version, conv[0].end_version), (1, 21));
+        assert_eq!(
+            conv[0].supported_dtypes,
+            onnx_runtime_ir::conv::SCHEMA_PRE_BF16_DTYPES
+        );
+        assert_eq!((conv[1].since_version, conv[1].end_version), (22, u64::MAX));
+        assert_eq!(conv[1].supported_dtypes, onnx_runtime_ir::conv::DTYPES);
     }
 
     #[test]

@@ -694,9 +694,18 @@ pub(crate) fn node_passes_dtype_filter(
     } else {
         node.domain.as_str()
     };
-    let entry = entries
+    let matching = entries
         .iter()
-        .find(|e| e.op_type == node.op_type && e.domain == domain);
+        .filter(|entry| entry.op_type == node.op_type && entry.domain == domain)
+        .collect::<Vec<_>>();
+    let entry = match node.version.and_then(|version| i32::try_from(version).ok()) {
+        Some(version) if version > 0 => matching
+            .into_iter()
+            .filter(|entry| entry.since_version <= version && version <= entry.end_version)
+            .max_by_key(|entry| entry.since_version),
+        _ if matching.len() == 1 => matching.into_iter().next(),
+        _ => None,
+    };
     let Some(entry) = entry else {
         return false;
     };
@@ -2295,6 +2304,78 @@ mod tests {
         );
         let node = g.nodes.get(nid).unwrap();
         assert!(!super::node_passes_dtype_filter(node, &g, &entries,));
+    }
+
+    #[test]
+    fn dtype_filter_selects_versioned_conv_dtype_contract() {
+        let entries = vec![
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 1,
+                end_version: 21,
+                supported_dtypes: &[DataType::Float32, DataType::Float16],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 22,
+                end_version: i32::MAX,
+                supported_dtypes: &[DataType::Float32, DataType::Float16, DataType::BFloat16],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+        ];
+        for (version, accepted) in [(21, false), (22, true)] {
+            let (mut graph, id) = graph_with_node(
+                "Conv",
+                "",
+                &[DataType::BFloat16, DataType::BFloat16],
+                &[DataType::BFloat16],
+            );
+            graph.node_mut(id).version = Some(version);
+            assert_eq!(
+                super::node_passes_dtype_filter(graph.node(id), &graph, &entries),
+                accepted,
+                "BF16 Conv schema version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn dtype_filter_rejects_ambiguous_versioned_contract_without_node_version() {
+        let entries = vec![
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 1,
+                end_version: 21,
+                supported_dtypes: &[DataType::Float32],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+            KernelRegistryEntry {
+                op_type: "Conv",
+                domain: "",
+                since_version: 22,
+                end_version: i32::MAX,
+                supported_dtypes: &[DataType::Float32, DataType::BFloat16],
+                input_dtype_constraints: &[],
+                output_dtype_constraints: &[],
+            },
+        ];
+        let (graph, id) = graph_with_node(
+            "Conv",
+            "",
+            &[DataType::Float32, DataType::Float32],
+            &[DataType::Float32],
+        );
+        assert!(
+            !super::node_passes_dtype_filter(graph.node(id), &graph, &entries),
+            "multiple versioned contracts require the schema version read from ORT"
+        );
     }
 
     /// The union of an op's edge dtypes is not its kernel's rule.
