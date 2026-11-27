@@ -43,6 +43,76 @@ fn assert_float_outputs(label: &str, dtype: DataType, cuda: &[Vec<u8>], cpu: &[V
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn affine_grid_f64_matches_cpu_and_preserves_double_precision() {
+    let ep = require_cuda();
+    let dtype = DataType::Float64;
+    // The scale rounds to 1.0 in f32; non-dyadic coordinates also expose f32 intermediates.
+    let delta = 2f64.powi(-30);
+    let scale = 1.0 + delta;
+    for (align_corners, xs, zs) in [
+        (0, [-2.0 / 3.0, 0.0, 2.0 / 3.0], [-0.5, 0.5]),
+        (1, [-1.0, 0.0, 1.0], [-1.0, 1.0]),
+    ] {
+        let attrs = [("align_corners", Attribute::Int(align_corners))];
+        let expected_2d: Vec<f64> = xs.iter().flat_map(|&x| [scale * x, scale]).collect();
+        let expected_3d: Vec<f64> = zs
+            .iter()
+            .flat_map(|&z| {
+                xs.into_iter()
+                    .flat_map(move |x| [scale * x + z, z + scale, x - z + delta])
+            })
+            .collect();
+        for (theta_shape, theta, size, output_shape, expected) in [
+            (
+                vec![1, 2, 3],
+                vec![scale, 0.25, 0.0, 0.0, 1.0, scale],
+                vec![1i64, 1, 1, 3],
+                vec![1, 1, 3, 2],
+                expected_2d,
+            ),
+            (
+                vec![1, 3, 4],
+                vec![
+                    scale, 0.25, 1.0, 0.0, 0.0, 1.0, 1.0, scale, 1.0, 0.5, -1.0, delta,
+                ],
+                vec![1, 1, 2, 1, 3],
+                vec![1, 2, 1, 3, 3],
+                expected_3d,
+            ),
+        ] {
+            let inputs = [
+                input(dtype, &theta_shape, &theta),
+                input(DataType::Int64, &[size.len()], &size),
+            ];
+            let outputs = [(dtype, output_shape)];
+            let cuda = run_cuda(&ep, "AffineGrid", "", 20, &inputs, &outputs, &attrs);
+            let cpu = run_cpu("AffineGrid", "", 20, &inputs, &outputs, &attrs);
+            assert_eq!(cuda[0].len(), expected.len() * size_of::<f64>());
+            assert_eq!(cpu[0].len(), cuda[0].len());
+            for (index, ((cuda, cpu), expected)) in cuda[0]
+                .chunks_exact(size_of::<f64>())
+                .zip(cpu[0].chunks_exact(size_of::<f64>()))
+                .zip(expected)
+                .enumerate()
+            {
+                let cuda = f64::from_ne_bytes(cuda.try_into().unwrap());
+                let cpu = f64::from_ne_bytes(cpu.try_into().unwrap());
+                assert!(
+                    (cuda - expected).abs() <= 1e-14
+                        && (cpu - expected).abs() <= 1e-14
+                        && (cuda - cpu).abs() <= 1e-14,
+                    "AffineGrid {theta_shape:?}, align_corners={align_corners}, index {index}: CUDA {cuda}, CPU {cpu}, expected {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn affine_grid_matches_cpu_for_two_and_three_dimensional_grids() {
     let ep = require_cuda();
     for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {

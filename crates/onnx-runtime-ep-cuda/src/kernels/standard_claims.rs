@@ -96,7 +96,7 @@ const CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, D
 
 fn affine_grid(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "theta")?;
+    super::data_transform::AffineGridDtype::from_theta(input_dtypes[0])?;
     require_dtype(input_dtypes, 1, DataType::Int64, "size")?;
     bool_attribute(node, "align_corners")
 }
