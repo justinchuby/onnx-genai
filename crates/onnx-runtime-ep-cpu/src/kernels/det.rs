@@ -84,7 +84,7 @@ fn determinant(a: &mut [f64], n: usize) -> f64 {
     }
     // Keep an independent exponent so intermediate pivot products cannot
     // overflow or underflow when the final result is representable.
-    let (mut mantissa, mut exponent) = (1.0, 0_i64);
+    let (mut mantissa, mut exponent) = (1.0_f64, 0_i64);
     for k in 0..n {
         let mut pivot = k;
         let mut max = a[k * n + k].abs();
