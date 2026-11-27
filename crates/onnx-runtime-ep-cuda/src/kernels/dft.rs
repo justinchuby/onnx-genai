@@ -15,6 +15,7 @@ use onnx_runtime_ep_api::{
     CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
+use onnx_runtime_ir::dft::{self as dft_rules, DftMode};
 use onnx_runtime_ir::{DataType, Node, Shape, TensorLayout};
 
 use crate::cufft::{CufftPlan, CufftPlanCache, CufftPlanKey, DftDirection, DftInputKind};
@@ -23,22 +24,57 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 const WORKSPACE_ALIGNMENT: usize = 256;
-const MODULE: &str = "dft_pack_v1";
+const MODULE: &str = "dft_pack_v2";
 const SOURCE: &str = r#"
-extern "C" __global__ void dft_pack_f32(
-    const float* input, float2* packed, const unsigned long long* metadata,
-    int rank, int axis, unsigned long long signal_length,
+template <typename T> struct Direct {
+    using Storage = T;
+    __device__ static T load(T value) { return value; }
+    __device__ static T store(T value) { return value; }
+};
+
+struct Half {
+    using Storage = unsigned short;
+    __device__ static float load(Storage value) {
+        float result;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(value));
+        return result;
+    }
+    __device__ static Storage store(float value) {
+        Storage result;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(value));
+        return result;
+    }
+};
+
+struct BFloat {
+    using Storage = unsigned short;
+    __device__ static float load(Storage value) {
+        return __uint_as_float((unsigned int)value << 16);
+    }
+    __device__ static Storage store(float value) {
+        unsigned int bits = __float_as_uint(value);
+        if ((bits & 0x7fffffffu) > 0x7f800000u) return (bits >> 16) | 0x0040u;
+        return (bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16;
+    }
+};
+
+template <typename Codec, typename Packed>
+__device__ void dft_pack(
+    const typename Codec::Storage* input, Packed* packed, const unsigned long long* metadata,
+    int rank, int axis, unsigned long long signal_length, unsigned long long input_bins,
     unsigned long long dft_length, unsigned long long batch,
-    int complex_components) {
+    int complex_components, int inverse_real) {
   const unsigned long long* dims = metadata;
   const unsigned long long* strides = metadata + rank;
   const unsigned long long total = batch * dft_length;
   for (unsigned long long index = blockIdx.x * blockDim.x + threadIdx.x;
        index < total;
        index += (unsigned long long)gridDim.x * blockDim.x) {
-    const unsigned long long signal_index = index % dft_length;
+    const unsigned long long bin = index % dft_length;
+    const bool mirrored = inverse_real && bin >= input_bins;
+    const unsigned long long signal_index = mirrored ? dft_length - bin : bin;
     unsigned long long batch_index = index / dft_length;
-    float2 value = make_float2(0.0f, 0.0f);
+    Packed value = {};
     if (signal_index < signal_length) {
       unsigned long long offset = signal_index * strides[axis];
       for (int dim = rank - 2; dim >= 0; --dim) {
@@ -47,17 +83,23 @@ extern "C" __global__ void dft_pack_f32(
         batch_index /= dims[dim];
         offset += coordinate * strides[dim];
       }
-      value.x = input[offset];
-      if (complex_components == 2) value.y = input[offset + 1];
+      value.x = Codec::load(input[offset]);
+      // DC and even Nyquist are real even when their supplied imaginary values are nonzero.
+      if (complex_components == 2 &&
+          (!inverse_real || (bin != 0 && bin != dft_length - bin))) {
+        value.y = Codec::load(input[offset + 1]);
+        if (mirrored) value.y = -value.y;
+      }
     }
     packed[index] = value;
   }
 }
 
-extern "C" __global__ void dft_unpack_f32(
-    const float2* packed, float* output, const unsigned long long* metadata,
+template <typename Codec, typename Packed, typename Compute>
+__device__ void dft_unpack(
+    const Packed* packed, typename Codec::Storage* output, const unsigned long long* metadata,
     int rank, int axis, unsigned long long dft_length,
-    unsigned long long output_length, unsigned long long batch, float scale) {
+    unsigned long long output_length, unsigned long long batch, int output_components, Compute scale) {
   const unsigned long long* dims = metadata + 2 * rank;
   const unsigned long long* strides = metadata + 3 * rank;
   const unsigned long long total = batch * output_length;
@@ -73,11 +115,32 @@ extern "C" __global__ void dft_unpack_f32(
       batch_index /= dims[dim];
       offset += coordinate * strides[dim];
     }
-    const float2 value = packed[(index / output_length) * dft_length + signal_index];
-    output[offset] = value.x * scale;
-    output[offset + 1] = value.y * scale;
+    const Packed value = packed[(index / output_length) * dft_length + signal_index];
+    output[offset] = Codec::store(value.x * scale);
+    if (output_components == 2) output[offset + 1] = Codec::store(value.y * scale);
   }
 }
+
+#define DFT_KERNELS(SUFFIX, CODEC, PACKED, COMPUTE) \
+extern "C" __global__ void dft_pack_##SUFFIX( \
+    const CODEC::Storage* input, PACKED* packed, const unsigned long long* metadata, \
+    int rank, int axis, unsigned long long signal_length, unsigned long long input_bins, \
+    unsigned long long dft_length, unsigned long long batch, int components, int inverse_real) { \
+    dft_pack<CODEC>(input, packed, metadata, rank, axis, signal_length, input_bins, \
+                    dft_length, batch, components, inverse_real); \
+} \
+extern "C" __global__ void dft_unpack_##SUFFIX( \
+    const PACKED* packed, CODEC::Storage* output, const unsigned long long* metadata, \
+    int rank, int axis, unsigned long long dft_length, unsigned long long output_length, \
+    unsigned long long batch, int components, COMPUTE scale) { \
+    dft_unpack<CODEC>(packed, output, metadata, rank, axis, dft_length, output_length, \
+                      batch, components, scale); \
+}
+
+DFT_KERNELS(f32, Direct<float>, float2, float)
+DFT_KERNELS(f64, Direct<double>, double2, double)
+DFT_KERNELS(f16, Half, float2, float)
+DFT_KERNELS(bf16, BFloat, float2, float)
 "#;
 
 pub(crate) struct DftFactory {
@@ -87,46 +150,33 @@ pub(crate) struct DftFactory {
 
 impl KernelFactory for DftFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        reject_real_inverse(node).map_err(EpError::KernelFailed)?;
-        let inverse = bool_attr(node, "inverse")?;
-        let onesided = bool_attr(node, "onesided")?;
-        let default_axis = if node.local_opset().unwrap_or(17) >= 20 {
-            -2
-        } else {
-            1
-        };
+        let opset = node.local_opset().unwrap_or(17);
+        let mode = supported_mode(node, opset).map_err(dft_error)?;
         Ok(Box::new(DftKernel {
             runtime: self.runtime.clone(),
             plans: self.plans.clone(),
-            inverse,
-            onesided,
-            axis_attr: node.attr("axis").and_then(|attribute| attribute.as_int()),
-            default_axis,
+            mode,
+            opset,
+            default_axis: dft_rules::default_axis(node, opset),
             prepared_plan: Mutex::new(None),
         }))
     }
 }
 
-fn reject_real_inverse(node: &Node) -> std::result::Result<(), String> {
-    if onnx_runtime_ir::dft::DftMode::parse(node)? == onnx_runtime_ir::dft::DftMode::RealInverse {
-        Err("CUDA DFT: inverse=1, onesided=1 (IRFFT) needs Hermitian spectrum reconstruction and real output, which this cuFFT adapter does not implement; select the CPU EP for IRFFT".into())
-    } else {
-        Ok(())
+fn supported_mode(node: &Node, opset: u64) -> std::result::Result<DftMode, String> {
+    let mode = DftMode::parse(node)?;
+    if opset < 20 && mode == DftMode::RealInverse {
+        return Err(
+            "CUDA IRFFT requires DFT opset 20 or newer; select the CPU EP for opset 17".into(),
+        );
     }
-}
-
-fn bool_attr(node: &Node, name: &str) -> Result<bool> {
-    match node.attr(name).and_then(|attribute| attribute.as_int()) {
-        None | Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        Some(value) => Err(EpError::KernelFailed(format!(
-            "cuda_ep DFT: attribute '{name}' must be 0 or 1, got {value}"
-        ))),
-    }
+    Ok(mode)
 }
 
 #[derive(Clone, Debug)]
 struct DftSpec {
+    dtype: DataType,
+    mode: DftMode,
     input_shape: Vec<usize>,
     output_shape: Vec<usize>,
     axis: usize,
@@ -139,10 +189,18 @@ struct DftSpec {
 }
 
 impl DftSpec {
+    fn packed_dtype(&self) -> DataType {
+        if self.dtype == DataType::Float64 {
+            DataType::Float64
+        } else {
+            DataType::Float32
+        }
+    }
+
     fn key(&self, device: u32) -> CufftPlanKey {
         CufftPlanKey {
             device,
-            dtype: DataType::Float32,
+            dtype: self.packed_dtype(),
             input_kind: self.input_kind,
             rank: self.input_shape.len(),
             axis: self.axis,
@@ -171,7 +229,7 @@ impl WorkspaceLayout {
         let packed_bytes = spec
             .batch
             .checked_mul(spec.dft_length)
-            .and_then(|elements| elements.checked_mul(2 * std::mem::size_of::<f32>()))
+            .and_then(|elements| elements.checked_mul(2 * spec.packed_dtype().storage_bytes(1)))
             .ok_or_else(|| {
                 EpError::KernelFailed("cuda_ep DFT: packed complex workspace size overflow".into())
             })?;
@@ -203,18 +261,19 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 struct DftKernel {
     runtime: Arc<CudaRuntime>,
     plans: Arc<CufftPlanCache>,
-    inverse: bool,
-    onesided: bool,
-    axis_attr: Option<i64>,
+    mode: DftMode,
+    opset: u64,
     default_axis: i64,
     prepared_plan: Mutex<Option<(CufftPlanKey, Arc<Mutex<CufftPlan>>)>>,
 }
 
 impl DftKernel {
     fn resolve_from_views(&self, inputs: &[TensorView]) -> Result<DftSpec> {
-        if inputs.is_empty() || inputs.len() > 3 {
+        let max_inputs = if self.opset >= 20 { 3 } else { 2 };
+        if inputs.is_empty() || inputs.len() > max_inputs {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep DFT: expected 1..=3 inputs, got {}",
+                "cuda_ep DFT: opset {} expects 1..={max_inputs} inputs, got {}",
+                self.opset,
                 inputs.len()
             )));
         }
@@ -224,27 +283,15 @@ impl DftKernel {
                 "cuda_ep DFT: data input must be present".into(),
             ));
         }
-        if input.dtype != DataType::Float32 {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep DFT: data input must be Float32, got {:?}; unsupported dtypes must \
-                 decline at placement time",
-                input.dtype
-            )));
-        }
         let axis = if let Some(axis) = present_input(inputs, 2) {
-            scalar_i64(&self.runtime, axis, "axis")?
+            scalar_int(&self.runtime, axis, 2, self.opset)?
         } else {
-            self.axis_attr.unwrap_or(self.default_axis)
+            self.default_axis
         };
-        let normalized_axis = normalize_axis(axis, input.shape.len())?;
-        let dft_length = if let Some(length) = present_input(inputs, 1) {
-            scalar_i64(&self.runtime, length, "dft_length")?
-        } else {
-            i64::try_from(input.shape[normalized_axis]).map_err(|_| {
-                EpError::KernelFailed("cuda_ep DFT: input signal length exceeds i64".into())
-            })?
-        };
-        make_spec(input.shape, axis, dft_length, self.inverse, self.onesided)
+        let dft_length = present_input(inputs, 1)
+            .map(|length| scalar_int(&self.runtime, length, 1, self.opset))
+            .transpose()?;
+        self.spec(input.shape, input.dtype, axis, dft_length)
     }
 
     fn resolve_from_metadata(&self, inputs: &[TensorMetadata<'_>]) -> Result<Option<DftSpec>> {
@@ -256,18 +303,23 @@ impl DftKernel {
         {
             return Ok(None);
         }
-        let axis = self.axis_attr.unwrap_or(self.default_axis);
-        let signal_length = input.shape[normalize_axis(axis, input.shape.len())?];
-        let dft_length = i64::try_from(signal_length).map_err(|_| {
-            EpError::KernelFailed("cuda_ep DFT: input signal length exceeds i64".into())
-        })?;
-        Ok(Some(make_spec(
+        Ok(Some(self.spec(
             input.shape,
-            axis,
-            dft_length,
-            self.inverse,
-            self.onesided,
+            input.dtype,
+            self.default_axis,
+            None,
         )?))
+    }
+
+    fn spec(
+        &self,
+        shape: &[usize],
+        dtype: DataType,
+        axis: i64,
+        length: Option<i64>,
+    ) -> Result<DftSpec> {
+        data_kernels(self.opset, dtype).map_err(dft_error)?;
+        make_spec(shape, dtype, axis, length, self.mode)
     }
 
     fn plan(&self, spec: &DftSpec) -> Result<Arc<Mutex<CufftPlan>>> {
@@ -362,9 +414,8 @@ impl DftKernel {
             .checked_add(layout.work_offset as u64)
             .ok_or_else(|| EpError::KernelFailed("cuda_ep DFT: work pointer overflow".into()))?;
 
-        let pack = self
-            .runtime
-            .nvrtc_function(MODULE, SOURCE, "dft_pack_f32")?;
+        let (pack_name, unpack_name) = data_kernels(self.opset, spec.dtype).map_err(dft_error)?;
+        let pack = self.runtime.nvrtc_function(MODULE, SOURCE, pack_name)?;
         let input = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let rank = i32::try_from(spec.input_shape.len())
             .map_err(|_| EpError::KernelFailed("cuda_ep DFT: input rank exceeds i32".into()))?;
@@ -372,6 +423,8 @@ impl DftKernel {
             .map_err(|_| EpError::KernelFailed("cuda_ep DFT: axis exceeds i32".into()))?;
         let signal_length = spec.signal_length as u64;
         let dft_length = spec.dft_length as u64;
+        let input_bins = spec.mode.input_length(spec.dft_length) as u64;
+        let inverse_real = i32::from(spec.mode == DftMode::RealInverse);
         let batch = spec.batch as u64;
         let complex_components = match spec.input_kind {
             DftInputKind::Real => 1i32,
@@ -388,9 +441,11 @@ impl DftKernel {
             .arg(&rank)
             .arg(&axis)
             .arg(&signal_length)
+            .arg(&input_bins)
             .arg(&dft_length)
             .arg(&batch)
-            .arg(&complex_components);
+            .arg(&complex_components)
+            .arg(&inverse_real);
         // SAFETY: pointers and scalar extents were validated against the input
         // tensor and governed workspace above.
         unsafe { builder.launch(launch_config(packed_elements)) }
@@ -400,7 +455,7 @@ impl DftKernel {
             let mut plan = plan.lock().map_err(|_| {
                 EpError::KernelFailed("cuda_ep DFT: cuFFT plan lock was poisoned".into())
             })?;
-            // SAFETY: `packed` covers batch*dft_length complex f32 values and
+            // SAFETY: `packed` covers batch*dft_length complex values of the plan's precision and
             // `work` covers the exact work size queried from this plan.
             unsafe {
                 plan.execute(
@@ -414,13 +469,17 @@ impl DftKernel {
             }
         }
 
-        let unpack = self
-            .runtime
-            .nvrtc_function(MODULE, SOURCE, "dft_unpack_f32")?;
+        let unpack = self.runtime.nvrtc_function(MODULE, SOURCE, unpack_name)?;
         let output = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let output_length = spec.output_length as u64;
-        let scale = if self.inverse {
+        let output_components = spec.mode.output_components() as i32;
+        let scale_f32 = if spec.mode.inverse() {
             1.0f32 / spec.dft_length as f32
+        } else {
+            1.0
+        };
+        let scale_f64 = if spec.mode.inverse() {
+            1.0f64 / spec.dft_length as f64
         } else {
             1.0
         };
@@ -437,9 +496,14 @@ impl DftKernel {
             .arg(&dft_length)
             .arg(&output_length)
             .arg(&batch)
-            .arg(&scale);
+            .arg(&output_components);
+        if spec.dtype == DataType::Float64 {
+            builder.arg(&scale_f64);
+        } else {
+            builder.arg(&scale_f32);
+        }
         // SAFETY: packed/output pointers and metadata describe the validated
-        // contiguous tensors, and every indexed output has two f32 components.
+        // contiguous tensors, with one or two output components per sample.
         unsafe { builder.launch(launch_config(output_elements)) }
             .map_err(|error| driver_err("launching DFT unpack kernel", error))?;
         Ok(())
@@ -498,10 +562,10 @@ impl Kernel for DftKernel {
 
 fn make_spec(
     input_shape: &[usize],
+    dtype: DataType,
     axis_raw: i64,
-    dft_length_raw: i64,
-    inverse: bool,
-    onesided: bool,
+    length: Option<i64>,
+    mode: DftMode,
 ) -> Result<DftSpec> {
     let rank = input_shape.len();
     if rank < 2 {
@@ -509,35 +573,23 @@ fn make_spec(
             "cuda_ep DFT: input rank must be at least 2 (signal plus complex component), got {rank}"
         )));
     }
-    let axis = normalize_axis(axis_raw, rank)?;
+    let axis = dft_rules::normalize_axis(axis_raw, rank).map_err(dft_error)?;
     let complex_components = input_shape[rank - 1];
-    let input_kind = match complex_components {
-        1 => DftInputKind::Real,
-        2 => DftInputKind::Complex,
-        value => {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep DFT: last input dimension must be 1 (real) or 2 (complex), got {value}"
-            )));
-        }
-    };
-    if onesided && input_kind != DftInputKind::Real {
-        return Err(EpError::KernelFailed(
-            "cuda_ep DFT: onesided=1 is valid only for real input (last dimension 1)".into(),
-        ));
-    }
-    let dft_length = usize::try_from(dft_length_raw)
-        .ok()
-        .filter(|length| *length > 0)
-        .ok_or_else(|| {
-            EpError::KernelFailed(format!(
-                "cuda_ep DFT: dft_length must be positive, got {dft_length_raw}"
-            ))
-        })?;
-    let output_length = if onesided {
-        dft_length / 2 + 1
+    mode.validate_components(complex_components)
+        .map_err(dft_error)?;
+    let input_kind = if complex_components == 1 {
+        DftInputKind::Real
     } else {
-        dft_length
+        DftInputKind::Complex
     };
+    let explicit = length
+        .map(dft_rules::explicit_length)
+        .transpose()
+        .map_err(dft_error)?;
+    let dft_length = explicit
+        .map_or_else(|| mode.default_length(input_shape[axis]), Ok)
+        .map_err(dft_error)?;
+    let output_length = mode.output_length(dft_length);
     let batch = input_shape
         .iter()
         .enumerate()
@@ -549,8 +601,10 @@ fn make_spec(
         })?;
     let mut output_shape = input_shape.to_vec();
     output_shape[axis] = output_length;
-    output_shape[rank - 1] = 2;
+    output_shape[rank - 1] = mode.output_components();
     Ok(DftSpec {
+        dtype,
+        mode,
         input_shape: input_shape.to_vec(),
         output_shape,
         axis,
@@ -559,7 +613,7 @@ fn make_spec(
         output_length,
         batch,
         input_kind,
-        direction: if inverse {
+        direction: if mode.inverse() {
             DftDirection::Inverse
         } else {
             DftDirection::Forward
@@ -567,36 +621,73 @@ fn make_spec(
     })
 }
 
-fn normalize_axis(axis: i64, rank: usize) -> Result<usize> {
-    let rank_i64 = i64::try_from(rank)
-        .map_err(|_| EpError::KernelFailed("cuda_ep DFT: input rank exceeds i64".into()))?;
-    let normalized = if axis < 0 { axis + rank_i64 } else { axis };
-    if normalized < 0 || normalized >= rank_i64 - 1 {
-        return Err(EpError::KernelFailed(format!(
-            "cuda_ep DFT: axis {axis} is invalid for rank {rank}; the last dimension is the \
-             complex component and cannot be transformed"
-        )));
+fn dft_error(reason: String) -> EpError {
+    EpError::KernelFailed(format!("cuda_ep DFT: {reason}"))
+}
+
+fn data_kernels(
+    opset: u64,
+    dtype: DataType,
+) -> std::result::Result<(&'static str, &'static str), String> {
+    match (opset >= 20, dtype) {
+        (_, DataType::Float32) => Ok(("dft_pack_f32", "dft_unpack_f32")),
+        (true, DataType::Float64) => Ok(("dft_pack_f64", "dft_unpack_f64")),
+        (true, DataType::Float16) => Ok(("dft_pack_f16", "dft_unpack_f16")),
+        (true, DataType::BFloat16) => Ok(("dft_pack_bf16", "dft_unpack_bf16")),
+        _ => Err(format!(
+            "unsupported data dtype {dtype:?} for DFT opset {opset} on CUDA"
+        )),
     }
-    Ok(normalized as usize)
 }
 
 fn present_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a TensorView<'a>> {
     inputs.get(index).filter(|input| !input.is_absent())
 }
 
-fn scalar_i64(runtime: &CudaRuntime, input: &TensorView, name: &str) -> Result<i64> {
-    if input.dtype != DataType::Int64 || input.numel() != 1 || !input.is_contiguous() {
-        return Err(EpError::KernelFailed(format!(
-            "cuda_ep DFT: {name} must be a contiguous Int64 scalar, got dtype {:?}, shape {:?}",
-            input.dtype, input.shape
+fn validate_scalar_dtype(
+    dtype: DataType,
+    index: usize,
+    opset: u64,
+) -> std::result::Result<(), String> {
+    let length_v20 = index == 1 && opset >= 20;
+    if dtype == DataType::Int64 || (length_v20 && dft_rules::is_length_dtype(dtype)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} must have dtype {}, got {dtype:?}",
+            if index == 1 { "dft_length" } else { "axis" },
+            if length_v20 {
+                "Int32 or Int64"
+            } else {
+                "Int64"
+            }
+        ))
+    }
+}
+
+fn scalar_int(runtime: &CudaRuntime, input: &TensorView, index: usize, opset: u64) -> Result<i64> {
+    validate_scalar_dtype(input.dtype, index, opset).map_err(dft_error)?;
+    if !input.shape.is_empty() || !input.is_contiguous() {
+        return Err(dft_error(format!(
+            "{} must be a contiguous rank-zero scalar, got shape {:?}",
+            if index == 1 { "dft_length" } else { "axis" },
+            input.shape
         )));
     }
     let mut bytes = [0u8; std::mem::size_of::<i64>()];
-    // SAFETY: the validated scalar input covers exactly eight readable bytes.
+    let size = input.dtype.storage_bytes(1);
+    // SAFETY: the validated scalar input covers exactly `size` readable bytes.
     unsafe {
-        runtime.dtoh(&mut bytes, cuptr(input.data_ptr::<u8>() as *const c_void))?;
+        runtime.dtoh(
+            &mut bytes[..size],
+            cuptr(input.data_ptr::<u8>() as *const c_void),
+        )?;
     }
-    Ok(i64::from_ne_bytes(bytes))
+    Ok(if input.dtype == DataType::Int32 {
+        i64::from(i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    } else {
+        i64::from_ne_bytes(bytes)
+    })
 }
 
 fn validate_io(input: &TensorView, output: &TensorMut, spec: &DftSpec) -> Result<()> {
@@ -607,10 +698,10 @@ fn validate_io(input: &TensorView, output: &TensorMut, spec: &DftSpec) -> Result
                 .into(),
         ));
     }
-    if output.dtype != DataType::Float32 {
+    if output.dtype != spec.dtype {
         return Err(EpError::KernelFailed(format!(
-            "cuda_ep DFT: output must be Float32, got {:?}",
-            output.dtype
+            "cuda_ep DFT: output dtype must match input {:?}, got {:?}",
+            spec.dtype, output.dtype
         )));
     }
     if output.shape != spec.output_shape {
@@ -670,30 +761,34 @@ pub(crate) fn unsupported_reason(
     input_layouts: &[TensorLayout],
 ) -> Option<String> {
     let reject = || -> std::result::Result<(), String> {
-        reject_real_inverse(node)?;
-        if node.outputs.len() != 1 || node.inputs.is_empty() || node.inputs.len() > 3 {
-            return Err("requires 1..=3 inputs and exactly 1 output".into());
+        let max_inputs = if opset >= 20 { 3 } else { 2 };
+        if node.outputs.len() != 1 || node.inputs.is_empty() || node.inputs.len() > max_inputs {
+            return Err(format!(
+                "opset {opset} requires 1..={max_inputs} inputs and exactly 1 output"
+            ));
         }
         if node.inputs[0].is_none() {
             return Err("data input must be present".into());
         }
-        if input_dtypes.first() != Some(&DataType::Float32) {
-            return Err(format!(
-                "data input dtype must be Float32 for the cuFFT path, got {:?}",
-                input_dtypes.first().copied().unwrap_or(DataType::Undefined)
-            ));
-        }
+        data_kernels(
+            opset,
+            input_dtypes.first().copied().unwrap_or(DataType::Undefined),
+        )?;
         for (index, name) in [(1usize, "dft_length"), (2usize, "axis")] {
-            if node.inputs.get(index).is_some_and(Option::is_some)
-                && input_dtypes.get(index) != Some(&DataType::Int64)
-            {
-                return Err(format!(
-                    "input {index} ('{name}') must be Int64, got {:?}",
+            if node.inputs.get(index).is_some_and(Option::is_some) {
+                validate_scalar_dtype(
                     input_dtypes
                         .get(index)
                         .copied()
-                        .unwrap_or(DataType::Undefined)
-                ));
+                        .unwrap_or(DataType::Undefined),
+                    index,
+                    opset,
+                )?;
+                if let Some(shape) = input_shapes.get(index)
+                    && !shape.is_empty()
+                {
+                    return Err(format!("{name} must be a rank-zero scalar, got {shape:?}"));
+                }
             }
         }
         let shape = input_shapes
@@ -711,36 +806,18 @@ pub(crate) fn unsupported_reason(
         {
             return Err("data input layout must be contiguous".into());
         }
-        let complex_components = shape.last().and_then(|dimension| dimension.as_static());
-        if !matches!(complex_components, None | Some(1 | 2)) {
-            return Err(format!(
-                "last input dimension must be 1 (real) or 2 (complex), got {complex_components:?}"
-            ));
-        }
-        let onesided = match node
-            .attr("onesided")
-            .and_then(|attribute| attribute.as_int())
-        {
-            None | Some(0) => false,
-            Some(1) => true,
-            Some(value) => return Err(format!("attribute 'onesided' must be 0 or 1, got {value}")),
-        };
-        match node
-            .attr("inverse")
-            .and_then(|attribute| attribute.as_int())
-        {
-            None | Some(0 | 1) => {}
-            Some(value) => return Err(format!("attribute 'inverse' must be 0 or 1, got {value}")),
-        }
-        if onesided && complex_components == Some(2) {
-            return Err("onesided=1 is valid only for real input (last dimension 1)".into());
+        let mode = supported_mode(node, opset)?;
+        if let Some(components) = shape.last().and_then(|dimension| dimension.as_static()) {
+            mode.validate_components(components)?;
         }
         if node.inputs.get(2).is_none_or(Option::is_none) {
-            let axis = node
-                .attr("axis")
-                .and_then(|attribute| attribute.as_int())
-                .unwrap_or(if opset >= 20 { -2 } else { 1 });
-            normalize_axis(axis, shape.len()).map_err(|error| error.to_string())?;
+            let axis =
+                dft_rules::normalize_axis(dft_rules::default_axis(node, opset), shape.len())?;
+            if node.inputs.get(1).is_none_or(Option::is_none)
+                && let Some(extent) = shape[axis].as_static()
+            {
+                mode.default_length(extent)?;
+            }
         }
         Ok(())
     };
@@ -752,39 +829,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn real_inverse_is_declined_before_any_cuda_runtime_access() {
-        let mut node = Node::new(
-            onnx_runtime_ir::NodeId(0),
-            "DFT",
-            vec![Some(onnx_runtime_ir::ValueId(0))],
-            vec![onnx_runtime_ir::ValueId(1)],
-        );
-        node.attributes
-            .insert("inverse".into(), onnx_runtime_ir::Attribute::Int(1));
-        node.attributes
-            .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
-        let error = reject_real_inverse(&node).unwrap_err();
-        assert!(
-            error.contains("IRFFT") && error.contains("CPU EP"),
-            "{error}"
-        );
-        let reason = unsupported_reason(
-            &node,
-            20,
-            &[onnx_runtime_ir::static_shape([1, 3, 2])],
-            &[DataType::Float32],
-            &[],
-        )
-        .unwrap();
-        assert!(
-            reason.contains("Hermitian spectrum reconstruction"),
-            "{reason}"
-        );
+    fn opset17_real_inverse_still_declines_before_runtime_access() {
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "DFT", vec![], vec![]);
+        for name in ["inverse", "onesided"] {
+            node.attributes
+                .insert(name.into(), onnx_runtime_ir::Attribute::Int(1));
+        }
+        assert!(supported_mode(&node, 17).unwrap_err().contains("CPU EP"));
+        assert_eq!(supported_mode(&node, 20).unwrap(), DftMode::RealInverse);
     }
 
     #[test]
     fn workspace_layout_is_aligned_and_contains_all_regions() {
-        let spec = make_spec(&[2, 4, 1], -2, 7, false, false).unwrap();
+        let spec = make_spec(&[2, 4, 1], DataType::Float32, -2, Some(7), DftMode::Forward).unwrap();
         let layout = WorkspaceLayout::new(&spec, 123).unwrap();
         assert_eq!(layout.packed_offset % WORKSPACE_ALIGNMENT, 0);
         assert_eq!(layout.work_offset % WORKSPACE_ALIGNMENT, 0);
@@ -794,13 +851,27 @@ mod tests {
 
     #[test]
     fn onesided_rejects_complex_input() {
-        let error = make_spec(&[1, 4, 2], -2, 4, false, true).unwrap_err();
+        let error = make_spec(
+            &[1, 4, 2],
+            DataType::Float32,
+            -2,
+            Some(4),
+            DftMode::RealForward,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("valid only for real input"));
     }
 
     #[test]
     fn output_shape_tracks_arbitrary_axis_and_onesided_plus_one() {
-        let spec = make_spec(&[2, 3, 5, 1], 1, 8, false, true).unwrap();
+        let spec = make_spec(
+            &[2, 3, 5, 1],
+            DataType::Float32,
+            1,
+            Some(8),
+            DftMode::RealForward,
+        )
+        .unwrap();
         assert_eq!(spec.output_shape, [2, 5, 5, 2]);
         assert_eq!(spec.batch, 10);
     }

@@ -314,7 +314,7 @@ would let us claim them. Until one exists, declining is the honest answer, and
 
 Emitted by our own fusion passes, so they are created *after* capability and
 never appear in an input graph: `FusedGemm`, `FusedAttention`,
-`FusedMatMulBias`, and the `pkg.nxrt` ops `BlockQuantizedMatMul`,
+`FusedMatMulBias`, and the `pkg.nxrt._private` ops `BlockQuantizedMatMul`,
 `BlockQuantizedMoE`, `CompressedSparseAttention`, `IndexShare`,
 `PackedVarlenAttention`, `SparseKvGather`, `VarlenAttention`.
 

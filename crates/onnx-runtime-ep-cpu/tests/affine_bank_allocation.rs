@@ -234,7 +234,13 @@ fn affine_grouped_projection_has_no_bank_sized_copies_for_any_bank_layout() {
             .collect::<Vec<_>>();
         let facts = [OutputMetadata::from_view(&y)];
         let request = kernel
-            .workspace_requirement(&metadata, &facts)
+            .workspace_requirement_for_execution(
+                &inputs,
+                std::slice::from_ref(&y),
+                &metadata,
+                &facts,
+                None,
+            )
             .unwrap()
             .require_ready()
             .unwrap();
@@ -366,7 +372,13 @@ fn affine_grouped_payloads_are_admitted_once_without_heap_copies() {
             .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
             .collect::<Vec<_>>();
         let req = kernel
-            .workspace_requirement(&metadata, &[OutputMetadata::from_view(&out)])
+            .workspace_requirement_for_execution(
+                &inputs,
+                std::slice::from_ref(&out),
+                &metadata,
+                &[OutputMetadata::from_view(&out)],
+                None,
+            )
             .unwrap()
             .require_ready()
             .unwrap();

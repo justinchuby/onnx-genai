@@ -348,6 +348,16 @@ mod error {
         #[error("internal executor error: {0}")]
         Internal(String),
 
+        #[error(
+            "initialize Host tensor {dtype:?} {shape:?} payload: {source}; repair the initializer or release memory before retrying"
+        )]
+        HostTensorInitialization {
+            dtype: onnx_runtime_ir::DataType,
+            shape: Vec<usize>,
+            #[source]
+            source: Box<dyn std::error::Error + Send + Sync>,
+        },
+
         #[error("Sequence op {op}: {reason}")]
         SequenceOp { op: String, reason: String },
         #[error("ONNX Optional operator {op}: {reason}")]
@@ -2986,3 +2996,6 @@ mod option_tests {
 
 #[cfg(test)]
 mod host_tensor_tests;
+
+mod owned_host_array;
+pub use owned_host_array::{HostElement, OwnedHostArray};

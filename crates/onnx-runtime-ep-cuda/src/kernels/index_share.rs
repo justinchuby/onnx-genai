@@ -1,4 +1,4 @@
-//! `pkg.nxrt::IndexShare` v1: device-resident selected-token attention for the
+//! `pkg.nxrt._private::IndexShare` v1: device-resident selected-token attention for the
 //! GLM-5.2 IndexShare / DeepSeek DSA building block.
 //!
 //! The frozen CPU reference in

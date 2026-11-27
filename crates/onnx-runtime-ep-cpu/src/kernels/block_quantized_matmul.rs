@@ -30,8 +30,8 @@ use super::decoded_projection::ProjectionScratch;
 use super::matmul::gemm;
 use super::packed_bytes::{PackedByteDigest, PackedByteSource};
 use super::packed_projection::{PackedProjectionPlan, validate_format};
-use crate::dtype::{can_borrow_dense, to_dense_f32_widen_into, write_dense_f32_narrow};
-use crate::strided::validate_host_storage;
+use super::projection_input::ProjectionInput;
+use crate::dtype::write_dense_f32_narrow;
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
 const OP: &str = "BlockQuantizedMatMul";
@@ -207,56 +207,6 @@ impl BlockFormat {
     }
 }
 
-/// A validated source, with no payload read or allocation before admission.
-struct ProjectionInput<'a> {
-    view: &'a TensorView<'a>,
-    elements: usize,
-    borrowed: bool,
-    name: &'static str,
-}
-
-impl<'a> ProjectionInput<'a> {
-    fn new(name: &'static str, view: &'a TensorView<'a>) -> Result<Self> {
-        let elements = match view.dtype {
-            DataType::Float32 => validate_host_storage::<f32>(OP, name, view)?,
-            DataType::Float16 => validate_host_storage::<half::f16>(OP, name, view)?,
-            DataType::BFloat16 => validate_host_storage::<half::bf16>(OP, name, view)?,
-            dtype => {
-                return Err(error(format!(
-                    "{name} has unsupported dtype {dtype:?}; bind Float32, Float16 or BFloat16 storage"
-                )));
-            }
-        };
-        let borrowed = elements == 0 || can_borrow_dense::<f32>(view);
-        Ok(Self {
-            view,
-            elements,
-            borrowed,
-            name,
-        })
-    }
-
-    fn staging_elements(&self) -> usize {
-        if self.borrowed { 0 } else { self.elements }
-    }
-
-    fn read<'b>(&'b self, lane: &'b mut ProjectionScratch<'_>) -> Result<&'b [f32]> {
-        if self.elements == 0 {
-            return Ok(&[]);
-        }
-        if self.borrowed {
-            // SAFETY: construction proves Host span, Float32 dtype, contiguous
-            // layout and alignment. The source lives through this short borrow.
-            return Ok(unsafe {
-                std::slice::from_raw_parts(self.view.data_ptr::<f32>(), self.elements)
-            });
-        }
-        let values = lane.initialized_prefix(self.elements)?;
-        to_dense_f32_widen_into(self.name, self.view, values)?;
-        Ok(values)
-    }
-}
-
 #[derive(Clone, Copy, Default)]
 struct InputStaging {
     activation: usize,
@@ -395,11 +345,11 @@ impl Kernel for BlockQuantizedMatMulKernel {
         let rows = self.metadata_rows(metadata)?;
         let packed_bytes = self.packed_lane_bytes(rows, inputs)?;
         let activation = inputs.first().filter(|v| !v.is_absent()).ok_or_else(|| error("live workspace planning needs activation A; bind its Host tensor view before admission"))?;
-        let activation = ProjectionInput::new("A", activation)?;
+        let activation = ProjectionInput::new(OP, "A", activation)?;
         let bias = inputs
             .get(2)
             .filter(|v| !v.is_absent())
-            .map(|v| ProjectionInput::new("bias", v))
+            .map(|v| ProjectionInput::new(OP, "bias", v))
             .transpose()?;
         let staging = InputStaging::for_sources(rows, &activation, bias.as_ref());
         let (plan, requirement) = self.plan_workspace(rows, packed_bytes, staging)?;
@@ -604,9 +554,9 @@ impl BlockQuantizedMatMulKernel {
         }
         let source = PackedByteSource::full(OP, &inputs[1])?;
         let packed_bytes = if m == 0 { 0 } else { source.copy_bytes() };
-        let activation_source = ProjectionInput::new("A", &inputs[0])?;
+        let activation_source = ProjectionInput::new(OP, "A", &inputs[0])?;
         let bias_source = bias_view
-            .map(|v| ProjectionInput::new("bias", v))
+            .map(|v| ProjectionInput::new(OP, "bias", v))
             .transpose()?;
         let staging = InputStaging::for_sources(m, &activation_source, bias_source.as_ref());
         let (layout, result_elements) =

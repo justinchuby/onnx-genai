@@ -16,7 +16,8 @@
 //! FFI-free (libm is pure Rust, no `cc`).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::modulo::ModMode;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
@@ -148,56 +149,39 @@ binary_factory!(SumFactory, BinOp::Sum);
 binary_factory!(MeanFactory, BinOp::Mean);
 
 /// Factory for ONNX `Mod`, carrying its `fmod` semantic selector.
-pub struct ModFactory;
+pub struct ModFactory {
+    pub since_version: u64,
+}
 
 impl KernelFactory for ModFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let fmod = match node.attr("fmod") {
-            None | Some(Attribute::Int(0)) => false,
-            Some(Attribute::Int(1)) => true,
-            Some(Attribute::Int(value)) => {
-                return Err(EpError::KernelFailed(format!(
-                    "Mod: `fmod` must be 0 or 1, got {value}"
-                )));
-            }
-            Some(_) => {
-                return Err(EpError::KernelFailed(
-                    "Mod: `fmod` must be an integer attribute".into(),
-                ));
-            }
-        };
-        Ok(Box::new(ModKernel { fmod }))
+        let mode = ModMode::parse(node)
+            .map_err(|reason| EpError::KernelFailed(format!("Mod: {reason}")))?;
+        Ok(Box::new(ModKernel {
+            mode,
+            since_version: self.since_version,
+        }))
     }
 }
 
-/// ONNX `Mod`: integer floor-mod when `fmod=0`, C-style remainder when `fmod=1`.
+/// ONNX `Mod`: floor or truncating remainder, with float floor added in opset 28.
 pub struct ModKernel {
-    fmod: bool,
+    mode: ModMode,
+    since_version: u64,
 }
 
 impl Kernel for ModKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Mod", inputs, outputs, 2, 2, 1)?;
-        if self.fmod {
-            dispatch_arith!(inputs[0].dtype, "Mod", T => {
-                mod_typed::<T>(true, inputs, outputs)
-            })
-        } else {
-            match inputs[0].dtype {
-                DataType::Int8 => mod_typed::<i8>(false, inputs, outputs),
-                DataType::Int16 => mod_typed::<i16>(false, inputs, outputs),
-                DataType::Int32 => mod_typed::<i32>(false, inputs, outputs),
-                DataType::Int64 => mod_typed::<i64>(false, inputs, outputs),
-                DataType::Uint8 => mod_typed::<u8>(false, inputs, outputs),
-                DataType::Uint16 => mod_typed::<u16>(false, inputs, outputs),
-                DataType::Uint32 => mod_typed::<u32>(false, inputs, outputs),
-                DataType::Uint64 => mod_typed::<u64>(false, inputs, outputs),
-                dtype => Err(EpError::KernelFailed(format!(
-                    "Mod: fmod=0 requires an integer dtype, got {dtype:?}; \
-                     floating-point Mod requires fmod=1"
-                ))),
+        self.mode
+            .validate_dtype(self.since_version, inputs[0].dtype)
+            .map_err(|reason| EpError::KernelFailed(format!("Mod: {reason}")))?;
+        dispatch_arith!(inputs[0].dtype, "Mod", T => {
+            match self.mode {
+                ModMode::Floor => mod_typed::<T, true>(inputs, outputs),
+                ModMode::Trunc => mod_typed::<T, false>(inputs, outputs),
             }
-        }
+        })
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -206,15 +190,24 @@ impl Kernel for ModKernel {
 }
 
 trait ModDomain: ComputeDomain {
-    fn c_mod(self, divisor: Self, fmod: bool) -> Self;
+    fn remainder<const FLOOR: bool>(self, divisor: Self) -> Self;
 }
 
 macro_rules! impl_float_mod {
     ($($t:ty),*) => {$(
         impl ModDomain for $t {
             #[inline]
-            fn c_mod(self, divisor: Self, _fmod: bool) -> Self {
-                self % divisor
+            fn remainder<const FLOOR: bool>(self, divisor: Self) -> Self {
+                let remainder = self % divisor;
+                if !FLOOR || remainder.is_nan() {
+                    remainder
+                } else if remainder == 0.0 {
+                    (0.0 as $t).copysign(divisor)
+                } else if remainder.is_sign_negative() != divisor.is_sign_negative() {
+                    remainder + divisor
+                } else {
+                    remainder
+                }
             }
         }
     )*};
@@ -224,12 +217,12 @@ macro_rules! impl_signed_mod {
     ($($t:ty),*) => {$(
         impl ModDomain for $t {
             #[inline]
-            fn c_mod(self, divisor: Self, fmod: bool) -> Self {
+            fn remainder<const FLOOR: bool>(self, divisor: Self) -> Self {
                 if divisor == 0 {
                     return 0;
                 }
                 let remainder = self.wrapping_rem(divisor);
-                if !fmod
+                if FLOOR
                     && remainder != 0
                     && (remainder < 0) != (divisor < 0)
                 {
@@ -246,7 +239,7 @@ macro_rules! impl_unsigned_mod {
     ($($t:ty),*) => {$(
         impl ModDomain for $t {
             #[inline]
-            fn c_mod(self, divisor: Self, _fmod: bool) -> Self {
+            fn remainder<const FLOOR: bool>(self, divisor: Self) -> Self {
                 if divisor == 0 { 0 } else { self % divisor }
             }
         }
@@ -257,8 +250,7 @@ impl_float_mod!(f32, f64);
 impl_signed_mod!(i8, i16, i32, i64);
 impl_unsigned_mod!(u8, u16, u32, u64);
 
-fn mod_typed<T: NumericElem>(
-    fmod: bool,
+fn mod_typed<T: NumericElem, const FLOOR: bool>(
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
 ) -> Result<()>
@@ -274,7 +266,7 @@ where
         acc[i] = value.to_acc()
     })?;
     broadcast_apply(&rhs, inputs[1].shape, &out_shape, |i, divisor| {
-        acc[i] = acc[i].c_mod(divisor.to_acc(), fmod)
+        acc[i] = acc[i].remainder::<FLOOR>(divisor.to_acc())
     })?;
     let out = acc.into_iter().map(T::from_acc).collect::<Vec<_>>();
     write_dense::<T>(&mut outputs[0], &out)
@@ -1088,6 +1080,55 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
 
+    #[test]
+    fn ort_mod_keeps_legacy_claim_and_factory_past_opset_27() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Mod",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        let ort = crate::CpuExecutionProvider::for_ort_plugin();
+        let native = crate::CpuExecutionProvider::new();
+        let shapes = [static_shape([1]), static_shape([1])];
+        let dtypes = [DataType::Float32; 2];
+        let a = Owned::f32(&[1], &[-5.5]);
+        let b = Owned::f32(&[1], &[3.0]);
+        let mut out = Owned::zeros_f32(&[1]);
+        let inputs = [a.view(), b.view()];
+        let concrete = [vec![1], vec![1]];
+        for opset in [13, 28, 29] {
+            assert!(
+                ort.supports_op(&node, opset, &shapes, &dtypes, &[])
+                    .is_supported()
+            );
+            assert!(
+                ort.get_kernel(&node, &concrete, opset)
+                    .unwrap()
+                    .execute(&inputs, &mut [out.view_mut()])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fmod=0 requires an integer dtype")
+            );
+        }
+        native
+            .get_kernel(&node, &concrete, 28)
+            .unwrap()
+            .execute(&inputs, &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![0.5]);
+
+        node.attributes.insert("fmod".into(), Attribute::Int(1));
+        ort.get_kernel(&node, &concrete, 29)
+            .unwrap()
+            .execute(&inputs, &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![-2.5]);
+    }
+
     fn run_bin(f: BinOp, a: &Owned, b: &Owned, out: &mut Owned) {
         BinaryKernel { op: f, flops: None }
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
@@ -1156,9 +1197,12 @@ mod tests {
         let a = Owned::i32(&[4], &[-5, 5, -5, 5]);
         let b = Owned::i32(&[4], &[3, 3, -3, -3]);
         let mut out = Owned::zeros(DataType::Int32, &[4]);
-        ModKernel { fmod: false }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        ModKernel {
+            mode: ModMode::Floor,
+            since_version: 10,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![1, 2, -2, -1]);
     }
 
@@ -1167,9 +1211,12 @@ mod tests {
         let a = Owned::i64(&[3, 1], &[5, -5, 8]);
         let b = Owned::i64(&[1, 4], &[3, -3, 4, -4]);
         let mut out = Owned::zeros(DataType::Int64, &[3, 4]);
-        ModKernel { fmod: false }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        ModKernel {
+            mode: ModMode::Floor,
+            since_version: 10,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i64(), vec![2, -1, 1, -3, 1, -2, 3, -1, 2, -1, 0, 0]);
     }
 
@@ -1179,8 +1226,9 @@ mod tests {
         let b = Owned::f32(&[4], &[3.0, 3.0, -3.0, -3.0]);
         let mut out = Owned::zeros_f32(&[4]);
         let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Mod", vec![], vec![]);
-        node.attributes.insert("fmod".into(), Attribute::Int(1));
-        ModFactory
+        node.attributes
+            .insert("fmod".into(), onnx_runtime_ir::Attribute::Int(1));
+        ModFactory { since_version: 10 }
             .create(&node, &[])
             .unwrap()
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
@@ -1196,9 +1244,12 @@ mod tests {
         let b = Owned::bf16(&[2], &divisors);
         let mut out = Owned::zeros(DataType::BFloat16, &[2]);
 
-        ModKernel { fmod: true }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        ModKernel {
+            mode: ModMode::Trunc,
+            since_version: 10,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
 
         let expected = dividends
             .into_iter()
@@ -1218,9 +1269,12 @@ mod tests {
         let a = Owned::i32(&[2], &[5, -5]);
         let b = Owned::i32(&[2], &[0, 0]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        ModKernel { fmod: false }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        ModKernel {
+            mode: ModMode::Floor,
+            since_version: 10,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![0, 0]);
     }
 
@@ -1229,14 +1283,68 @@ mod tests {
         let a = Owned::f32(&[1], &[5.5]);
         let b = Owned::f32(&[1], &[3.0]);
         let mut out = Owned::zeros_f32(&[1]);
-        let error = ModKernel { fmod: false }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap_err();
+        let error = ModKernel {
+            mode: ModMode::Floor,
+            since_version: 10,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("fmod=0 requires an integer dtype")
         );
+    }
+
+    #[test]
+    fn mod_28_floor_float_edges() {
+        let a = Owned::f32(
+            &[11],
+            &[
+                -5.5,
+                5.5,
+                0.0,
+                -0.0,
+                6.0,
+                -3.0,
+                3.0,
+                f32::INFINITY,
+                1.0,
+                f32::NAN,
+                1.0,
+            ],
+        );
+        let b = Owned::f32(
+            &[11],
+            &[
+                3.0,
+                -3.0,
+                -2.0,
+                2.0,
+                -3.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                2.0,
+                -0.0,
+                2.0,
+                f32::NAN,
+            ],
+        );
+        let mut out = Owned::zeros_f32(&[11]);
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "Mod", vec![], vec![]);
+        ModFactory { since_version: 28 }
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let result = out.to_f32();
+        for (&got, want) in result
+            .iter()
+            .zip([0.5_f32, -0.5, -0.0, 0.0, -0.0, f32::INFINITY, 3.0])
+        {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+        assert!(result[7..].iter().all(|v| v.is_nan()));
     }
 
     #[test]

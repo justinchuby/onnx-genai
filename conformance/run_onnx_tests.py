@@ -55,10 +55,8 @@ ADDITIONAL_PASS_OPS = ["Abs", "Conv", "Sigmoid"]
 # every PR's conformance job red. That is the control working, not failing.
 # When it happens again, do not relax the expectation: move this to another op
 # the EP genuinely declines (the runner must exit 2 with `UNSUPPORTED_OP`, and
-# `onnx.reference` must still be able to evaluate it). `Det` is chosen because
-# it is a linear-algebra op well outside this EP's dispatch and activation
-# roadmap, so it should stay declined far longer than an elementwise op will.
-SYNTHETIC_UNSUPPORTED_OP = "SyntheticUnsupportedDet"
+# `onnx.reference` must still be able to evaluate it).
+SYNTHETIC_UNSUPPORTED_OP = "SyntheticUnsupportedMeanVarianceNormalization"
 EXPECTED_STATUS = {
     **{op: "PASS" for op in CPU_OPS + ADDITIONAL_PASS_OPS},
     SYNTHETIC_UNSUPPORTED_OP: "UNSUPPORTED",
@@ -264,7 +262,7 @@ def manual_model(op: str) -> onnx.ModelProto:
         "ReduceMean": np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32),
         "Unsqueeze": np.array([[1.0, 2.0]], dtype=np.float32),
         "Conv": np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3),
-        SYNTHETIC_UNSUPPORTED_OP: np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        SYNTHETIC_UNSUPPORTED_OP: np.arange(8, dtype=np.float32).reshape(1, 2, 2, 2),
     }
     if op == "Constant":
         node = helper.make_node(
@@ -352,12 +350,12 @@ def manual_model(op: str) -> onnx.ModelProto:
         )
     elif op == SYNTHETIC_UNSUPPORTED_OP:
         x = numpy_helper.from_array(values[op], "X")
-        node = helper.make_node("Det", ["X"], ["Y"])
+        node = helper.make_node("MeanVarianceNormalization", ["X"], ["Y"])
         graph = helper.make_graph(
             [node],
             op,
             [],
-            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, values[op].shape)],
             [x],
         )
     else:

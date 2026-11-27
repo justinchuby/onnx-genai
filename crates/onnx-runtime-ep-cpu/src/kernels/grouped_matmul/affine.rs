@@ -7,7 +7,7 @@ use crate::kernels::{
 };
 use onnx_runtime_ep_api::{
     DevicePtr, EpError, Kernel, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspacePreparation, WorkspaceView,
+    WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceView,
     packed_routed::{AffineGrouped, GroupLayout},
 };
 use onnx_runtime_ir::{packed_routed::Op, quantized_grouped::OP};
@@ -16,13 +16,10 @@ fn error(detail: impl std::fmt::Display) -> EpError {
     EpError::KernelFailed(format!("{OP}: {detail}"))
 }
 impl Affine {
-    fn plan(&self, l: GroupLayout) -> Result<ValueIndexWorkspace<f32, 2>> {
+    fn plan(&self, l: GroupLayout, row_elements: usize) -> Result<ValueIndexWorkspace<f32, 2>> {
         ValueIndexWorkspace::new(
             OP,
-            [
-                ("Y staging", l.lanes),
-                ("activation row", if l.lanes == 0 { 0 } else { l.k }),
-            ],
+            [("Y staging", l.lanes), ("activation row", row_elements)],
             ("routing indices", l.routes),
         )
     }
@@ -79,7 +76,7 @@ impl Affine {
             crate::strided::validate_host_storage::<f32>(OP, "Y", &view)?;
             Some(Rows::new(OP, "X", &inputs[0])?)
         };
-        let plan = self.plan(l)?;
+        let plan = self.plan(l, rows.as_ref().map_or(0, Rows::scratch_len))?;
         // SAFETY: the owner supplies exclusive Host scratch disjoint from all
         // tensors. Complete mixed binding precedes every source value read.
         unsafe {
@@ -93,11 +90,8 @@ impl Affine {
                 let Some(rows) = rows else {
                     return Ok(());
                 };
-                // Reserve one conservative row in metadata, but preserve the
-                // aligned inner-contiguous borrow even for strided outer axes.
-                let scratch = &mut row_scratch[..rows.scratch_len()];
                 for (token, outputs) in y.chunks_exact_mut(l.selections * l.n).enumerate() {
-                    let input = rows.get(token, scratch)?;
+                    let input = rows.get(token, row_scratch)?;
                     for (selection, output) in outputs.chunks_exact_mut(l.n).enumerate() {
                         let expert = routes[token * l.selections + selection];
                         for (column, value) in output.iter_mut().enumerate() {
@@ -120,8 +114,47 @@ impl Kernel for Affine {
         inputs: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
     ) -> Result<WorkspacePreparation> {
-        Ok(WorkspacePreparation::Ready(
-            self.plan(self.geometry(inputs, outputs)?)?.requirement(),
+        let l = self.geometry(inputs, outputs)?;
+        if l.lanes == 0 {
+            Ok(WorkspacePreparation::Ready(self.plan(l, 0)?.requirement()))
+        } else {
+            // Shape/dtype metadata cannot prove row alignment or contiguity.
+            self.plan(l, l.k)?;
+            Ok(WorkspacePreparation::Deferred)
+        }
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        facts: &[OutputMetadata<'_>],
+        _: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        let l = self.geometry(metadata, facts)?;
+        if inputs.len() != metadata.len()
+            || inputs.iter().zip(metadata).any(|(view, meta)| {
+                view.dtype != meta.dtype
+                    || view.shape != meta.shape
+                    || (!view.is_absent() != meta.present && !view.shape.contains(&0))
+            })
+        {
+            return Err(error(
+                "input views differ from workspace metadata; refresh metadata for the actual bindings",
+            ));
+        }
+        if !outputs.is_empty() {
+            self.0.layout(inputs, outputs)?;
+        }
+        // Descriptors only: complete arena admission still precedes all route,
+        // scale and activation reads in run. Empty Y never needs X Host access.
+        let row_elements = if l.lanes == 0 {
+            0
+        } else {
+            Rows::new(OP, "X", &inputs[0])?.scratch_len()
+        };
+        Ok(WorkspaceExecutionPreparation::Ready(
+            self.plan(l, row_elements)?.requirement(),
         ))
     }
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {

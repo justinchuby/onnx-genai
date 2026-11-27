@@ -29,10 +29,16 @@ fn requirement(k: &Affine, inputs: &[TensorView], out: &TensorMut) -> WorkspaceR
         .iter()
         .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
         .collect::<Vec<_>>();
-    k.workspace_requirement(&meta, &[OutputMetadata::tensor(out.dtype, out.shape)])
-        .unwrap()
-        .require_ready()
-        .unwrap()
+    k.workspace_requirement_for_execution(
+        inputs,
+        std::slice::from_ref(out),
+        &meta,
+        &[OutputMetadata::tensor(out.dtype, out.shape)],
+        None,
+    )
+    .unwrap()
+    .require_ready()
+    .unwrap()
 }
 fn bytes(floats: usize, routes: usize) -> usize {
     (floats * 4).next_multiple_of(align_of::<usize>()) + routes * size_of::<usize>()
@@ -97,7 +103,7 @@ fn whole_workspace_preserves_route_order_for_every_source_layout_and_optional_ze
                 let mut y = Owned::zeros_f32(&[2, 2, 3]);
                 assert_eq!(
                     requirement(&k, &inputs, &y.view_mut()).bytes,
-                    bytes(16, 4) as u64
+                    bytes(12 + rows.scratch_len(), 4) as u64
                 );
                 for i in 0..slots {
                     assert!(k.supports_strided_input(i));
@@ -118,6 +124,7 @@ fn short_or_misaligned_workspace_refuses_before_source_reads_and_initialization(
     let k = kernel();
     let mut inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
     let mut out = Owned::f32(&[2, 2, 3], &[123.; 12]);
+    inputs[0].data = DevicePtr(4usize as *const std::ffi::c_void);
     inputs[2].data = DevicePtr(8usize as *const std::ffi::c_void);
     inputs[3].data = DevicePtr(4usize as *const std::ffi::c_void);
     let req = requirement(&k, &inputs, &out.view_mut());
@@ -294,12 +301,8 @@ fn metadata_handles_unresolved_output_and_invalid_formats_without_panics() {
         dtype: DataType::Float32,
     }];
     assert_eq!(
-        k.workspace_requirement(&meta, &facts)
-            .unwrap()
-            .require_ready()
-            .unwrap()
-            .bytes,
-        bytes(16, 4) as u64
+        k.workspace_requirement(&meta, &facts).unwrap(),
+        WorkspacePreparation::Deferred
     );
     for config in [
         AffineGrouped {
@@ -348,7 +351,7 @@ fn one_retained_affine_workspace_has_no_warm_issuer_callbacks_and_trims_exactly(
     let inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
     let mut y = Owned::zeros_f32(&[2, 2, 3]);
     let request = requirement(&k, &inputs, &y.view_mut());
-    assert_eq!(request.bytes, expected as u64);
+    assert_eq!(request.bytes, bytes(12, 4) as u64);
     let first = provider
         .allocate_workspace(expected, request.alignment, request.role())
         .unwrap();
@@ -371,15 +374,31 @@ fn one_retained_affine_workspace_has_no_warm_issuer_callbacks_and_trims_exactly(
         (before.0 + 1, before.1 + 1)
     );
     let calls = (books.claims(), books.releases());
-    for _ in 0..4096 {
-        let request = requirement(&k, &inputs, &y.view_mut());
-        assert_eq!(request.bytes, expected as u64);
+    let strided_x = Repacked::new(&f[0], 2);
+    let strided_inputs = [
+        strided_x.view(),
+        f[1].view(),
+        f[2].view(),
+        f[3].view(),
+        f[4].view(),
+    ];
+    for iteration in 0..4096 {
+        let inputs = if iteration % 2 == 0 {
+            inputs.as_slice()
+        } else {
+            &strided_inputs
+        };
+        let request = requirement(&k, inputs, &y.view_mut());
+        assert_eq!(
+            request.bytes,
+            bytes(if iteration % 2 == 0 { 12 } else { 16 }, 4) as u64
+        );
         let mut allocation = provider
-            .allocate_workspace(expected, request.alignment, request.role())
+            .allocate_workspace(request.bytes as usize, request.alignment, request.role())
             .unwrap();
         assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
         let workspace = WorkspaceView::new(DevicePtrMut(allocation.as_mut_ptr()), allocation.len());
-        k.execute_with_workspace(&inputs, &mut [y.view_mut()], Some(workspace))
+        k.execute_with_workspace(inputs, &mut [y.view_mut()], Some(workspace))
             .unwrap();
         provider.deallocate_workspace(allocation).unwrap();
     }
@@ -440,4 +459,51 @@ fn odd_depth_and_block_counts_preserve_scalar_accumulation_and_nonfinite_x_bits(
         }
     }
     assert_eq!(bits(out.to_f32()), bits(expected));
+}
+
+#[test]
+fn cached_geometry_is_refined_for_each_actual_row_layout() {
+    let k = kernel();
+    let f = fixture();
+    let mut metadata = f
+        .iter()
+        .map(|v| TensorMetadata::new(v.dtype, &v.shape, true))
+        .collect::<Vec<_>>();
+    let mut y = Owned::zeros_f32(&[2, 2, 3]);
+    let facts = [OutputMetadata::tensor(DataType::Float32, &[2, 2, 3])];
+    let cached = Some(k.workspace_requirement(&metadata, &facts).unwrap());
+    assert_eq!(cached, Some(WorkspacePreparation::Deferred));
+    for mode in [0, 2, 1, 3, 5, 4, 0] {
+        let storage = Repacked::new(&f[0], mode);
+        let inputs = [
+            storage.view(),
+            f[1].view(),
+            f[2].view(),
+            f[3].view(),
+            f[4].view(),
+        ];
+        let row = Rows::new(OP, "X", &inputs[0]).unwrap().scratch_len();
+        let out = y.view_mut();
+        let req = k
+            .workspace_requirement_for_execution(&inputs, &[out], &metadata, &facts, cached)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        assert_eq!(req.bytes, bytes(12 + row, 4) as u64, "mode={mode}");
+        let mut backing = vec![0u128; (req.bytes as usize).div_ceil(16)];
+        let lane = WorkspaceView::new(
+            DevicePtrMut(backing.as_mut_ptr().cast()),
+            req.bytes as usize,
+        );
+        k.execute_with_workspace(&inputs, &mut [y.view_mut()], Some(lane))
+            .unwrap();
+        assert_eq!(bits(y.to_f32()), bits(reference(&inputs)));
+    }
+    let inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
+    metadata[0].shape = &[1, 4];
+    // A compatible cached answer cannot authorize mismatched live geometry.
+    assert!(
+        k.workspace_requirement_for_execution(&inputs, &[y.view_mut()], &metadata, &facts, cached)
+            .is_err()
+    );
 }

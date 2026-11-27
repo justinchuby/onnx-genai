@@ -226,7 +226,7 @@ def build(*, mobius_root: Path, output_dir: Path) -> dict:
     # scope this fixture claims (see the asserts above) and this generator
     # must be revisited rather than silently shipping an unverified emission
     # claim.
-    native_only_ops = {op for op in node_ops if op.startswith("pkg.nxrt::")}
+    native_only_ops = {op for op in node_ops if op.startswith("pkg.nxrt._private::")}
     assert not native_only_ops, (
         f"unexpected native-only ops in a fixture that claims stock-ORT "
         f"executability: {native_only_ops}"

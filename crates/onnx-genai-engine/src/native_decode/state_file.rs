@@ -41,8 +41,8 @@ impl NativeStateFileLimits {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
-    tokens: Vec<TokenId>,
+struct Manifest<'a> {
+    tokens: std::borrow::Cow<'a, [TokenId]>,
     len: usize,
     past: Vec<TensorSpec>,
     cpu: Option<Vec<CpuSpec>>,
@@ -68,16 +68,6 @@ fn reserve(memory: &dyn MemoryGovernor, bytes: u64) -> anyhow::Result<MemoryLeas
     memory.reserve(Tier::Host, bytes, crate::engine::Holder::NativeSessionSnapshot.role(),
         crate::engine::Holder::NativeSessionSnapshot.id())
         .context("reserve bounded Native state file buffers; increase the host memory budget or use a smaller state file")
-}
-fn buffer(bytes: u64) -> anyhow::Result<Vec<u8>> {
-    let count = usize::try_from(bytes)
-        .context("Native state buffer exceeds host address space; restore a smaller file")?;
-    let mut result = Vec::new();
-    result.try_reserve_exact(count).context(
-        "allocate admitted Native state buffer; free host memory or restore a smaller file",
-    )?;
-    result.resize(count, 0);
-    Ok(result)
 }
 fn add(a: u64, b: u64) -> anyhow::Result<u64> {
     a.checked_add(b)
@@ -111,6 +101,7 @@ impl NativePastSnapshot {
         writer: &mut impl Write,
         limits: NativeStateFileLimits,
         memory: &dyn MemoryGovernor,
+        allocator: &onnx_runtime_session::HostTensorAllocator,
     ) -> anyhow::Result<u64> {
         limits.validate()?;
         anyhow::ensure!(
@@ -150,7 +141,7 @@ impl NativePastSnapshot {
         let mut names = self.past.keys().collect::<Vec<_>>();
         names.sort();
         let manifest = Manifest {
-            tokens: tokens.to_vec(),
+            tokens: std::borrow::Cow::Borrowed(tokens),
             len: self.len,
             past: names
                 .iter()
@@ -178,13 +169,18 @@ impl NativePastSnapshot {
                     })
                     .collect()
             }),
-            hidden: self.last_hidden.as_ref().map(Vec::len),
+            hidden: self.last_hidden.as_ref().map(NativeHidden::len),
         };
         anyhow::ensure!(
             manifest.payload_bytes()? == self.bytes,
             "Native state snapshot payload accounting disagrees with its tensor layouts; reset this session and report the decoder state contract"
         );
-        let json = serde_json::to_vec(&manifest).context("encode Native state file manifest")?;
+        let capacity=usize::try_from(estimate.min(limits.max_manifest_bytes)).context("Native state manifest output exceeds host address space; reduce explicit manifest limits")?;
+        let mut json = allocator.array::<u8>(capacity).context("admit Native state manifest serialization before materializing bytes; release Host headroom or save a shorter session")?;
+        let mut target = json.as_mut_slice();
+        serde_json::to_writer(&mut target,&manifest).with_context(||format!("encode Native state manifest within {capacity} admitted bytes (max_manifest_bytes {}); increase the explicit bound or shorten metadata",limits.max_manifest_bytes))?;
+        let used = capacity - target.len();
+        let json = &json.as_slice()[..used];
         anyhow::ensure!(
             json.len() as u64 <= estimate && json.len() as u64 <= limits.max_manifest_bytes,
             "Native state manifest requires {} bytes, exceeding its admitted estimate {estimate} or configured bound {}; increase the manifest limit or shorten the state",
@@ -209,19 +205,19 @@ impl NativePastSnapshot {
         put(&identity)?;
         put(&(json.len() as u64).to_le_bytes())?;
         put(&self.bytes.to_le_bytes())?;
-        put(&json)?;
+        put(json)?;
         for name in names {
             put(self.past[name].as_bytes())?;
         }
         if let Some(cpu) = &self.cpu_kv {
             for entry in &cpu.entries {
-                for rows in &entry.rows {
+                for rows in entry.rows.iter() {
                     put(rows)?;
                 }
             }
         }
         if let Some(hidden) = &self.last_hidden {
-            for value in hidden {
+            for value in hidden.as_slice() {
                 put(&value.to_le_bytes())?;
             }
         }
@@ -272,15 +268,18 @@ impl NativeDecodeSession {
                 && total <= limits.max_bytes,
             "Native state file declares {manifest_len} manifest bytes and {payload_len} payload bytes ({total} total), exceeding limits {limits:?}; restore a smaller file or increase explicit bounds"
         );
-        // JSON vectors, strings and layout records are conservatively covered
-        // before parsing. Payload admission covers input bytes plus Tensor's
-        // aligned copy; no executor mutation occurs while decoding.
+        // Parsed strings/layout records retain conservative legacy admission.
+        // Input staging and imported tensor payloads additionally retain their
+        // actual session allocator owners; parsing never mutates the executor.
+        // Reconcile legacy estimates only with the complete managed profile,
+        // not merely because this particular codec now has owned buffers.
         let metadata_lease = reserve(memory, times(manifest_len, 16)?)?;
-        let mut json = buffer(manifest_len)?;
-        reader.read_exact(&mut json).context(
+        let allocator = self.session.host_tensor_allocator()?;
+        let mut json=allocator.array::<u8>(usize::try_from(manifest_len).context("Native state manifest input exceeds host address space; reduce explicit manifest limits")?).context("admit Native state manifest input before reading; release Host headroom or restore a smaller file")?;
+        reader.read_exact(json.as_mut_slice()).context(
             "read complete Native state manifest; check read access and restore an intact file",
         )?;
-        let manifest: Manifest = serde_json::from_slice(&json).context(
+        let manifest: Manifest = serde_json::from_slice(json.as_slice()).context(
             "parse Native state manifest; restore an intact file with the supported schema",
         )?;
         self.validate_file_manifest(&manifest, limits)?;
@@ -289,15 +288,10 @@ impl NativeDecodeSession {
             payload_len == calculated,
             "Native state payload length {payload_len} disagrees with tensor layouts ({calculated}); restore an intact state file"
         );
-        let row_metadata = manifest.cpu.as_ref().map_or(Ok(0), |entries| {
-            entries.iter().try_fold(0, |sum, entry| {
-                let (blocks, _) = entry.rows()?;
-                add(
-                    sum,
-                    times(blocks as u64, std::mem::size_of::<Vec<u8>>() as u64)?,
-                )
-            })
-        })?;
+        let row_metadata = times(
+            manifest.cpu.as_ref().map_or(0, Vec::len) as u64,
+            std::mem::size_of::<cpu::CpuKvSnapshotEntry>() as u64,
+        )?;
         let lease = reserve(
             memory,
             add(
@@ -310,22 +304,21 @@ impl NativeDecodeSession {
         )?;
         let mut hash = Sha256::new();
         hash.update(header);
-        hash.update(&json);
-        let mut take = |count: u64| -> anyhow::Result<Vec<u8>> {
-            let mut data = buffer(count)?;
-            reader
-                .read_exact(&mut data)
-                .context("read complete Native state tensor payload; check read access and restore an intact file")?;
-            hash.update(&data);
-            Ok(data)
-        };
+        hash.update(json.as_slice());
         let mut past = HashMap::new();
         for spec in manifest.past {
-            let raw = take(spec.bytes)?;
-            let tensor =
-                Tensor::from_raw(dtype(spec.dtype)?, spec.shape, &raw).with_context(|| {
-                    format!("allocate imported Native state tensor '{}'", spec.name)
-                })?;
+            let mut read = Ok(());
+            let tensor=allocator.fill(dtype(spec.dtype)?,spec.shape,|bytes| {
+                read=reader.read_exact(bytes);
+                if read.is_ok() {hash.update(bytes);}
+                Ok(())
+            }).with_context(||format!("admit imported Native state tensor '{}' before reading; release Host headroom or restore a smaller state",spec.name))?;
+            read.with_context(|| {
+                format!(
+                    "read complete Native state tensor '{}'; restore an intact file",
+                    spec.name
+                )
+            })?;
             past.insert(spec.name, tensor);
         }
         let cpu_kv = manifest
@@ -334,10 +327,18 @@ impl NativeDecodeSession {
                 let mut decoded = Vec::with_capacity(entries.len());
                 for spec in entries {
                     let (blocks, row_size) = spec.rows()?;
-                    let mut rows = Vec::with_capacity(blocks);
-                    for _ in 0..blocks {
-                        rows.push(take(row_size)?);
-                    }
+                    let mut rows = cpu::CpuKvSnapshotRows::new(
+                        &self.session.host_tensor_allocator()?,
+                        blocks,
+                        usize::try_from(row_size).context("Native CPU KV live row exceeds host address space; restore a smaller state")?,
+                    )?;
+                    rows.fill(|row| {
+                        reader.read_exact(row).context(
+                            "read complete Native CPU KV row payload; restore an intact state file",
+                        )?;
+                        hash.update(row);
+                        Ok(())
+                    })?;
                     decoded.push(cpu::CpuKvSnapshotEntry {
                         pair: spec.pair,
                         shape: spec.shape,
@@ -354,12 +355,18 @@ impl NativeDecodeSession {
         let last_hidden = manifest
             .hidden
             .map(|len| -> anyhow::Result<_> {
-                Ok(take(times(len as u64, 4)?)?
-                    .chunks_exact(4)
-                    .map(|bytes| {
-                        f32::from_le_bytes(bytes.try_into().expect("four-byte hidden chunk"))
-                    })
-                    .collect())
+                let mut values = allocator.array::<f32>(len).context(
+                    "admit Native hidden-state file payload before reading; release Host headroom",
+                )?;
+                for value in values.as_mut_slice() {
+                    let mut bytes = [0; 4];
+                    reader
+                        .read_exact(&mut bytes)
+                        .context("read complete Native hidden state; restore an intact file")?;
+                    hash.update(bytes);
+                    *value = f32::from_le_bytes(bytes);
+                }
+                Ok(NativeHidden::from_cpu(values))
             })
             .transpose()?;
         let mut checksum = [0; 32];
@@ -379,7 +386,7 @@ impl NativeDecodeSession {
             "Native state file contains trailing data; restore exactly one complete state file"
         );
         Ok(DecodedState {
-            tokens: manifest.tokens,
+            tokens: manifest.tokens.into_owned(),
             state: NativePastSnapshot {
                 past,
                 len: manifest.len,
@@ -394,7 +401,7 @@ impl NativeDecodeSession {
 
     fn validate_file_manifest(
         &self,
-        manifest: &Manifest,
+        manifest: &Manifest<'_>,
         limits: NativeStateFileLimits,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -559,7 +566,7 @@ impl CpuSpec {
         Ok((blocks, row))
     }
 }
-impl Manifest {
+impl Manifest<'_> {
     fn payload_bytes(&self) -> anyhow::Result<u64> {
         let mut result = 0;
         for t in &self.past {

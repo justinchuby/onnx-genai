@@ -60,7 +60,7 @@ use common::{
 };
 use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
-use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, static_shape};
 
 #[test]
 #[cfg_attr(
@@ -111,6 +111,195 @@ fn transpose_packed_cuda_matches_reference_bytes() {
         );
         assert_eq!(outputs[0], expected, "{dtype:?} at opset {opset}");
     }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
+    let ep = require_cuda();
+    let shape = static_shape([7]);
+    let mut node = Node::new(NodeId(0), "Cast", vec![], vec![]);
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+    assert!(
+        ep.supports_op(&node, 1, &[shape.clone()], &[DataType::Uint8], &[])
+            .is_supported()
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Int2 as i64));
+    assert!(
+        ep.supports_op(&node, 1, &[shape], &[DataType::Uint8], &[])
+            .is_supported()
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float8E4M3FN as i64));
+    assert!(
+        ep.supports_op(&node, 25, &[static_shape([7])], &[DataType::Uint4], &[],)
+            .reason()
+            .is_some_and(|reason| reason.contains("does not support target dtype"))
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+    assert!(
+        ep.supports_op(
+            &node,
+            25,
+            &[static_shape([7])],
+            &[DataType::Float8E4M3FN],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("does not support source dtype"))
+    );
+
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+    assert!(
+        ep.supports_op(
+            &node,
+            27,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("opset 28"))
+    );
+    assert!(
+        ep.supports_op(
+            &node,
+            28,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .is_supported()
+    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Int32 as i64));
+    assert!(
+        ep.supports_op(
+            &node,
+            28,
+            &[static_shape([3])],
+            &[DataType::Float6E2M3],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("supports only"))
+    );
+    let cast_like = Node::new(NodeId(1), "CastLike", vec![], vec![]);
+    assert!(
+        ep.supports_op(
+            &cast_like,
+            15,
+            &[static_shape([3]), static_shape([3])],
+            &[DataType::Float6E2M3, DataType::Float32],
+            &[],
+        )
+        .reason()
+        .is_some_and(|reason| reason.contains("standard Cast"))
+    );
+
+    let cases = [
+        (
+            "uint8-to-uint4-codes-and-zero-points",
+            1,
+            input(DataType::Uint8, &[7], &[0u8, 1, 7, 8, 15, 16, 255]),
+            DataType::Uint4,
+            vec![0x10, 0x87, 0x0f, 0x0f],
+        ),
+        (
+            "uint4-to-int2-between-packed-types",
+            1,
+            input(DataType::Uint4, &[5], &[0x10u8, 0x87, 0xff]),
+            DataType::Int2,
+            vec![0x34, 0x03],
+        ),
+        (
+            "int2-to-int4-sign-extension",
+            1,
+            input(DataType::Int2, &[5], &[0x34u8, 0x03]),
+            DataType::Int4,
+            vec![0x10, 0x0f, 0x0f],
+        ),
+    ];
+    for (label, opset, source, target, expected) in cases {
+        let attrs = [("to", Attribute::Int(target as i64))];
+        let outputs = [(target, source.shape.clone())];
+        assert_eq!(
+            run_cpu(
+                "Cast",
+                "",
+                opset,
+                std::slice::from_ref(&source),
+                &outputs,
+                &attrs
+            )[0],
+            expected,
+            "{label}: CPU reference"
+        );
+        assert_eq!(
+            run_cuda(
+                &ep,
+                "Cast",
+                "",
+                opset,
+                std::slice::from_ref(&source),
+                &outputs,
+                &attrs,
+            )[0],
+            expected,
+            "{label}: CUDA"
+        );
+    }
+
+    let floats = float_input(
+        DataType::Float32,
+        &[6],
+        &[-20.0, -8.9, -7.9, 7.9, 8.0, f32::NAN],
+    );
+    let attrs = [("to", Attribute::Int(DataType::Int4 as i64))];
+    let outputs = [(DataType::Int4, vec![6])];
+    let expected = vec![0x8c, 0x79, 0x08];
+    assert_eq!(
+        run_cpu(
+            "Cast",
+            "",
+            1,
+            std::slice::from_ref(&floats),
+            &outputs,
+            &attrs
+        )[0],
+        expected
+    );
+    assert_eq!(
+        run_cuda(&ep, "Cast", "", 1, &[floats], &outputs, &attrs)[0],
+        expected
+    );
+
+    let source = input(DataType::Uint8, &[5], &[0u8, 1, 2, 3, 4]);
+    let target = input(DataType::Uint2, &[1], &[0u8]);
+    let outputs = [(DataType::Uint2, vec![5])];
+    let expected = vec![0xe4, 0x00];
+    assert_eq!(
+        run_cpu(
+            "CastLike",
+            "",
+            15,
+            &[source.clone(), target.clone()],
+            &outputs,
+            &[],
+        )[0],
+        expected
+    );
+    assert_eq!(
+        run_cuda(&ep, "CastLike", "", 15, &[source, target], &outputs, &[])[0],
+        expected
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,6 +554,173 @@ fn qlinear_matmul_cases() -> Vec<Case> {
             compare: Compare::ExactBytes,
         },
     ]
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+fn qlinear_matmul_scale_types_match_expected_integer_bytes() {
+    let ep = require_cuda();
+    for case in qlinear_matmul_cases() {
+        run_case(&ep, &case);
+    }
+    for (opset, scale_dtype) in [
+        (10, DataType::Float32),
+        (10, DataType::Float16),
+        (10, DataType::BFloat16),
+        (21, DataType::Float16),
+        (21, DataType::BFloat16),
+    ] {
+        let mut case = Case {
+            label: format!("QLinearMatMul-{opset}[{scale_dtype:?},per-row-column,ties]"),
+            op: "QLinearMatMul",
+            domain: "",
+            opset,
+            inputs: vec![
+                input(DataType::Uint8, &[2, 1], &[4u8, 6]),
+                float_input(scale_dtype, &[2], &[0.5, 1.5]),
+                input(DataType::Uint8, &[2], &[3u8, 3]),
+                input(DataType::Int8, &[1, 2], &[2i8, -2]),
+                float_input(scale_dtype, &[2], &[1.0, 0.5]),
+                input(DataType::Int8, &[2], &[1i8, -1]),
+                float_input(scale_dtype, &[], &[1.0]),
+                input(DataType::Uint8, &[], &[10u8]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![2, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        };
+        assert_eq!(
+            run_case(&ep, &case),
+            vec![vec![10, 10, 14, 8]],
+            "{}",
+            case.label
+        );
+        case.inputs[6] = float_input(scale_dtype, &[], &[f32::NAN]);
+        let err = try_run_cuda(
+            &ep,
+            case.op,
+            case.domain,
+            case.opset,
+            &case.inputs,
+            &case.outputs,
+            &case.attrs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("y_scale values must be finite and positive"),
+            "{err}"
+        );
+    }
+
+    for (dtype, scales, accumulator, output_zero, expected) in [
+        (DataType::Float16, [0.2, 0.75, 0.2], 2u8, 0u8, 1),
+        (DataType::BFloat16, [0.5, 1024.0, 76.0], 2, 0, 14),
+        (DataType::Float16, [256.0; 3], 1, 0, 255),
+        (
+            DataType::BFloat16,
+            [f32::from_bits(0x5f80_0000); 3],
+            1,
+            0,
+            255,
+        ),
+        (DataType::Float16, [256.0; 3], 0, 17, 0),
+        (
+            DataType::BFloat16,
+            [f32::from_bits(0x5f80_0000); 3],
+            0,
+            17,
+            0,
+        ),
+    ] {
+        let [a_scale, b_scale, y_scale] = scales.map(|scale| float_input(dtype, &[], &[scale]));
+        let case = Case {
+            label: format!("QLinearMatMul-21[{dtype:?},scale-arithmetic,{scales:?}]"),
+            op: "QLinearMatMul",
+            domain: "",
+            opset: 21,
+            inputs: vec![
+                input(DataType::Uint8, &[1, 1], &[accumulator]),
+                a_scale,
+                input(DataType::Uint8, &[], &[0u8]),
+                input(DataType::Int8, &[1, 1], &[1i8]),
+                b_scale,
+                input(DataType::Int8, &[], &[0i8]),
+                y_scale,
+                input(DataType::Uint8, &[], &[output_zero]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![1, 1])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        };
+        assert_eq!(run_case(&ep, &case), vec![vec![expected]], "{}", case.label);
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+fn qlinear_matmul_half_scale_admission_is_native_only() {
+    let native = require_cuda();
+    let legacy = CudaExecutionProvider::new_for_ort_plugin().expect("construct legacy CUDA EP");
+    let node = Node::new(
+        NodeId(0),
+        "QLinearMatMul",
+        (0..8).map(|id| Some(ValueId(id))).collect(),
+        vec![ValueId(8)],
+    );
+    let mut case = qlinear_matmul_cases().remove(0);
+    case.opset = 21;
+    let shapes: Vec<_> = case
+        .inputs
+        .iter()
+        .map(|tensor| static_shape(tensor.shape.iter().copied()))
+        .collect();
+    let mut dtypes: Vec<_> = case.inputs.iter().map(|tensor| tensor.dtype).collect();
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        for index in [1, 4, 6] {
+            dtypes[index] = dtype;
+        }
+        assert!(
+            native
+                .supports_op(&node, 21, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !native
+                .supports_op(&node, 9, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            native
+                .supports_op(&node, 10, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !legacy
+                .supports_op(&node, 10, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !legacy
+                .supports_op(&node, 21, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+    }
+
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(legacy.registry());
+    let entries: Vec<_> = descriptors
+        .iter()
+        .filter(|op| op.op_type == "QLinearMatMul" && op.domain.is_empty())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        (entries[0].since_version, entries[0].end_version),
+        (10, u64::MAX)
+    );
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        assert!(entries[0].supported_dtypes.contains(&dtype));
+    }
+    assert_eq!(run_case(&legacy, &case), run_case(&native, &case));
 }
 
 fn resize_cases() -> Vec<Case> {
@@ -1778,6 +2134,56 @@ fn bitshift_cases() -> Vec<Case> {
     ]
 }
 
+fn signed_bitshift_cases() -> Vec<(Case, Vec<u8>)> {
+    let mut cases = Vec::new();
+    macro_rules! cases_for_type {
+        ($dtype:ident, $ty:ty, $($extra_count:expr),*) => {{
+            let dtype = DataType::$dtype;
+            let width = <$ty>::BITS as $ty;
+            let counts = [0, 1, width - 1, width, width + 1, -1, $($extra_count),*];
+            let extra = counts.len() - 6;
+            // Pinned ONNX vectors distinguish arithmetic RIGHT and wrapping LEFT;
+            // two-sided broadcasting combines positive/negative X with all counts.
+            for (direction, positive, negative, negative_fill) in [
+                ("LEFT", [1, 2, <$ty>::MIN], [-8, -16, 0], 0),
+                ("RIGHT", [1, 0, 0], [-8, -4, -1], -1),
+            ] {
+                let expected: Vec<_> = positive.into_iter()
+                    .chain(std::iter::repeat_n(0, 3 + extra))
+                    .chain(negative)
+                    .chain(std::iter::repeat_n(negative_fill, 3 + extra))
+                    .flat_map(<$ty>::to_le_bytes)
+                    .collect();
+                let opsets: &[u64] = if dtype == DataType::Int32 && direction == "RIGHT" {
+                    &[11, 28]
+                } else {
+                    &[28]
+                };
+                for &opset in opsets {
+                    cases.push((Case {
+                        label: format!("BitShift-{opset}[{dtype:?},{direction}]"),
+                        op: "BitShift",
+                        domain: "",
+                        opset,
+                        inputs: vec![
+                            input(dtype, &[2, 1], &[1 as $ty, -8]),
+                            input(dtype, &[1, counts.len()], &counts),
+                        ],
+                        outputs: vec![(dtype, vec![2, counts.len()])],
+                        attrs: vec![("direction", Attribute::String(direction.as_bytes().to_vec()))],
+                        compare: Compare::ExactBytes,
+                    }, expected.clone()));
+                }
+            }
+        }};
+    }
+    cases_for_type!(Int8, i8,);
+    cases_for_type!(Int16, i16,);
+    cases_for_type!(Int32, i32,);
+    cases_for_type!(Int64, i64, 1 << 32, -0xffff_ffff);
+    cases
+}
+
 /// `LogSoftmax` parity, f32/f16/bf16, opset-13 last-axis and legacy opset-11
 /// coerce-to-2D, including a large-magnitude row to exercise the stable
 /// shifted-logsumexp path (the #266 overflow lesson).
@@ -2724,7 +3130,9 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("BitwiseOr", bitwise_binary_cases("BitwiseOr")));
     p.push(sweep("BitwiseXor", bitwise_binary_cases("BitwiseXor")));
     p.push(sweep("BitwiseNot", bitwise_not_cases()));
-    p.push(sweep("BitShift", bitshift_cases()));
+    let mut shifts = bitshift_cases();
+    shifts.extend(signed_bitshift_cases().into_iter().map(|(case, _)| case));
+    p.push(sweep("BitShift", shifts));
     p.push(sweep("LogSoftmax", log_softmax_cases()));
     p.push(sweep("Hardmax", hardmax_cases()));
 
@@ -3397,6 +3805,19 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) -> Vec<Vec<u8>> {
         }
     }
     cuda
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn bitshift_native_cuda_conformance() {
+    let ep = require_cuda();
+    for (case, expected) in signed_bitshift_cases() {
+        let output = run_case(&ep, &case);
+        assert_eq!(output, [expected], "{}", case.label);
+    }
+    for case in bitshift_cases() {
+        run_case(&ep, &case);
+    }
 }
 
 #[cfg_attr(

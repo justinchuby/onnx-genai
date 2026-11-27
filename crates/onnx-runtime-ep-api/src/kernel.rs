@@ -635,7 +635,7 @@ pub struct KernelSizedOutputMetadata {
 
 /// An executor-delivered kernel input. Existing EPs receive `Tensor` variants;
 /// an EP advertising the `nxrt` capability may receive a lazy `Weight` at the
-/// `pkg.nxrt::BlockQuantizedMoE` boundary.
+/// `pkg.nxrt._private::BlockQuantizedMoE` boundary.
 pub enum KernelInput<'a> {
     Tensor(TensorView<'a>),
     Weight(&'a WeightHandle),
