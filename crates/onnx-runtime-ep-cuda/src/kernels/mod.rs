@@ -669,8 +669,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Where", _)
         | ("Cast", _)
         | ("CastLike", _)
-        | ("TopK", _)
-        | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        | ("TopK", _) => CUDA_ALL_DTYPES,
+        ("EyeLike", "") => onnx_runtime_ir::eye_like::DTYPES,
         ("MeanVarianceNormalization", "") => onnx_runtime_ep_api::mean_variance_normalization::DTYPES,
         ("Range", "") => &[
             DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,

@@ -594,6 +594,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             deny!("OneHot: {reason}");
         }
+        if op.op_type == "EyeLike"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ir::eye_like::validate_claim(op, opset, shapes, input_dtypes)
+        {
+            deny!("EyeLike: {reason}");
+        }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
             && onnx_runtime_ir::is_default_domain(&op.domain)

@@ -884,11 +884,28 @@ type_constraints:
                     .contains(&DataType::BFloat16)
             );
         }
-        assert_eq!(registry.lookup("EyeLike", "", 21).unwrap().since_version, 9);
-        assert_eq!(
-            registry.lookup("EyeLike", "", 22).unwrap().since_version,
-            22
-        );
+        for (opset, since_version) in [(21, 9), (22, 22)] {
+            let schema = registry.lookup("EyeLike", "", opset).unwrap();
+            assert_eq!(schema.since_version, since_version);
+            for edge in ["T1", "T2"] {
+                let allowed = &schema
+                    .type_constraints
+                    .iter()
+                    .find(|constraint| constraint.type_param == edge)
+                    .unwrap()
+                    .allowed;
+                let expected: Vec<_> = onnx_runtime_ir::eye_like::DTYPES
+                    .iter()
+                    .copied()
+                    .filter(|&dtype| dtype != DataType::BFloat16 || opset >= 22)
+                    .collect();
+                assert_eq!(allowed.len(), expected.len(), "EyeLike-{opset} {edge}");
+                assert!(
+                    expected.iter().all(|dtype| allowed.contains(dtype)),
+                    "EyeLike-{opset} {edge}"
+                );
+            }
+        }
         assert_eq!(
             registry
                 .lookup("GroupNormalization", "", 20)

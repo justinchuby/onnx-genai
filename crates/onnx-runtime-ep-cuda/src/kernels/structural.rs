@@ -570,23 +570,9 @@ pub struct EyeLikeFactory {
 
 impl KernelFactory for EyeLikeFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let k = node.attr("k").and_then(Attribute::as_int).unwrap_or(0);
-        let dtype = match node.attr("dtype") {
-            None => None,
-            Some(Attribute::Int(value)) => {
-                let value = i32::try_from(*value).map_err(|_| {
-                    EpError::KernelFailed(format!("cuda_ep EyeLike: invalid dtype {value}"))
-                })?;
-                Some(DataType::from_onnx(value).ok_or_else(|| {
-                    EpError::KernelFailed(format!("cuda_ep EyeLike: invalid dtype {value}"))
-                })?)
-            }
-            Some(_) => {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep EyeLike: dtype must be an integer".into(),
-                ));
-            }
-        };
+        let onnx_runtime_ir::eye_like::Attributes { k, dtype } =
+            onnx_runtime_ir::eye_like::Attributes::parse(node)
+                .map_err(|reason| EpError::KernelFailed(format!("cuda_ep EyeLike: {reason}")))?;
         Ok(Box::new(EyeLikeKernel {
             k,
             dtype,

@@ -59,6 +59,7 @@ pub mod dropout;
 mod dtype;
 mod einsum;
 mod error;
+pub mod eye_like;
 pub mod gemm;
 mod graph;
 mod graph_view;
