@@ -33,6 +33,9 @@ pub(crate) fn unsupported_reason_at_opset(
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
         }
         "LpPool" => lp_pool(node, opset, input_dtypes),
+        "EyeLike" => {
+            onnx_runtime_ir::eye_like::validate_claim(node, opset, input_shapes, input_dtypes)
+        }
         "AveragePool" => {
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
                 .err()
@@ -89,7 +92,6 @@ pub(crate) fn unsupported_reason(
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
         "Gelu" => gelu(node, input_dtypes),
         "SpaceToDepth" => legacy_space_to_depth(node, input_dtypes),
-        "EyeLike" => eye_like(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
         | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
@@ -691,45 +693,6 @@ fn legacy_space_to_depth(node: &Node, input_dtypes: &[DataType]) -> Result<(), S
     require_fixed_width(input_dtypes, 0, "input")?;
     if !matches!(node.attr("blocksize").and_then(Attribute::as_int), Some(value) if value > 0) {
         return Err("attribute 'blocksize' must be a positive integer".into());
-    }
-    Ok(())
-}
-
-fn eye_like(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
-    required_arity(node, input_dtypes, 1, 1, 1)?;
-    require_fixed_width(input_dtypes, 0, "input")?;
-    if node
-        .attr("k")
-        .is_some_and(|attribute| attribute.as_int().is_none())
-    {
-        return Err("attribute 'k' must be an integer".into());
-    }
-    if let Some(attribute) = node.attr("dtype") {
-        let value = attribute
-            .as_int()
-            .ok_or_else(|| "attribute 'dtype' must be an integer".to_string())?;
-        let value = i32::try_from(value)
-            .map_err(|_| format!("attribute 'dtype' value {value} is invalid"))?;
-        let dtype = DataType::from_onnx(value)
-            .ok_or_else(|| format!("attribute 'dtype' value {value} is invalid"))?;
-        if !matches!(
-            dtype,
-            DataType::Bool
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Uint8
-                | DataType::Uint16
-                | DataType::Uint32
-                | DataType::Uint64
-                | DataType::Float16
-                | DataType::BFloat16
-                | DataType::Float32
-                | DataType::Float64
-        ) {
-            return Err(format!("attribute 'dtype' selects unsupported {dtype:?}"));
-        }
     }
     Ok(())
 }

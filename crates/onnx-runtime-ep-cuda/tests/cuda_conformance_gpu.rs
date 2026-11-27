@@ -2746,7 +2746,7 @@ fn eye_like_cases() -> Vec<Case> {
             label: format!("EyeLike[{dtype:?}-override,positive-offset]"),
             op: "EyeLike",
             domain: "",
-            opset: 9,
+            opset: if dtype == DataType::BFloat16 { 22 } else { 9 },
             inputs: vec![input(DataType::Float32, &[3, 4], &[9.0_f32; 12])],
             outputs: vec![(dtype, vec![3, 4])],
             attrs: vec![
@@ -4115,5 +4115,71 @@ fn opset26_native_cuda_conformance() {
     let ep = require_cuda();
     for case in bitcast_cases().into_iter().chain(cumprod_cases()) {
         run_case(&ep, &case);
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn eye_like_22_native_cuda_matches_onnx_reference() {
+    use DataType::{BFloat16, Float32};
+    use onnx_runtime_ep_api::ExecutionProvider;
+    let ep = require_cuda();
+    // ONNX 1.24 ReferenceEvaluator, opset 22, 2x3 input filled with sevens.
+    let bf16_one = 0x3f80_u16;
+    let shape = [2, 3];
+    let shape_for_claim = [onnx_runtime_ir::static_shape(shape)];
+    for (input_tensor, output_dtype, attrs, edge, expected) in [
+        (
+            input(BFloat16, &shape, &[0x40e0_u16; 6]),
+            BFloat16,
+            vec![],
+            "input",
+            [bf16_one, 0, 0, 0, bf16_one, 0]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            input(BFloat16, &shape, &[0x40e0_u16; 6]),
+            Float32,
+            vec![
+                ("dtype", Attribute::Int(i64::from(Float32.to_onnx()))),
+                ("k", Attribute::Int(-1)),
+            ],
+            "input",
+            [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        ),
+        (
+            input(Float32, &shape, &[7.0_f32; 6]),
+            BFloat16,
+            vec![
+                ("dtype", Attribute::Int(i64::from(BFloat16.to_onnx()))),
+                ("k", Attribute::Int(1)),
+            ],
+            "output",
+            [0, bf16_one, 0, 0, 0, bf16_one]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        ),
+    ] {
+        let input_dtype = input_tensor.dtype;
+        let inputs = [input_tensor];
+        let outputs = [(output_dtype, shape.to_vec())];
+        let (graph, id) = common::build_graph("EyeLike", "", 21, &inputs, &outputs, &attrs);
+        let claim = ep.supports_op(graph.node(id), 21, &shape_for_claim, &[input_dtype], &[]);
+        let reason = claim.reason().expect("EyeLike-9 must not claim BF16");
+        assert!(
+            reason.contains(&format!("{edge} dtype BFloat16")),
+            "{reason}"
+        );
+        assert_eq!(
+            run_cuda(&ep, "EyeLike", "", 22, &inputs, &outputs, &attrs),
+            vec![expected],
+            "{input_dtype:?} to {output_dtype:?}"
+        );
     }
 }

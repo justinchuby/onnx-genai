@@ -1219,6 +1219,31 @@ fn predicates_dropout_and_eye_like_resolve_all_outputs() {
 }
 
 #[test]
+fn eye_like_infers_bf16_on_both_edges_only_from_opset_22() {
+    use DataType::{BFloat16, Float32};
+    let shape = vec![sym(5), c(9)];
+    for (input_dtype, expected_dtype, dtype_attr, edge) in [
+        (BFloat16, BFloat16, None, "input"),
+        (BFloat16, Float32, Some(Float32), "input"),
+        (Float32, BFloat16, Some(BFloat16), "output"),
+    ] {
+        let mut eye = node("EyeLike", 1, 1);
+        if let Some(dtype) = dtype_attr {
+            eye = with_attr(eye, "dtype", Attribute::Int(i64::from(dtype.to_onnx())));
+        }
+        let input = || NodeIo {
+            type_info: Some(TypeInfo::new(input_dtype, shape.clone())),
+            ..NodeIo::default()
+        };
+        let error = try_run(&eye, vec![input()], 21).unwrap_err().to_string();
+        assert!(error.contains(&format!("{edge} dtype BFloat16")), "{error}");
+        let output = run(&eye, vec![input()], 22);
+        assert_eq!(out_dtype(&output), expected_dtype);
+        assert_eq!(out_shape(&output), shape);
+    }
+}
+
+#[test]
 fn unique_tracks_axis_and_flattened_inverse_lengths() {
     let flat = run(&node("Unique", 1, 4), vec![f32in(vec![sym(2), c(4)])], 11);
     assert_eq!(flat[0].type_info.as_ref().unwrap().shape.len(), 1);

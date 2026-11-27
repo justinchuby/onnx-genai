@@ -273,6 +273,7 @@ SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
 SESSION_HETERO_EXPECTED_TESTS = frozenset(
     {
         "cuda_cpu_cuda_chain_executes_on_both_real_providers",
+        "eye_like_22_unknown_input_rank_runs_without_cpu_fallback",
         "packed_shape_only_cuda_no_fallback",
     }
 )

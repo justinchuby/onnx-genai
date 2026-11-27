@@ -4,6 +4,7 @@
 #[path = "packed_shape_only/cases.rs"]
 mod packed_shape_only_cases;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{
@@ -14,8 +15,8 @@ use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ir::{DataType, Graph, Node, NodeId, Shape, TensorLayout, static_shape};
 use onnx_runtime_loader::WeightStore;
-use onnx_runtime_session::Tensor;
 use onnx_runtime_session::hetero::{ProviderPlacement, execute, plan};
+use onnx_runtime_session::{InferenceSession, Tensor};
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA; enable gpu-tests")]
@@ -152,6 +153,51 @@ fn graph() -> Graph {
     graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(abs)], vec![output]));
     graph.add_output(output);
     graph
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+#[test]
+fn eye_like_22_unknown_input_rank_runs_without_cpu_fallback() {
+    let mut cuda = CudaExecutionProvider::new(0).expect("CUDA device 0");
+    cuda.initialize(&EpConfig::default())
+        .expect("initialize CUDA");
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 22);
+    let dtype = DataType::BFloat16;
+    let input = graph.create_named_value("x", dtype, vec![]);
+    graph.mark_value_shape_unknown(input);
+    graph.add_input(input);
+    let output = graph.create_named_value("y", dtype, static_shape([2, 3]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "EyeLike",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let mut session = InferenceSession::from_graph_with_provider(
+        graph,
+        Arc::new(WeightStore::new()),
+        Path::new("."),
+        Arc::new(cuda),
+        None,
+    )
+    .expect("build CUDA-only EyeLike-22 with unknown input rank");
+    assert_eq!(session.device_id().device_type, DeviceType::Cuda);
+    assert!(
+        session.execution_provider_fallback_report().is_none(),
+        "EyeLike-22 must not fall back to CPU: {:?}",
+        session.execution_provider_fallback_report()
+    );
+    let x = Tensor::from_raw(dtype, vec![2, 3], &0x40e0_u16.to_le_bytes().repeat(6)).unwrap();
+    let result = session.run(&[("x", &x)]).expect("run CUDA-only EyeLike-22");
+    assert_eq!(result[0].dtype, dtype);
+    assert_eq!(result[0].shape, [2, 3]);
+    assert_eq!(
+        result[0].as_bytes(),
+        &[0x80, 0x3f, 0, 0, 0, 0, 0, 0, 0x80, 0x3f, 0, 0]
+    );
 }
 
 #[cfg_attr(

@@ -519,7 +519,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ],
 
         // IsInf, IsNaN: float inputs.
-        ("IsInf", "") | ("IsNaN", "") | ("EyeLike", "") => FLOAT_DTYPES,
+        ("IsInf", "") | ("IsNaN", "") => FLOAT_DTYPES,
+        ("EyeLike", "") => onnx_runtime_ir::eye_like::DTYPES,
 
         // Quantization: specific types but advertise broad.
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,

@@ -254,7 +254,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int64 indices (Int32 since opset 29), negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
 | `DepthToSpace` | `` | ✅ | **NVRTC-custom** | Standalone nxrt: fixed-width NCHW rearrangement with runtime `blocksize`; DCR default, CRD from opset 11 (`structural.rs`). |
 | `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Standalone nxrt: fixed-width inverse NCHW rearrangement; DCR default, explicit DCR/CRD from opset 28 (`structural.rs`). ORT plugin retains its legacy registration and DCR kernel. |
-| `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
+| `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and optional output dtype override. BF16 is supported on either edge from opset 22; the other numeric and boolean types are supported from opset 9 (`structural.rs`). |
 | `AffineGrid` | `` | ✅ | **NVRTC-custom** | Two- and three-dimensional sampling-grid construction for f32/f16/bf16/f64 theta, including `align_corners` and singleton spatial dimensions; f64 uses native double arithmetic (`data_transform.rs`). |
 | `Compress` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width selection with omitted-axis flattening, positive/negative axes, and short conditions (`data_transform.rs`). |
 | `DynamicQuantizeLinear` | `` | ✅ | **NVRTC-custom** | Float32 per-tensor dynamic uint8 quantization; one block derives min/max, scale, and ties-to-even zero point before quantizing (`quantization.rs`). |
@@ -582,9 +582,10 @@ operators: `GatherND`, `SpaceToDepth`, and `EyeLike`. All three use
 dtype-agnostic NVRTC byte kernels rather than a vendor library:
 `GatherND` supports Int64 indices (Int32 since opset 29), negative wrapping, tuple tails, and
 `batch_dims`; `SpaceToDepth` rearranges arbitrary fixed-width NCHW tensors; and
-`EyeLike` emits exact zero/one storage for every numeric/bool dtype supported by
-the CPU EP. GPU parity covers batch dimensions, negative indices, multiple
-channels, dtype overrides, diagonal offsets, and empty tensors. This raises the
+`EyeLike` emits exact zero/one storage for every numeric/bool dtype allowed by
+its opset, including BF16 from opset 22. GPU parity covers batch dimensions,
+negative indices, multiple channels, dtype overrides, diagonal offsets, and
+empty tensors. This raises the
 machine-verified `CUDA_COVERED_OPS` count from **131** to **134** and the current
 CPU standard-domain parity count from **102 / 141** to **105 / 141**. These ops
 move out of the CPU `ai.onnx` gap list.
