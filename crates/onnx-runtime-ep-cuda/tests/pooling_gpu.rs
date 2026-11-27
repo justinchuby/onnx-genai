@@ -346,6 +346,53 @@ fn cudnn_averagepool_padding_count_modes_match_cpu() {
     println!("cuDNN AveragePool padded include/exclude-padding cases passed");
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn cuda_window_pool_bf16_starts_at_opset_22_and_stays_device_resident() {
+    let ep = require_cuda();
+    let input: Vec<f32> = (1..=16).map(|value| value as f32).collect();
+    let shape = static_shape([1, 1, 4, 4]);
+
+    for (op_type, expected) in [
+        ("AveragePool", vec![3.5, 5.5, 11.5, 13.5]),
+        ("MaxPool", vec![6.0, 8.0, 14.0, 16.0]),
+    ] {
+        let (mut graph, node_id) = build_pool_model(
+            op_type,
+            DataType::BFloat16,
+            &[1, 1, 4, 4],
+            &[1, 1, 2, 2],
+            [2, 2],
+            [2, 2],
+            [0, 0, 0, 0],
+            None,
+        );
+        graph.opset_imports.insert(String::new(), 21);
+        let legacy = ep.supports_op(
+            graph.node(node_id),
+            21,
+            std::slice::from_ref(&shape),
+            &[DataType::BFloat16],
+            &[],
+        );
+        let reason = legacy.reason().expect("opset 21 BF16 must be declined");
+        assert!(
+            reason.contains("requires ONNX opset 22"),
+            "{op_type}: {reason}"
+        );
+
+        graph.opset_imports.insert(String::new(), 22);
+        assert_close(
+            &run_model(&ep, &Model::new(&graph), node_id, &input),
+            &expected,
+            0.05,
+        );
+    }
+}
+
 #[test]
 #[ignore = "physical CUDA timing: run prebuilt under the host benchmark lock"]
 fn averagepool_legacy_and_dilated_eager_latency() {

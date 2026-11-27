@@ -1040,14 +1040,14 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(center_crop_pad::CenterCropPadFactory),
     );
-    for version in [1, 7, 10, 11, 19] {
+    for version in [1, 7, 10, 11, 19, 22] {
         registry.register(
             OpKey::new("AveragePool", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(pooling::AveragePoolFactory),
         );
     }
-    for version in [1, 8, 10, 11, 12] {
+    for version in [1, 8, 10, 11, 12, 22] {
         registry.register(
             OpKey::new("MaxPool", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3701,9 +3701,9 @@ mod tests {
         // QuantizeLinear and DequantizeLinear each add six versioned entries,
         // while DynamicQuantizeLinear and QLinearMatMul add one each
         // (twenty-nine over the
-        // op-name count). Pooling adds twelve more versioned entries: five each
+        // op-name count). Pooling adds fourteen more versioned entries: six each
         // for AveragePool and MaxPool, plus the two global pool operators, for
-        // forty over the op-name count. ScatterElements also has distinct
+        // forty-two over the op-name count. ScatterElements also has distinct
         // opset-11 and opset-16 registrations. BatchNormalization,
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
@@ -3753,7 +3753,7 @@ mod tests {
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 132
+                + 134
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
@@ -3784,6 +3784,8 @@ mod tests {
         assert!(reg.lookup("DFT", "", 17).is_some());
         assert!(reg.lookup("STFT", "", 17).is_some());
         assert!(reg.lookup("Conv", "", 22).is_some());
+        assert!(reg.lookup("AveragePool", "", 22).is_some());
+        assert!(reg.lookup("MaxPool", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
         assert!(reg.lookup("SpaceToDepth", "", 13).is_some());

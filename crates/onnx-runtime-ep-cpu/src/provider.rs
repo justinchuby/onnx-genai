@@ -504,6 +504,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Err(reason) =
+            onnx_runtime_ir::pooling::validate_dtype_at_opset(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {

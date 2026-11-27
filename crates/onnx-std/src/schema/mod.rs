@@ -422,6 +422,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/scatter_elements.yaml"),
     include_str!("../../schemas/standard/scatter_elements_v29.yaml"),
     include_str!("../../schemas/standard/constant_of_shape.yaml"),
+    include_str!("../../schemas/standard/max_pool_12.yaml"),
     include_str!("../../schemas/standard/max_pool.yaml"),
     include_str!("../../schemas/standard/max_unpool_v9.yaml"),
     include_str!("../../schemas/standard/max_unpool_v11.yaml"),
@@ -1171,6 +1172,18 @@ type_constraints:
                 .find(|attribute| attribute.name == "kernel_shape")
                 .unwrap()
                 .required
+        );
+        let max_pool_12 = registry.lookup("MaxPool", "", 21).unwrap();
+        assert_eq!(max_pool_12.since_version, 12);
+        assert_eq!(
+            max_pool_12.type_constraints[0].allowed,
+            [
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Int8,
+                DataType::Uint8,
+            ]
         );
 
         let average_pool_19 = registry.lookup("AveragePool", "", 19).unwrap();
