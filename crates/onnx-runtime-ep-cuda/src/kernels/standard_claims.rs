@@ -40,6 +40,19 @@ pub(crate) fn unsupported_reason_at_opset(
             input_dtypes,
             conv_transpose_contract,
         ),
+        "DepthToSpace" | "SpaceToDepth"
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) =>
+        {
+            onnx_runtime_ir::space_depth::SpaceDepth::validate_claim(
+                node,
+                opset,
+                input_shapes,
+                input_dtypes,
+            )
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -66,7 +79,7 @@ pub(crate) fn unsupported_reason(
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
         "Gelu" => gelu(node, input_dtypes),
         "OneHot" => one_hot(node, input_dtypes),
-        "SpaceToDepth" => space_to_depth(node, input_dtypes),
+        "SpaceToDepth" => legacy_space_to_depth(node, input_dtypes),
         "EyeLike" => eye_like(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
         | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
@@ -648,7 +661,7 @@ fn gather_nd(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), S
     Ok(())
 }
 
-fn space_to_depth(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn legacy_space_to_depth(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 1, 1, 1)?;
     require_fixed_width(input_dtypes, 0, "input")?;
     if !matches!(node.attr("blocksize").and_then(Attribute::as_int), Some(value) if value > 0) {

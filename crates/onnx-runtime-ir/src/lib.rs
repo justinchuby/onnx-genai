@@ -75,6 +75,7 @@ pub mod quantized_grouped;
 pub mod quantized_matmul;
 pub mod roi_align;
 pub mod scatter;
+pub mod space_depth;
 pub mod standard_math;
 pub mod topk;
 pub mod trig;

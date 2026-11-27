@@ -357,6 +357,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ArgMax",
     "ArgMin",
     "GatherND",
+    "DepthToSpace",
     "SpaceToDepth",
     "EyeLike",
     "Pad",
@@ -720,7 +721,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
     }
 }
 
-/// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
+/// Derive kernel-registry descriptors from the ORT plugin's CUDA [`OpRegistry`].
 ///
 /// One descriptor per plugin-eligible `(op_type, domain, since_version)` key, with
 /// the domain taken verbatim from the registry (so `com.microsoft` kernels are
@@ -981,13 +982,31 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
-    reg.register(
-        OpKey::new("SpaceToDepth", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(structural::SpaceToDepthFactory {
-            runtime: runtime.clone(),
-        }),
+    let standalone = matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
     );
+    if standalone {
+        for op in ["DepthToSpace", "SpaceToDepth"] {
+            reg.register(
+                OpKey::new(op, "", 1),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(structural::SpaceDepthFactory {
+                    runtime: runtime.clone(),
+                    standalone,
+                }),
+            );
+        }
+    } else {
+        reg.register(
+            OpKey::new("SpaceToDepth", "", 13),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(structural::SpaceDepthFactory {
+                runtime: runtime.clone(),
+                standalone,
+            }),
+        );
+    }
     reg.register(
         OpKey::new("EyeLike", "", 9),
         onnx_runtime_ep_api::WorkspacePlanning::None,

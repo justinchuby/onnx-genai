@@ -105,8 +105,8 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | LSTM / GRU | 7 | Rare in modern models. |
 | ConvTranspose | 1 | Diffusion decoders. |
 | InstanceNormalization | 6 | Style transfer, diffusion. |
-| DepthToSpace | 1 | Super-resolution, diffusion. |
-| SpaceToDepth | 1 | |
+| DepthToSpace | 1 | Standalone nxrt NCHW rearrangement; `mode` since opset 11 (DCR default, or CRD). |
+| SpaceToDepth | 1 | Standalone nxrt inverse NCHW rearrangement; `mode` since opset 28 (DCR default, or CRD). ORT plugin registration remains unchanged. |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
 | Compress | 9 | |

@@ -3194,6 +3194,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // Batch 6 (issue #67): model-shaping/indexing structural operators.
     p.push(sweep("GatherND", gather_nd_cases()));
     p.push(sweep("SpaceToDepth", space_to_depth_cases()));
+    p.push(dedicated(
+        "DepthToSpace",
+        "cuda_conformance_gpu.rs",
+        "Independent DCR/CRD value fixtures in space_depth_modes_match_onnx",
+    ));
     p.push(sweep("EyeLike", eye_like_cases()));
 
     // Batch 7 (issue #67): general padding/cropping and sequence construction.
@@ -3944,6 +3949,122 @@ fn resize_19_symmetric_matches_onnx_and_cpu() {
         );
     }
 }
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn space_depth_modes_match_onnx() {
+    let ep = require_cuda();
+    let values: Vec<f32> = (0..16).map(|value| value as f32).collect();
+    for (op, src, dst, dcr, crd) in [
+        (
+            "SpaceToDepth",
+            [1, 2, 2, 4],
+            [1, 8, 1, 2],
+            [
+                0., 2., 8., 10., 1., 3., 9., 11., 4., 6., 12., 14., 5., 7., 13., 15.,
+            ],
+            [
+                0., 2., 1., 3., 4., 6., 5., 7., 8., 10., 9., 11., 12., 14., 13., 15.,
+            ],
+        ),
+        (
+            "DepthToSpace",
+            [1, 8, 1, 2],
+            [1, 2, 2, 4],
+            [
+                0., 4., 1., 5., 8., 12., 9., 13., 2., 6., 3., 7., 10., 14., 11., 15.,
+            ],
+            [
+                0., 2., 1., 3., 4., 6., 5., 7., 8., 10., 9., 11., 12., 14., 13., 15.,
+            ],
+        ),
+    ] {
+        for (opset, mode, expected) in [
+            (1, None, dcr),
+            (28, None, dcr),
+            (28, Some("DCR"), dcr),
+            (28, Some("CRD"), crd),
+        ] {
+            let mut attrs = vec![("blocksize", Attribute::Int(2))];
+            if let Some(mode) = mode {
+                attrs.push(("mode", Attribute::String(mode.as_bytes().to_vec())));
+            }
+            let case = Case {
+                label: format!("{op}-{opset}[{mode:?}]"),
+                op,
+                domain: "",
+                opset,
+                inputs: vec![input(DataType::Float32, &src, &values)],
+                outputs: vec![(DataType::Float32, dst.to_vec())],
+                attrs,
+                compare: Compare::ExactBytes,
+            };
+            let output = run_case(&ep, &case);
+            assert_eq!(
+                decode_floats(&output[0], DataType::Float32),
+                expected,
+                "{}",
+                case.label
+            );
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn ort_plugin_keeps_the_space_to_depth_13_contract() {
+    let ep = CudaExecutionProvider::new_for_ort_plugin().expect("CUDA device for ORT plugin");
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
+    let spatial: Vec<_> = descriptors
+        .iter()
+        .filter(|d| {
+            d.domain.is_empty() && matches!(d.op_type.as_str(), "SpaceToDepth" | "DepthToSpace")
+        })
+        .collect();
+    let [descriptor] = spatial.as_slice() else {
+        panic!(
+            "unexpected number of plugin spatial descriptors: {}",
+            spatial.len()
+        );
+    };
+    assert_eq!(descriptor.op_type, "SpaceToDepth");
+    assert_eq!(descriptor.since_version, 13);
+    assert_eq!(descriptor.end_version, u64::MAX);
+    assert_eq!(
+        descriptor.supported_dtypes,
+        &[DataType::Float32, DataType::Float16, DataType::BFloat16]
+    );
+    assert!(!ep.registry().supports("SpaceToDepth", "", 12));
+    assert!(!ep.registry().supports("DepthToSpace", "", 28));
+    // At the legacy provider boundary, `mode` was ignored by both the claim
+    // and kernel. Keep this probe below the plugin's independent shape filter.
+    let output = run_cuda(
+        &ep,
+        "SpaceToDepth",
+        "",
+        28,
+        &[input(
+            DataType::Float32,
+            &[1, 2, 2, 2],
+            &[0_f32, 1., 2., 3., 4., 5., 6., 7.],
+        )],
+        &[(DataType::Float32, vec![1, 8, 1, 1])],
+        &[
+            ("blocksize", Attribute::Int(2)),
+            ("mode", Attribute::String(b"CRD".to_vec())),
+        ],
+    );
+    assert_eq!(
+        decode_floats(&output[0], DataType::Float32),
+        [0., 4., 1., 5., 2., 6., 3., 7.]
+    );
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
