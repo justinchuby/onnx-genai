@@ -14,6 +14,14 @@ use crate::error::ShapeInferError;
 use crate::registry::InferenceRegistry;
 
 fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    infer_einsum(ctx, false)
+}
+
+fn native_einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    infer_einsum(ctx, true)
+}
+
+fn infer_einsum(ctx: &mut InferenceContext, native_runtime: bool) -> Result<(), ShapeInferError> {
     let equation_bytes = match ctx.node.attr("equation") {
         Some(Attribute::String(bytes)) => bytes,
         _ => {
@@ -63,7 +71,12 @@ fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         })
         .collect();
     let imported_opset = ctx.opset("");
-    let plan = match EinsumPlan::build_for_opset(equation, &inputs, imported_opset) {
+    let planned = if native_runtime {
+        EinsumPlan::build_for_native_opset(equation, &inputs, imported_opset)
+    } else {
+        EinsumPlan::build_for_opset(equation, &inputs, imported_opset)
+    };
+    let plan = match planned {
         Ok(plan) => plan,
         Err(error) if error.is_incomplete_metadata() => return Ok(()),
         Err(error) => {
@@ -124,4 +137,8 @@ fn einsum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// Register the `Einsum` rule.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Einsum", 12, einsum);
+}
+
+pub(crate) fn register_native(reg: &mut InferenceRegistry) {
+    reg.register("", "Einsum", 12, native_einsum);
 }

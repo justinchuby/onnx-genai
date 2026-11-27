@@ -197,7 +197,7 @@ impl ChildExecutor {
 
         // Seeded formal/capture shapes let inference resolve the body once.
         // Truly data-dependent outputs remain on Executor's JIT shape path.
-        let registry = InferenceRegistry::default_registry();
+        let registry = InferenceRegistry::native_runtime_registry();
         registry.infer_graph(&mut graph, &self.inherited_opsets, MergePolicy::Permissive)?;
 
         Ok(CompiledChildPlan {

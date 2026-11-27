@@ -274,6 +274,7 @@ SESSION_HETERO_EXPECTED_TESTS = frozenset(
     {
         "cuda_cpu_cuda_chain_executes_on_both_real_providers",
         "eye_like_22_unknown_input_rank_runs_without_cpu_fallback",
+        "einsum_bf16_executes_at_v27_and_v28_in_strict_single_cuda_sessions",
         "packed_shape_only_cuda_no_fallback",
     }
 )
