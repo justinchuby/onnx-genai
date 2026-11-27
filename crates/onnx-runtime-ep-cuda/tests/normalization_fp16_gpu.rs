@@ -225,6 +225,102 @@ fn rms_reference(input: &[f32], scale: &[f32], norm_size: usize, epsilon: f32) -
         .collect()
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn rmsnorm_float16_stash_overflow_is_not_float_stash() {
+    let input = [300.0f32, 300.0];
+    let scale = [1.0f32, 1.0];
+    let outputs = run_norm(
+        "RMSNormalization",
+        23,
+        &[float_tensor(&[1, 2], &input), float_tensor(&[2], &scale)],
+        &[(DataType::Float32, vec![1, 2])],
+        &[
+            ("epsilon", Attribute::Float(0.0)),
+            ("stash_type", Attribute::Int(10)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(decode_float(&outputs[0]), [0.0, 0.0]);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn rmsnorm_bfloat16_stash_casts_x_before_statistics() {
+    let input = [1.001f32, 1.002];
+    let scale = [1.0f32, 1.0];
+    let outputs = run_norm(
+        "RMSNormalization",
+        23,
+        &[float_tensor(&[1, 2], &input), float_tensor(&[2], &scale)],
+        &[(DataType::Float32, vec![1, 2])],
+        &[
+            ("epsilon", Attribute::Float(0.0)),
+            ("stash_type", Attribute::Int(16)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(decode_float(&outputs[0]), [1.0, 1.0]);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn rmsnorm_bfloat16_stash_reduce_mean_rounds_only_the_result() {
+    let input = vec![1.0f32; 512];
+    let scale = vec![1.0f32; 512];
+    let outputs = run_norm(
+        "RMSNormalization",
+        23,
+        &[
+            float_tensor(&[1, 512], &input),
+            float_tensor(&[512], &scale),
+        ],
+        &[(DataType::Float32, vec![1, 512])],
+        &[
+            ("epsilon", Attribute::Float(0.0)),
+            ("stash_type", Attribute::Int(16)),
+        ],
+    )
+    .unwrap();
+    assert!(
+        decode_float(&outputs[0])
+            .into_iter()
+            .all(|value| value == 1.0),
+        "ReduceMean accumulates BFLOAT16 squared inputs before rounding its result"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn rmsnorm_double_stash_avoids_float_square_overflow() {
+    let input = [1.0e20f32, 1.0e20];
+    let scale = [1.0f32, 1.0];
+    let outputs = run_norm(
+        "RMSNormalization",
+        23,
+        &[float_tensor(&[1, 2], &input), float_tensor(&[2], &scale)],
+        &[(DataType::Float32, vec![1, 2])],
+        &[
+            ("epsilon", Attribute::Float(0.0)),
+            ("stash_type", Attribute::Int(11)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(decode_float(&outputs[0]), [1.0, 1.0]);
+}
+
 fn layer_reference(
     input: &[f32],
     scale: &[f32],

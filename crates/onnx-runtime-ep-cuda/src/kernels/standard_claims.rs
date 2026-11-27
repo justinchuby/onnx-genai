@@ -557,8 +557,11 @@ fn rms_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
 
     match node.attr("stash_type") {
         None => Ok(()),
-        Some(attribute) if attribute.as_int() == Some(1) => Ok(()),
-        Some(_) => Err("attribute 'stash_type' must be 1 (float)".into()),
+        Some(attribute) if matches!(attribute.as_int(), Some(1 | 10 | 11 | 16)) => Ok(()),
+        Some(attribute) => Err(format!(
+            "attribute 'stash_type' must be FLOAT (1), FLOAT16 (10), DOUBLE (11), or BFLOAT16 (16), got {:?}",
+            attribute.as_int()
+        )),
     }
 }
 

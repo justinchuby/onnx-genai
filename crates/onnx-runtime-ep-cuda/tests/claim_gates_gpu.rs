@@ -111,6 +111,21 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
         &[DataType::Float64, DataType::Float32],
         1,
     );
+    for stash_type in [1, 10, 11, 16] {
+        let dtypes = [DataType::Float32, DataType::Float32];
+        let (graph, id) = node(
+            "RMSNormalization",
+            &dtypes,
+            1,
+            None,
+            &[("stash_type", Attribute::Int(stash_type))],
+        );
+        assert!(
+            ep.supports_op(graph.node(id), 23, &[], &dtypes, &[])
+                .is_supported(),
+            "RMSNormalization must claim schema-legal stash_type={stash_type}"
+        );
+    }
     let fp16_dtypes = [DataType::Float16, DataType::Float32];
     let (fp16_graph, fp16_id) = node("RMSNormalization", &fp16_dtypes, 1, None, &[]);
     assert!(
@@ -241,7 +256,7 @@ fn claim_gates_reject_attributes_cuda_would_otherwise_silently_coerce() {
             23,
             vec![DataType::Float32, DataType::Float32],
             1,
-            vec![("stash_type", Attribute::Int(16))],
+            vec![("stash_type", Attribute::Int(6))],
         ),
         (
             "RotaryEmbedding",
