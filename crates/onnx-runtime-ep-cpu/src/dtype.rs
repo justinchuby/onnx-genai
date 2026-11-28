@@ -1912,6 +1912,9 @@ mod tests {
             assert_eq!(storage, expected, "short producer must not write any bytes");
             for (i, &v) in values.iter().enumerate() {
                 let offset = 1 + (4 + (i / 3) * 7 - (i % 3) * 2) * width;
+                if dtype == DataType::Float64 && v.is_nan() {
+                    continue;
+                }
                 let bits = match dtype {
                     DataType::Float16 => half::f16::from_f32(v).to_bits().to_ne_bytes().to_vec(),
                     DataType::BFloat16 => half::bf16::from_f32(v).to_bits().to_ne_bytes().to_vec(),
@@ -1922,6 +1925,15 @@ mod tests {
                 expected[offset..offset + width].copy_from_slice(&bits);
             }
             write_dense_f32_narrow("scatter", &mut out, &values).unwrap();
+            if dtype == DataType::Float64 {
+                let nan_index = 2usize;
+                let nan_offset = 1 + (4 + (nan_index / 3) * 7 - (nan_index % 3) * 2) * width;
+                let nan_bytes: [u8; 8] =
+                    storage[nan_offset..nan_offset + width].try_into().unwrap();
+                assert!(f64::from_ne_bytes(nan_bytes).is_nan());
+                expected[nan_offset..nan_offset + width]
+                    .copy_from_slice(&storage[nan_offset..nan_offset + width]);
+            }
             assert_eq!(storage, expected, "dtype={dtype:?}");
         }
     }
