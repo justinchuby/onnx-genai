@@ -550,6 +550,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
             DataType::Int64,
         ],
         ("CumSum", "") => ARITH_DTYPES,
+        ("RNN", "") => onnx_runtime_ep_api::rnn::DTYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
 
@@ -716,6 +717,7 @@ pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
 pub mod rmsnorm;
+mod rnn;
 pub mod rotary_embedding;
 pub mod sdpa;
 pub mod selection;
@@ -899,6 +901,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Compress",
     "Tile",
     "Range",
+    "RNN",
     "CumSum",
     "Clip",
     "ArgMax",
@@ -2234,6 +2237,17 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("CumSum", "", 14),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::CumSumFactory),
+    );
+    rec.register_through(
+        OpKey::new("RNN", "", 14),
+        21,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(rnn::Factory),
+    );
+    rec.register(
+        OpKey::new("RNN", "", 22),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(rnn::Factory),
     );
     rec.register(
         OpKey::new("CumProd", "", 26),
@@ -3792,10 +3806,11 @@ mod tests {
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
         // Opset-29 LinearAttention adds one standalone registration.
         // Standalone QLinearMatMul-21 adds one registration.
+        // RNN has separate opset-14-through-21 and opset-22 registrations.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 138
+                + 139
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
