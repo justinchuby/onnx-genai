@@ -1018,28 +1018,48 @@ fn servingless_token_contract_is_single_request(
     contract: &onnx_genai_metadata::TensorContract,
     symbols: &HashMap<String, i64>,
 ) -> anyhow::Result<bool> {
-    let Some(axis) = contract.batch_layout.request_axis() else {
-        return Ok(true);
+    use onnx_genai_metadata::{BatchLayout, TensorDimension};
+
+    let (axis, expansion) = match &contract.batch_layout {
+        BatchLayout::Shared => return Ok(true),
+        BatchLayout::RequestAligned { axis } => (*axis, 1_i64),
+        BatchLayout::RequestExpanded { axis, factor } => {
+            let factor = i64::try_from(*factor)?;
+            anyhow::ensure!(
+                factor > 0,
+                "tokens output has a zero request expansion factor; repair the workflow output \
+                 contract"
+            );
+            (*axis, factor)
+        }
+        BatchLayout::TokenPacked { .. } | BatchLayout::RuntimeSequenceState => return Ok(false),
     };
-    let extent = match contract.shape.get(axis).context(
+
+    let dimension = contract.shape.get(axis).context(
         "tokens output request axis exceeds its rank; repair the workflow output contract",
-    )? {
-        onnx_genai_metadata::TensorDimension::Fixed(extent) => *extent,
-        onnx_genai_metadata::TensorDimension::Symbol(symbol) => {
+    )?;
+    match dimension {
+        TensorDimension::Fixed(extent) => {
+            anyhow::ensure!(
+                *extent >= 0,
+                "tokens output has negative request extent {extent}; repair the workflow output \
+                 contract"
+            );
+            Ok(*extent % expansion == 0 && *extent / expansion == 1)
+        }
+        TensorDimension::Symbol(symbol) => {
             let Some(extent) = symbols.get(symbol) else {
                 return Ok(false);
             };
-            *extent
+            anyhow::ensure!(
+                *extent >= 0,
+                "tokens output symbol '{symbol}' has negative request extent {extent}; repair the \
+                 workflow output contract"
+            );
+            Ok(*extent == 1)
         }
-        onnx_genai_metadata::TensorDimension::Any => return Ok(false),
-    };
-    let expansion = i64::try_from(contract.batch_layout.request_expansion_factor())?;
-    anyhow::ensure!(
-        extent >= 0 && expansion > 0,
-        "tokens output has invalid request extent {extent} or expansion factor {expansion}; repair \
-         the workflow output contract"
-    );
-    Ok(extent <= expansion)
+        TensorDimension::Any => Ok(false),
+    }
 }
 
 #[cfg(test)]
@@ -1054,6 +1074,7 @@ mod servingless_generation_tests {
     fn servingless_generation_requires_a_provably_single_request_output() {
         let symbols = HashMap::from([("batch".to_string(), 1)]);
         for contract in [
+            contract("dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: shared }\n"),
             contract(
                 "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
             ),
@@ -1063,24 +1084,66 @@ mod servingless_generation_tests {
             contract(
                 "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
             ),
+            contract(
+                "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+            ),
         ] {
             assert!(servingless_token_contract_is_single_request(&contract, &symbols).unwrap());
         }
 
-        for contract in [
-            contract(
-                "dtype: int64\nshape: [2, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+        let two_requests = HashMap::from([("batch".to_string(), 2)]);
+        let unresolved = HashMap::new();
+        for (contract, symbols) in [
+            (
+                contract(
+                    "dtype: int64\nshape: [2, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+                ),
+                &symbols,
             ),
-            contract(
-                "dtype: int64\nshape: [Any, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+            (
+                contract(
+                    "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+                ),
+                &symbols,
             ),
-            contract(
-                "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+            (
+                contract(
+                    "dtype: int64\nshape: [4, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+                ),
+                &two_requests,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [Any, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+                ),
+                &unresolved,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [items, 1]\nbatch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: offsets, owner: owner }] }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: runtime_sequence_state }\n",
+                ),
+                &symbols,
             ),
         ] {
-            assert!(
-                !servingless_token_contract_is_single_request(&contract, &HashMap::new()).unwrap()
-            );
+            assert!(!servingless_token_contract_is_single_request(&contract, symbols).unwrap());
         }
     }
 }
@@ -1136,12 +1199,21 @@ impl<'a> WorkflowExecutionPlan<'a> {
             .context("generation requires one package output with role: tokens")?;
         let Some(serving) = workflow.serving.as_ref() else {
             anyhow::ensure!(
-                self.request_count <= 1
-                    && servingless_token_contract_is_single_request(
-                        &output_contract.contract,
-                        &self.initial_symbols,
-                    )?,
-                "generation requires a workflow serving contract"
+                self.request_count <= 1,
+                "generation has {} logical requests but workflow output '{output}' has no serving \
+                 contract to preserve separate token streams; use the tensor workflow API for \
+                 batching or author a serving contract",
+                self.request_count
+            );
+            anyhow::ensure!(
+                servingless_token_contract_is_single_request(
+                    &output_contract.contract,
+                    &self.initial_symbols,
+                )?,
+                "generation cannot prove that serving-less workflow output '{output}' describes \
+                 exactly one token stream from its '{}' batch layout; use the tensor workflow API \
+                 or author a single-request output contract",
+                output_contract.contract.batch_layout.kind_name()
             );
             return Ok(());
         };

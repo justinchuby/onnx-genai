@@ -1497,12 +1497,24 @@ mod tests {
             graph.add_output(output);
             let cache = GraphViewCache::build(&graph).unwrap();
             let view = GraphView::new(&graph, &cache);
-            let unfiltered = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+            let unfiltered = query_plugin_capabilities(
+                &view,
+                &ep,
+                &factory.kernel_registry_entries,
+                &[],
+                |_, _| true,
+            )
+            .unwrap();
             assert!(unfiltered.iter().any(|claim| claim.node_ids.contains(&rnn)));
 
-            let claims =
-                query_plugin_capabilities(&view, &ep, factory.operator_exclusions, |_, _| true)
-                    .unwrap();
+            let claims = query_plugin_capabilities(
+                &view,
+                &ep,
+                &factory.kernel_registry_entries,
+                factory.operator_exclusions,
+                |_, _| true,
+            )
+            .unwrap();
             assert_eq!(claims.len(), 2);
             assert!(claims.iter().any(|claim| claim.node_ids == [before]));
             assert!(claims.iter().any(|claim| claim.node_ids == [after]));
@@ -1576,12 +1588,24 @@ mod tests {
             let cache = GraphViewCache::build(&graph).unwrap();
             let view = GraphView::new(&graph, &cache);
 
-            let standalone = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+            let standalone = query_plugin_capabilities(
+                &view,
+                &ep,
+                &factory.kernel_registry_entries,
+                &[],
+                |_, _| true,
+            )
+            .unwrap();
             assert_eq!(standalone.len(), 1);
             assert_eq!(standalone[0].node_ids, [reverse, identity]);
-            let plugin =
-                query_plugin_capabilities(&view, &ep, factory.operator_exclusions, |_, _| true)
-                    .unwrap();
+            let plugin = query_plugin_capabilities(
+                &view,
+                &ep,
+                &factory.kernel_registry_entries,
+                factory.operator_exclusions,
+                |_, _| true,
+            )
+            .unwrap();
             assert_eq!(plugin.len(), 1);
             assert_eq!(plugin[0].node_ids, [identity]);
         }

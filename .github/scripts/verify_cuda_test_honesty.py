@@ -340,6 +340,7 @@ EXPECTED_EINSUM_TESTS_BY_TARGET = {
             "materialized_view_rejects_partial_offset_overlap_before_mutation",
             "misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract",
             "optimizer_memory_ceiling_selects_generic_native_without_intermediates",
+            "ort_plugin_claim_keeps_official_einsum_dtype_boundary",
             "permutation_and_diagonal_use_zero_copy_views_and_materialize_correctly",
             "registry_reachability_and_claim_declines_are_intentional",
             "semantic_capture_mismatch_is_pre_mutation_and_preserves_snapshot",
