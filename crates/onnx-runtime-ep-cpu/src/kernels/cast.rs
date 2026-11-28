@@ -1237,7 +1237,13 @@ mod tests {
         let shape = static_shape([7]);
         assert!(
             provider
-                .supports_op(&node, 1, &[shape.clone()], &[DataType::Uint8], &[])
+                .supports_op(
+                    &node,
+                    1,
+                    std::slice::from_ref(&shape),
+                    &[DataType::Uint8],
+                    &[],
+                )
                 .is_supported()
         );
         node.attributes
@@ -1281,20 +1287,38 @@ mod tests {
             .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
         assert!(
             provider
-                .supports_op(&cast, 27, &[shape.clone()], &[DataType::Float6E2M3], &[],)
+                .supports_op(
+                    &cast,
+                    27,
+                    std::slice::from_ref(&shape),
+                    &[DataType::Float6E2M3],
+                    &[],
+                )
                 .reason()
                 .is_some_and(|reason| reason.contains("opset 28"))
         );
         assert!(
             provider
-                .supports_op(&cast, 28, &[shape.clone()], &[DataType::Float6E2M3], &[],)
+                .supports_op(
+                    &cast,
+                    28,
+                    std::slice::from_ref(&shape),
+                    &[DataType::Float6E2M3],
+                    &[],
+                )
                 .is_supported()
         );
         cast.attributes
             .insert("to".into(), Attribute::Int(DataType::Int32 as i64));
         assert!(
             provider
-                .supports_op(&cast, 28, &[shape.clone()], &[DataType::Float6E2M3], &[],)
+                .supports_op(
+                    &cast,
+                    28,
+                    std::slice::from_ref(&shape),
+                    &[DataType::Float6E2M3],
+                    &[],
+                )
                 .reason()
                 .is_some_and(|reason| reason.contains("supports only"))
         );

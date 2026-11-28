@@ -156,6 +156,7 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         E::Load(load) => map_loader_error(load),
         E::NotInitialized
         | E::Internal(_)
+        | E::HostTensorInitialization { .. }
         | E::UnresolvedShape { .. }
         | E::ShapeOverflow { .. }
         | E::OutputShapeCountMismatch { .. }
@@ -1034,6 +1035,14 @@ mod tests {
                 op: "NonZero".into(),
                 expected: 1,
                 got: 2,
+            }),
+            OrtErrorCode::Fail
+        );
+        assert_eq!(
+            map_session_error(&E::HostTensorInitialization {
+                dtype: onnx_runtime_ir::DataType::Float32,
+                shape: vec![2],
+                source: Box::new(std::io::Error::other("allocation failed")),
             }),
             OrtErrorCode::Fail
         );

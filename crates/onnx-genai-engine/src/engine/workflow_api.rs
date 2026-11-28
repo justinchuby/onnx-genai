@@ -213,6 +213,8 @@ impl Engine {
     /// The same drive `generate` uses. A caller reaches for this when it has
     /// tensors to bind that no prompt can express — an image, an audio window,
     /// a caller-built mask — not because the package is a different kind.
+    /// Generation reads one token stream from one physical lane. Use
+    /// [`Self::run_pipeline_outputs`] to consume multiple lanes or named streams.
     pub fn generate_with_pipeline_request(
         &mut self,
         request: PipelineGenerateRequest,

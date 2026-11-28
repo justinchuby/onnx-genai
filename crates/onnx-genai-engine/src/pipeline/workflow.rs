@@ -267,6 +267,7 @@ pub(crate) struct WorkflowPerformanceCounters {
 pub struct WorkflowExecutionPlan<'a> {
     engine: &'a WorkflowRuntime,
     generation_control: Option<GenerationControl>,
+    generation_output: Option<GenerationTokenOutput>,
     values: PipelineTensors,
     input_aliases: HashMap<String, String>,
     initial_symbols: HashMap<String, i64>,
@@ -307,6 +308,7 @@ pub(crate) struct WorkflowRunTelemetry {
     stage_runs: BTreeMap<String, u64>,
     stage_elapsed_ns: BTreeMap<String, u128>,
     row_outputs: BTreeMap<String, Vec<String>>,
+    generation_output: Option<GenerationTokenOutput>,
     /// Publications in the transaction working set, keyed by declared output
     /// identity rather than incidental event/value names.
     output_publications: BTreeMap<String, u64>,
@@ -1014,6 +1016,238 @@ impl WorkflowRuntime {
     }
 }
 
+#[derive(Clone)]
+struct GenerationTokenOutput {
+    name: String,
+    request_axis: Option<usize>,
+    selected_row: Option<usize>,
+}
+
+impl GenerationTokenOutput {
+    fn new(
+        name: &str,
+        contract: &onnx_genai_metadata::TensorContract,
+        servingless: bool,
+    ) -> anyhow::Result<Self> {
+        let layout = &contract.batch_layout;
+        let expansion = layout.request_expansion_factor();
+        anyhow::ensure!(
+            expansion == 1,
+            "generation cannot flatten output '{name}' with request expansion factor \
+             {expansion}; reduce to one physical token stream or use the tensor workflow API"
+        );
+        Ok(Self {
+            name: name.to_string(),
+            request_axis: layout.request_axis().or_else(|| {
+                // Legacy dense token outputs can declare [1, sequence] as shared.
+                (servingless && layout.is_shared() && contract.rank() == 2).then_some(0)
+            }),
+            selected_row: None,
+        })
+    }
+
+    /// Flattening is only lossless for one publication stream, one row and
+    /// one physical lane. Check the accumulated extent before observing a chunk.
+    fn validate_chunk(
+        &mut self,
+        row: Option<usize>,
+        chunk: &Value,
+        previous: Option<&Value>,
+        mode: &WorkflowEmitMode,
+        axis: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let output = &self.name;
+        if let Some(request_axis) = self.request_axis {
+            let extent = |value: &Value| {
+                value.shape().get(request_axis).copied().with_context(|| {
+                    format!(
+                        "generation output '{output}' request axis {request_axis} is missing \
+                         from payload shape {:?}; repair the output contract",
+                        value.shape()
+                    )
+                })
+            };
+            let chunk_extent = i128::from(extent(chunk)?);
+            let accumulated_extent = if let Some(previous) =
+                previous.filter(|_| matches!(mode, WorkflowEmitMode::Append))
+            {
+                let previous_extent = i128::from(extent(previous)?);
+                if append_axis(axis, chunk) == request_axis {
+                    previous_extent + chunk_extent
+                } else {
+                    previous_extent
+                }
+            } else {
+                chunk_extent
+            };
+            anyhow::ensure!(
+                chunk_extent == 1 && accumulated_extent == 1,
+                "generation cannot flatten output '{output}': request axis {request_axis} has \
+                 observed extent {accumulated_extent} (chunk extent {chunk_extent}), expected 1; \
+                 append along the token axis, reduce to one physical lane, or use the tensor \
+                 workflow API"
+            );
+        }
+        if let Some(row) = row {
+            let selected = self.selected_row.get_or_insert(row);
+            anyhow::ensure!(
+                *selected == row,
+                "generation cannot flatten multi-row ragged output '{output}' (rows {selected} \
+                 and {row}); consume semantic row streams with the tensor workflow API instead"
+            );
+        }
+        Ok(())
+    }
+
+    fn servingless_contract_is_single_lane(
+        &self,
+        contract: &onnx_genai_metadata::TensorContract,
+        symbols: &HashMap<String, i64>,
+    ) -> anyhow::Result<bool> {
+        let Some(axis) = self.request_axis else {
+            return Ok(contract.batch_layout.is_shared() && contract.rank() <= 1);
+        };
+        let output = &self.name;
+        let dimension = contract.shape.get(axis).with_context(|| {
+            format!(
+                "generation output '{output}' request axis {axis} exceeds rank {}; \
+                 repair the workflow output contract",
+                contract.rank()
+            )
+        })?;
+        let extent = match dimension {
+            TensorDimension::Fixed(extent) => Some(extent),
+            TensorDimension::Symbol(symbol) => symbols.get(symbol),
+            TensorDimension::Any => None,
+        };
+        let Some(&extent) = extent else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            extent >= 0,
+            "generation output '{output}' request axis {axis} has negative extent {extent}; \
+             repair the workflow output contract"
+        );
+        Ok(extent == 1)
+    }
+}
+
+#[cfg(test)]
+mod servingless_generation_tests {
+    use super::*;
+
+    fn contract(yaml: &str) -> onnx_genai_metadata::TensorContract {
+        serde_yaml::from_str(yaml).expect("test token contract")
+    }
+
+    #[test]
+    fn servingless_generation_requires_a_provably_single_physical_lane() {
+        let is_single_lane = |contract: &onnx_genai_metadata::TensorContract, symbols: &_| {
+            GenerationTokenOutput::new("tokens", contract, true).is_ok_and(|output| {
+                output
+                    .servingless_contract_is_single_lane(contract, symbols)
+                    .unwrap()
+            })
+        };
+        let symbols = HashMap::from([("batch".to_string(), 1)]);
+        for contract in [
+            contract("dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: shared }\n"),
+            contract("dtype: int64\nshape: [tokens]\nbatch_layout: { kind: shared }\n"),
+            contract(
+                "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+            ),
+            contract(
+                "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 1 }\n",
+            ),
+            contract(
+                "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+            ),
+            contract(
+                "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 1 }\n",
+            ),
+        ] {
+            assert!(is_single_lane(&contract, &symbols));
+        }
+
+        let two_requests = HashMap::from([("batch".to_string(), 2)]);
+        let unresolved = HashMap::new();
+        for (contract, symbols) in [
+            (
+                contract("dtype: int64\nshape: [2, 1]\nbatch_layout: { kind: shared }\n"),
+                &symbols,
+            ),
+            (
+                contract("dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: shared }\n"),
+                &two_requests,
+            ),
+            (
+                contract("dtype: int64\nshape: [Any, 1]\nbatch_layout: { kind: shared }\n"),
+                &symbols,
+            ),
+            (
+                contract("dtype: int64\nshape: [1, 1, 1]\nbatch_layout: { kind: shared }\n"),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [2, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [2, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_expanded, axis: 0, factor: 2 }\n",
+                ),
+                &two_requests,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [Any, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
+                ),
+                &unresolved,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [items, 1]\nbatch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: offsets, owner: owner }] }\n",
+                ),
+                &symbols,
+            ),
+            (
+                contract(
+                    "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: runtime_sequence_state }\n",
+                ),
+                &symbols,
+            ),
+        ] {
+            assert!(!is_single_lane(&contract, symbols));
+        }
+    }
+}
+
 impl<'a> WorkflowExecutionPlan<'a> {
     pub(crate) fn new(
         engine: &'a WorkflowRuntime,
@@ -1031,7 +1265,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         engine.require_execution_admitted()?;
         // The specialized host owns its control's semantic commit race.
         request.generation_control = None;
-        let plan = Self::new_hosted(engine, request, &[])?;
+        let mut plan = Self::new_hosted(engine, request, &[])?;
         plan.ensure_single_stream_generation()?;
         Ok(plan)
     }
@@ -1042,7 +1276,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
     ) -> anyhow::Result<Self> {
         engine.require_execution_admitted()?;
         request.generation_control = None;
-        let plan = Self::new_hosted(engine, request, &[])?;
+        let mut plan = Self::new_hosted(engine, request, &[])?;
         plan.ensure_single_stream_generation()?;
         Ok(plan)
     }
@@ -1056,31 +1290,75 @@ impl<'a> WorkflowExecutionPlan<'a> {
         (self.values, self.session_id)
     }
 
-    pub(crate) fn ensure_single_stream_generation(&self) -> anyhow::Result<()> {
+    pub(crate) fn ensure_single_stream_generation(&mut self) -> anyhow::Result<()> {
         let workflow = &self.engine.plan.workflow;
-        let output = workflow
+        let (output, output_contract) = workflow
             .outputs
             .iter()
             .find(|(_, output)| output.role == WorkflowOutputRole::Tokens)
-            .map(|(name, _)| name)
             .context("generation requires one package output with role: tokens")?;
-        let serving = workflow
-            .serving
-            .as_ref()
-            .context("generation requires a workflow serving contract")?;
-        let active = workflow
-            .state
-            .get(&serving.active)
-            .map_or(serving.active.as_str(), |state| state.initializer.as_str());
-        let active_rows = workflow_bool_rows(&self.values, active)?;
-        let row_plan = workflow_row_plan(workflow, &self.values, self.request_count)?;
-        let active_requests =
-            active_generation_request_count(&active_rows, row_plan.as_ref(), self.request_count)?;
+        let generation_output = GenerationTokenOutput::new(
+            output,
+            &output_contract.contract,
+            workflow.serving.is_none(),
+        )?;
+        if let Some(serving) = workflow.serving.as_ref() {
+            let active = workflow
+                .state
+                .get(&serving.active)
+                .map_or(serving.active.as_str(), |state| state.initializer.as_str());
+            let active_rows = workflow_bool_rows(&self.values, active)?;
+            let row_plan = workflow_row_plan(workflow, &self.values, self.request_count)?;
+            let active_requests = active_generation_request_count(
+                &active_rows,
+                row_plan.as_ref(),
+                self.request_count,
+            )?;
+            anyhow::ensure!(
+                active_requests <= 1,
+                "generation cannot flatten multi-row ragged output '{output}'; consume semantic row \
+                 streams with the tensor workflow API instead"
+            );
+        } else {
+            anyhow::ensure!(
+                self.request_count <= 1,
+                "generation has {} logical requests but workflow output '{output}' has no serving \
+                 contract to preserve separate token streams; use the tensor workflow API for \
+                 batching or author a serving contract",
+                self.request_count
+            );
+            anyhow::ensure!(
+                generation_output.servingless_contract_is_single_lane(
+                    &output_contract.contract,
+                    &self.initial_symbols,
+                )?,
+                "generation cannot prove that serving-less workflow output '{output}' describes \
+                 exactly one token stream from its '{}' batch layout; use the tensor workflow API \
+                 or author a single-request output contract",
+                output_contract.contract.batch_layout.kind_name()
+            );
+        }
+        // Generate has no stream selector. Resolve the identity before any token
+        // observer sees data, not after two streams have shared an accumulator.
+        let mut streams = std::collections::BTreeSet::new();
+        for_each_workflow_emit(&self.engine.plan.compiled_workflow.graph, &mut |emit| {
+            if let WorkflowNode::Emit {
+                output: target,
+                stream,
+                ..
+            } = emit
+                && target == output
+            {
+                streams.insert(stream.as_deref().unwrap_or(output.as_str()));
+            }
+        });
         anyhow::ensure!(
-            active_requests <= 1,
-            "generation cannot flatten multi-row ragged output '{output}'; consume semantic row \
-             streams with the tensor workflow API instead"
+            streams.len() == 1,
+            "generation requires exactly one token stream for output '{output}', but the \
+             workflow declares {streams:?}; select one stream in the workflow or use the \
+             tensor workflow API"
         );
+        self.generation_output = Some(generation_output);
         Ok(())
     }
 
@@ -1255,6 +1533,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         Ok(Self {
             engine,
             generation_control,
+            generation_output: None,
             values,
             input_aliases,
             initial_symbols,
@@ -1400,6 +1679,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // One named owner for everything this pass alone holds (§3.3): its id
         // and the telemetry it accumulates. Both end with the pass.
         let mut pass = engine.begin_pass(self.max_iterations_only);
+        pass.telemetry.generation_output = self.generation_output.clone();
         for island in &engine.backend.execution_islands {
             island.begin_execution(pass.id);
         }
@@ -2905,6 +3185,11 @@ impl WorkflowRuntime {
                 let output_contract = workflow.outputs.get(output).with_context(|| {
                     format!("workflow emit references undeclared output '{output}'")
                 })?;
+                let observe_generation_tokens = output_contract.role == WorkflowOutputRole::Tokens
+                    && telemetry
+                        .generation_output
+                        .as_ref()
+                        .is_none_or(|generation| generation.name == *output);
                 let guards = when
                     .as_deref()
                     .map(|guard| workflow_bool_rows(values, guard))
@@ -2941,7 +3226,7 @@ impl WorkflowRuntime {
                         telemetry,
                         symbols,
                         dynamic_symbols,
-                        output_contract.role == onnx_genai_metadata::WorkflowOutputRole::Tokens,
+                        observe_generation_tokens,
                     )?;
                     publish_pending_provisional_publications(publication_journal, host)?;
                     if let Some(host) = host.as_deref_mut() {
@@ -2992,6 +3277,13 @@ impl WorkflowRuntime {
                     symbols,
                     dynamic_symbols,
                 )?;
+                if let Some(generation) = telemetry
+                    .generation_output
+                    .as_mut()
+                    .filter(|generation| generation.name == *output)
+                {
+                    generation.validate_chunk(None, &emitted, values.get(output), mode, *axis)?;
+                }
                 if let Some(journal) = publication_journal.as_mut() {
                     journal
                         .publish(
@@ -3008,8 +3300,7 @@ impl WorkflowRuntime {
                         })?;
                 }
                 publish_pending_provisional_publications(publication_journal, host)?;
-                let staged_generation_tokens = (output_contract.role
-                    == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+                let staged_generation_tokens = observe_generation_tokens
                     .then(|| {
                         emitted
                             .to_vec_i64()?
@@ -5615,36 +5906,39 @@ fn clone_pipeline_tensors(values: &PipelineTensors) -> anyhow::Result<PipelineTe
         .collect()
 }
 
-fn workflow_emitted_outputs(node: &WorkflowNode) -> std::collections::HashSet<String> {
-    fn collect(node: &WorkflowNode, outputs: &mut std::collections::HashSet<String>) {
-        match node {
-            WorkflowNode::Sequence { nodes } => {
-                for node in nodes {
-                    collect(node, outputs);
-                }
+fn for_each_workflow_emit<'a>(node: &'a WorkflowNode, visit: &mut impl FnMut(&'a WorkflowNode)) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for node in nodes {
+                for_each_workflow_emit(node, visit);
             }
-            WorkflowNode::Loop { setup, body, .. } => {
-                collect(setup, outputs);
-                collect(body, outputs);
-            }
-            WorkflowNode::Branch { cases, default, .. } => {
-                for case in cases.values() {
-                    collect(case, outputs);
-                }
-                if let Some(default) = default {
-                    collect(default, outputs);
-                }
-            }
-            WorkflowNode::Emit { output, .. } => {
-                outputs.insert(output.clone());
-            }
-            WorkflowNode::Invoke { .. }
-            | WorkflowNode::Transfer { .. }
-            | WorkflowNode::ExecutionIsland { .. } => {}
         }
+        WorkflowNode::Loop { setup, body, .. } => {
+            for_each_workflow_emit(setup, visit);
+            for_each_workflow_emit(body, visit);
+        }
+        WorkflowNode::Branch { cases, default, .. } => {
+            for case in cases.values() {
+                for_each_workflow_emit(case, visit);
+            }
+            if let Some(default) = default {
+                for_each_workflow_emit(default, visit);
+            }
+        }
+        WorkflowNode::Emit { .. } => visit(node),
+        WorkflowNode::Invoke { .. }
+        | WorkflowNode::Transfer { .. }
+        | WorkflowNode::ExecutionIsland { .. } => {}
     }
+}
+
+fn workflow_emitted_outputs(node: &WorkflowNode) -> std::collections::HashSet<String> {
     let mut outputs = std::collections::HashSet::new();
-    collect(node, &mut outputs);
+    for_each_workflow_emit(node, &mut |emit| {
+        if let WorkflowNode::Emit { output, .. } = emit {
+            outputs.insert(output.clone());
+        }
+    });
     outputs
 }
 
@@ -5658,42 +5952,19 @@ fn workflow_emitted_outputs(node: &WorkflowNode) -> std::collections::HashSet<St
 /// what lets an append loop mix a ragged accept step with a single-token
 /// forced step and still produce one row per request.
 pub(super) fn workflow_row_wise_outputs(node: &WorkflowNode) -> std::collections::HashSet<String> {
-    fn collect(node: &WorkflowNode, outputs: &mut std::collections::HashSet<String>) {
-        match node {
-            WorkflowNode::Sequence { nodes } => {
-                for node in nodes {
-                    collect(node, outputs);
-                }
-            }
-            WorkflowNode::Loop { setup, body, .. } => {
-                collect(setup, outputs);
-                collect(body, outputs);
-            }
-            WorkflowNode::Branch { cases, default, .. } => {
-                for case in cases.values() {
-                    collect(case, outputs);
-                }
-                if let Some(default) = default {
-                    collect(default, outputs);
-                }
-            }
-            WorkflowNode::Emit {
-                output,
-                valid_length,
-                when,
-                ..
-            } => {
-                if valid_length.is_some() || when.is_some() {
-                    outputs.insert(output.clone());
-                }
-            }
-            WorkflowNode::Invoke { .. }
-            | WorkflowNode::Transfer { .. }
-            | WorkflowNode::ExecutionIsland { .. } => {}
-        }
-    }
     let mut outputs = std::collections::HashSet::new();
-    collect(node, &mut outputs);
+    for_each_workflow_emit(node, &mut |emit| {
+        if let WorkflowNode::Emit {
+            output,
+            valid_length,
+            when,
+            ..
+        } = emit
+            && (valid_length.is_some() || when.is_some())
+        {
+            outputs.insert(output.clone());
+        }
+    });
     outputs
 }
 
@@ -6070,6 +6341,14 @@ fn emit_workflow_rows_with_publications(
             &mut row_symbols,
             dynamic_symbols,
         )?;
+        let row_output = format!("{output}.row.{row}");
+        if let Some(generation) = telemetry
+            .generation_output
+            .as_mut()
+            .filter(|generation| generation.name == output)
+        {
+            generation.validate_chunk(Some(row), &emitted, values.get(&row_output), mode, axis)?;
+        }
         if observe_generation_tokens {
             staged_generation_tokens.push(
                 emitted
@@ -6099,7 +6378,6 @@ fn emit_workflow_rows_with_publications(
         telemetry.emit_events += 1;
         telemetry.emitted_elements += emitted.numel() as u64;
         telemetry.record_output_publication(output);
-        let row_output = format!("{output}.row.{row}");
         row_names[row] = row_output.clone();
         match mode {
             WorkflowEmitMode::Replace => {
@@ -9447,26 +9725,32 @@ impl WorkflowGenerationCursor {
     /// is: an emit into a row-wise output lands on its rows, and reading the
     /// bare name would find nothing and call that "emitted nothing".
     pub(crate) fn emitted_tokens(&self, runtime: &WorkflowRuntime) -> anyhow::Result<Vec<i64>> {
-        let Some(output) = runtime
-            .plan
-            .workflow
+        let workflow = &runtime.plan.workflow;
+        let Some((output, declaration)) = workflow
             .outputs
             .iter()
             .find(|(_, output)| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens)
-            .map(|(name, _)| name.clone())
         else {
             return Ok(Vec::new());
         };
+        let mut generation =
+            GenerationTokenOutput::new(output, &declaration.contract, workflow.serving.is_none())?;
         let values = clone_pipeline_tensors(&self.values)?;
         let outputs =
             runtime.package_outputs(values, self.telemetry.row_outputs.clone(), Vec::new());
-        let rows = outputs.rows(&output);
+        let rows = outputs.rows(output);
+        anyhow::ensure!(
+            rows.len() <= 1,
+            "generation cannot flatten multi-row ragged output '{output}'; consume semantic row \
+             streams with the tensor workflow API instead"
+        );
         let Some(value) = outputs
-            .aggregate(&output)
+            .aggregate(output)
             .or_else(|| rows.first().map(|(_, value)| *value))
         else {
             return Ok(Vec::new());
         };
+        generation.validate_chunk(None, value, None, &WorkflowEmitMode::Replace, None)?;
         value.to_vec_i64().map_err(Into::into)
     }
 

@@ -820,7 +820,7 @@ fn is_standard_bitshift(node: &onnx_runtime_ir::Node) -> bool {
     node.op_type == "BitShift" && onnx_runtime_ir::normalize_domain(&node.domain).is_empty()
 }
 
-fn query_plugin_capabilities(
+pub(crate) fn query_plugin_capabilities(
     view: &onnx_runtime_ir::GraphView<'_>,
     ep: &dyn ExecutionProvider,
     entries: &[KernelRegistryEntry],
@@ -2805,7 +2805,8 @@ mod tests {
 
             for graph_kernel in [false, true] {
                 let ep = ClaimingEp(graph_kernel.then_some(random));
-                let baseline = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+                let baseline =
+                    query_plugin_capabilities(&view, &ep, &[], &[], |_, _| true).unwrap();
                 assert_eq!(baseline.len(), 1);
                 assert_eq!(baseline[0].node_ids, [random, neighbor]);
 
@@ -2813,6 +2814,7 @@ mod tests {
                 let claims = query_plugin_capabilities(
                     &view,
                     &ep,
+                    &[],
                     NATIVE_RANDOM_EXCLUSIONS,
                     |node, via_graph| {
                         if view.node(node).id == random {

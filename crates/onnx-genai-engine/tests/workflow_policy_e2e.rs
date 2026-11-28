@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use onnx_genai_engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
     SessionForkParticipantKind, SessionPosition,
+    pipeline::{TypedRevisionOperation, WorkflowOutputPublication},
 };
 use onnx_genai_ort::{DataType, SessionOptions, Value};
 
@@ -2142,18 +2143,55 @@ pipeline:
         &[("update.onnx.textproto", MASKED_UPDATE)],
     )?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
-    let request =
+    let request = || -> anyhow::Result<_> {
+        Ok(
+            PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+                .with_input("current", Value::from_slice_i64(&[1, 99, 99], &[1, 3])?)
+                .with_input("proposed", Value::from_slice_i64(&[4, 5, 6], &[1, 3])?)
+                .with_input(
+                    "mask",
+                    Value::from_raw_bytes(vec![0, 1, 1], &[1, 3], onnx_genai_ort::DataType::Bool)?,
+                )
+                .with_input("step", Value::from_slice_i64(&[0], &[1])?),
+        )
+    };
+    assert_eq!(
+        engine.run_pipeline(request()?)?["tokens"].to_vec_i64()?,
+        [1, 5, 6]
+    );
+    assert_eq!(
+        engine.generate_with_pipeline_request(request()?)?.token_ids,
+        [1, 5, 6]
+    );
+
+    let multiple_rows =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
-            .with_input("current", Value::from_slice_i64(&[1, 99, 99], &[1, 3])?)
-            .with_input("proposed", Value::from_slice_i64(&[4, 5, 6], &[1, 3])?)
+            .with_input(
+                "current",
+                Value::from_slice_i64(&[1, 99, 99, 2, 99, 99], &[2, 3])?,
+            )
+            .with_input(
+                "proposed",
+                Value::from_slice_i64(&[4, 5, 6, 7, 8, 9], &[2, 3])?,
+            )
             .with_input(
                 "mask",
-                Value::from_raw_bytes(vec![0, 1, 1], &[1, 3], onnx_genai_ort::DataType::Bool)?,
+                Value::from_raw_bytes(
+                    vec![0, 1, 1, 0, 1, 1],
+                    &[2, 3],
+                    onnx_genai_ort::DataType::Bool,
+                )?,
             )
-            .with_input("step", Value::from_slice_i64(&[0], &[1])?);
-    assert_eq!(
-        engine.run_pipeline(request)?["tokens"].to_vec_i64()?,
-        [1, 5, 6]
+            .with_input("step", Value::from_slice_i64(&[0, 0], &[2])?);
+    let error = engine
+        .generate_with_pipeline_request(multiple_rows)
+        .expect_err("shared [2, sequence] tokens must not flatten into one generated stream");
+    let message = error.to_string();
+    assert!(
+        message.contains("tokens")
+            && message.contains("shared")
+            && message.contains("tensor workflow API"),
+        "{message}"
     );
 
     let speculative_metadata = r#"
@@ -3617,6 +3655,192 @@ pipeline:
         max_iterations: iterations
         carried: []
 "#;
+
+fn token_stream_package(
+    name: &str,
+    version: &str,
+    shape: &str,
+    layout: &str,
+    family: &str,
+    steps: &str,
+) -> anyhow::Result<Engine> {
+    let metadata = format!(
+        r#"
+schema_version: {version}
+pipeline:
+  workflow:
+    manifest: {{adapter_abis: {{}}}}
+    inputs:
+      first:
+        contract: {{dtype: int64, shape: {shape}, batch_layout: {layout}}}
+        role: {{kind: opaque}}
+        source: {{kind: application, name: first}}
+        required: true
+      second:
+        contract: {{dtype: int64, shape: {shape}, batch_layout: {layout}}}
+        role: {{kind: opaque}}
+        source: {{kind: application, name: second}}
+        required: true
+      active:
+        contract: {{dtype: bool, shape: []}}
+        role: {{kind: opaque}}
+        source: {{kind: literal}}
+        default: true
+    outputs:
+      answer:
+        contract: {{dtype: int64, shape: {shape}, batch_layout: {layout}}}
+        role: tokens
+        stage: pre_adapter
+        {family}
+    components: {{}}
+    steps:
+{steps}
+"#
+    );
+    Engine::from_dir(&package(name, &metadata, &[])?, EngineConfig::default())
+}
+
+fn token_stream_request(
+    first: &[i64],
+    second: &[i64],
+    shape: &[i64],
+) -> anyhow::Result<PipelineGenerateRequest> {
+    Ok(
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("first", Value::from_slice_i64(first, shape)?)
+            .with_input("second", Value::from_slice_i64(second, shape)?),
+    )
+}
+
+#[test]
+fn servingless_generation_rejects_expanded_token_lanes() -> anyhow::Result<()> {
+    let mut engine = token_stream_package(
+        "expanded-token-lanes",
+        "v1.1",
+        "[2, 1]",
+        "{kind: request_expanded, axis: 0, factor: 2}",
+        "",
+        "      - {kind: emit, value: first, output: answer, mode: replace}",
+    )?;
+    let request = || token_stream_request(&[17, 91], &[23, 97], &[2, 1]);
+    let outputs = engine.run_pipeline_outputs(request()?)?;
+    let answer = outputs.aggregate("answer").expect("dense tensor output");
+    assert_eq!(answer.shape(), [2, 1]);
+    assert_eq!(answer.to_vec_i64()?, [17, 91]);
+
+    let error = engine
+        .generate_with_pipeline_request(request()?)
+        .expect_err("generation must not concatenate two lanes owned by one request");
+    let message = format!("{error:#}");
+    for detail in [
+        "answer",
+        "request expansion factor 2",
+        "tensor workflow API",
+    ] {
+        assert!(message.contains(detail), "{message}");
+    }
+    Ok(())
+}
+
+#[test]
+fn servingless_generation_rejects_request_axis_growth_in_guarded_append() -> anyhow::Result<()> {
+    let request = || token_stream_request(&[17], &[91], &[1, 1]);
+    for axis in [0, 1] {
+        let steps = format!(
+            "      - {{kind: emit, value: first, output: answer, mode: append, when: active, axis: {axis}}}
+      - {{kind: emit, value: second, output: answer, mode: append, when: active, axis: {axis}}}"
+        );
+        let mut engine = token_stream_package(
+            "guarded-token-append",
+            "v1.1",
+            "[1, 1]",
+            "{kind: request_aligned, axis: 0}",
+            "",
+            &steps,
+        )?;
+        let outputs = engine.run_pipeline_outputs(request()?)?;
+        let rows = outputs.rows("answer");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.shape(), if axis == 0 { [2, 1] } else { [1, 2] });
+        assert_eq!(rows[0].1.to_vec_i64()?, [17, 91]);
+
+        let generated = engine.generate_with_pipeline_request(request()?);
+        if axis == 0 {
+            let error = generated.expect_err("one row key must not hide a second physical lane");
+            let message = format!("{error:#}");
+            for detail in [
+                "answer",
+                "request axis 0",
+                "observed extent 2",
+                "tensor workflow API",
+            ] {
+                assert!(message.contains(detail), "{message}");
+            }
+        } else {
+            assert_eq!(generated?.token_ids, [17, 91]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn servingless_generation_rejects_conflicting_named_token_streams() -> anyhow::Result<()> {
+    let request = || token_stream_request(&[17], &[91], &[1]);
+    for second_stream in ["draft", "answer_stream"] {
+        let steps = format!(
+            "      - {{kind: emit, value: first, output: answer, mode: append, stream: answer_stream}}
+      - {{kind: emit, value: second, output: answer, mode: append, stream: {second_stream}}}"
+        );
+        let mut engine = token_stream_package(
+            "named-token-revisions",
+            "v1.5",
+            "[Any]",
+            "{kind: shared}",
+            "family: {kind: revisions, version: \"1\"}",
+            &steps,
+        )?;
+        let outputs = engine.run_pipeline_outputs(request()?)?;
+        let revisions = outputs
+            .publications()
+            .iter()
+            .filter_map(|publication| match publication {
+                WorkflowOutputPublication::Revision(revision)
+                    if revision.operation == TypedRevisionOperation::Append =>
+                {
+                    Some(revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(revisions.len(), 2);
+        for (revision, stream, token) in [
+            (revisions[0], "answer_stream", 17),
+            (revisions[1], second_stream, 91),
+        ] {
+            assert_eq!(revision.stream.0, stream);
+            assert_eq!(
+                revision
+                    .payload
+                    .as_ref()
+                    .expect("append payload")
+                    .to_vec_i64()?,
+                [token]
+            );
+        }
+
+        let generated = engine.generate_with_pipeline_request(request()?);
+        if second_stream == "draft" {
+            let error = generated.expect_err("generation must not concatenate named revisions");
+            let message = format!("{error:#}");
+            for detail in ["answer", "answer_stream", "draft", "tensor workflow API"] {
+                assert!(message.contains(detail), "{message}");
+            }
+        } else {
+            assert_eq!(generated?.token_ids, [17, 91]);
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn prediction_time_limit_stops_generic_authored_emission_without_cancelling_commit()

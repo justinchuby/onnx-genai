@@ -3868,10 +3868,12 @@ mod tests {
         // RNN has separate opset-14-through-21 and opset-22 registrations.
         // The four random generators each have a second (opset-22) revision.
         // NegativeLogLikelihoodLoss adds opset 12, 13, and 22 entries.
+        // Det and ReverseSequence add one registration each, while MaxUnpool
+        // adds three schema-version registrations.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 144
+                + 149
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
                 + onnx_runtime_ep_api::reverse_sequence::VERSIONS.len()
