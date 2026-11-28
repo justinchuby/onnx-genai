@@ -227,6 +227,22 @@ pub const STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM: OperatorExclusions = &{
     rules
 };
 
+/// Standalone kernel revisions not exposed by the shipped ORT factories.
+pub const SHIPPED_ORT_EXCLUSIONS: OperatorExclusions = &{
+    let existing = STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM;
+    let mut rules = [OperatorExclusion {
+        domain: "",
+        op_type: "ReverseSequence",
+        since_version: 0,
+    }; STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM.len() + 1];
+    let mut i = 0;
+    while i < existing.len() {
+        rules[i] = existing[i];
+        i += 1;
+    }
+    rules
+};
+
 /// Earliest excluded schema revision for the normalized operator name.
 pub fn first_excluded_revision(
     exclusions: OperatorExclusions,
