@@ -408,6 +408,58 @@ fn native_random_cuda_distribution_dtype_seed_and_capture() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn gelu_opset20_cuda_preserves_float64_precision() {
+    let ep = require_cuda();
+    let xs = [
+        -3.123_456_789_012_345_f64,
+        -0.731_234_567_890_123,
+        0.613_579_246_801_357,
+        2.123_456_789_012_345,
+    ];
+    // Independent binary64 references from the normal CDF (erfc) and tanh formulas.
+    let exact = [
+        -0.002_791_435_029_202_671_6,
+        -0.169_878_911_821_562_23,
+        0.448_068_269_507_055_3,
+        2.087_659_986_821_002_6,
+    ];
+    let tanh = [
+        -0.002_428_442_720_514_409_3,
+        -0.169_942_551_318_503_17,
+        0.448_032_695_466_633_16,
+        2.087_864_070_651_28,
+    ];
+    let shape = [2, 2];
+    let x = input(DataType::Float64, &shape, &xs);
+    for (mode, expected) in [(None, exact), (Some("none"), exact), (Some("tanh"), tanh)] {
+        let attrs = mode
+            .map(|m| vec![("approximate", Attribute::String(m.as_bytes().to_vec()))])
+            .unwrap_or_default();
+        let output = run_cuda(
+            &ep,
+            "Gelu",
+            "",
+            20,
+            std::slice::from_ref(&x),
+            &[(DataType::Float64, shape.to_vec())],
+            &attrs,
+        );
+        assert_eq!(output[0].len(), std::mem::size_of_val(&expected));
+        for ((bytes, x), expected) in output[0].chunks_exact(8).zip(xs).zip(expected) {
+            let got = f64::from_ne_bytes(bytes.try_into().unwrap());
+            assert!(
+                (got - expected).abs() <= 2e-15,
+                "{mode:?}: GELU({x})={got}, expected {expected}"
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Profile model
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3811,8 +3863,8 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(dedicated(
         "Gelu",
-        "fused_epilogue_gpu.rs",
-        "GELU activation",
+        "cuda_conformance_gpu.rs",
+        "standard opset-20 Gelu: exact and tanh with FP64 references",
     ));
     p.push(dedicated("Silu", "activations_gpu.rs", "SiLU activation"));
     p.push(dedicated("LeakyRelu", "activations_gpu.rs", "alpha-driven"));

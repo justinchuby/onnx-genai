@@ -9,10 +9,10 @@
 //! stays numerically identical to the decomposition it replaces.
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
-use crate::dtype::to_dense_f32_widen;
+use crate::dtype::{to_dense, to_dense_f32_widen, write_dense};
 
 /// `√(2/π)`, the outer scale of the tanh GELU approximation, in `f64`.
 const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
@@ -99,6 +99,23 @@ impl KernelFactory for StdGeluFactory {
 impl Kernel for StdGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
+        if inputs[0].dtype == DataType::Float64 {
+            let mut values = to_dense::<f64>(&inputs[0])?;
+            for x in &mut values {
+                let v = *x;
+                *x = if v == f64::NEG_INFINITY {
+                    0.0
+                } else {
+                    let activation = if self.tanh {
+                        (SQRT_2_OVER_PI * (v + 0.044_715 * v * v * v)).tanh()
+                    } else {
+                        libm::erf(v * std::f64::consts::FRAC_1_SQRT_2)
+                    };
+                    (0.5 * v) * (1.0 + activation)
+                };
+            }
+            return write_dense(&mut outputs[0], &values);
+        }
         let x = to_dense_f32_widen("Gelu", &inputs[0])?;
         let tanh = self.tanh;
         super::simd_activations::write_mapped("Gelu", &mut outputs[0], &x, |x, y| {
@@ -259,5 +276,52 @@ mod tests {
         let mut out = Owned::zeros_f32(&[1]);
         k.execute(&[a.view()], &mut [out.view_mut()]).unwrap();
         assert!((out.to_f32()[0] - reference_tanh(1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn std_gelu_opset20_preserves_float64_precision() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::{Attribute, NodeId};
+
+        let ep = crate::CpuExecutionProvider::new();
+        let shape = [2, 2];
+        let xs = [
+            -3.123_456_789_012_345_f64,
+            0.613_579_246_801_357,
+            -0.731_234_567_890_123,
+            2.123_456_789_012_345,
+        ];
+        let input = Owned::f64(&shape, &xs).with_view(&shape, &[1, 2]);
+        for mode in [None, Some("none"), Some("tanh")] {
+            let mut node = Node::new(NodeId(0), "Gelu", vec![], vec![]);
+            if let Some(mode) = mode {
+                node.attributes.insert(
+                    "approximate".into(),
+                    Attribute::String(mode.as_bytes().to_vec()),
+                );
+            }
+            let kernel = ep.get_kernel(&node, &[shape.to_vec()], 20).unwrap();
+            let mut out = Owned::zeros(DataType::Float64, &shape);
+            kernel
+                .execute(&[input.view()], &mut [out.view_mut()])
+                .unwrap();
+            for (i, (got, x)) in out
+                .to_f64()
+                .into_iter()
+                .zip([xs[0], xs[2], xs[1], xs[3]])
+                .enumerate()
+            {
+                let expected = if mode == Some("tanh") {
+                    let inner = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044_715 * x.powi(3));
+                    x * (1.0 + inner.tanh()) / 2.0
+                } else {
+                    x * libm::erfc(-x / std::f64::consts::SQRT_2) / 2.0
+                };
+                assert!(
+                    (got - expected).abs() <= 2e-15,
+                    "{mode:?} at index {i}: GELU({x})={got}, expected {expected}"
+                );
+            }
+        }
     }
 }
