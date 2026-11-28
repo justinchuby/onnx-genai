@@ -1237,7 +1237,13 @@ mod tests {
         let shape = static_shape([7]);
         assert!(
             provider
-                .supports_op(&node, 1, std::slice::from_ref(&shape), &[DataType::Uint8], &[])
+                .supports_op(
+                    &node,
+                    1,
+                    std::slice::from_ref(&shape),
+                    &[DataType::Uint8],
+                    &[],
+                )
                 .is_supported()
         );
         node.attributes
