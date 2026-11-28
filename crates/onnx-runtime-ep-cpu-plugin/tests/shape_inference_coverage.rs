@@ -62,6 +62,55 @@ fn linear_attention_plugin_shape_admission_uses_resolved_schema_revision() {
     }
 }
 
+#[test]
+fn newly_registered_native_rules_route_at_their_exact_schema_revisions() {
+    let strategy = |op: &str, version: i64, input_count: usize| {
+        let mut node = Node::new(
+            NodeId(0),
+            op,
+            (0..input_count)
+                .map(|index| Some(ValueId(index as u32)))
+                .collect(),
+            vec![ValueId(100)],
+        );
+        node.version = Some(version);
+        ShapeInference::for_node(&node, &vec![vec![Some(2), Some(2)]; input_count], 1)
+    };
+
+    for (op, version) in [
+        ("Det", 11),
+        ("NegativeLogLikelihoodLoss", 12),
+        ("NegativeLogLikelihoodLoss", 13),
+        ("NegativeLogLikelihoodLoss", 22),
+        ("RNN", 1),
+        ("RNN", 14),
+        ("ReverseSequence", 10),
+    ] {
+        assert!(
+            matches!(
+                strategy(op, version, 1),
+                ShapeInference::NativeRegistry { shape_operands, .. }
+                    if shape_operands.is_empty()
+            ),
+            "{op}-{version} must route through its native shape rule"
+        );
+    }
+    for version in [9, 11, 22] {
+        assert!(
+            matches!(
+                strategy("MaxUnpool", version, 3),
+                ShapeInference::NativeRegistry { shape_operands, .. }
+                    if shape_operands == [2]
+            ),
+            "MaxUnpool-{version} must read only the optional output_shape operand"
+        );
+    }
+    assert!(matches!(
+        strategy("MaxUnpool", 10, 3),
+        ShapeInference::Declined { .. }
+    ));
+}
+
 /// Ops that resolve to `Declined` under the probe below, and therefore reach
 /// ORT's CPU EP rather than ours when they appear in a graph.
 ///
@@ -183,7 +232,7 @@ const TEST_ONLY: &[&str] = &["TotallyFakeOp"];
 /// exist on any real graph. Supplying a plausible bundle is the more faithful
 /// model of production, and an op still counts as declining unless *some* point
 /// in the matrix yields a rule.
-fn declines(op_type: &str, domain: &str) -> bool {
+fn declines_at(op_type: &str, domain: &str, opsets: &[i64]) -> bool {
     if domain.is_empty() && op_type == "DequantizePacked" {
         let mut node = Node::new(NodeId(0), op_type, vec![Some(ValueId(0))], vec![ValueId(1)]);
         node.version = Some(29);
@@ -217,7 +266,6 @@ fn declines(op_type: &str, domain: &str) -> bool {
         );
     }
 
-    const OPSETS: &[i64] = &[1, 13, 18, 22, 23, 27, 28, 29];
     const SHAPES: &[&[usize]] = &[&[8], &[4, 8], &[2, 3, 8], &[1, 3, 8, 8]];
     /// The integer attributes `for_node` reads, with values consistent with
     /// `SHAPES` (width 8, so `N`/`K` of 8 and a valid `axis`/`num_groups`).
@@ -233,7 +281,7 @@ fn declines(op_type: &str, domain: &str) -> bool {
         ],
     ];
 
-    for &opset in OPSETS {
+    for &opset in opsets {
         for arity in 1..=4usize {
             for shape in SHAPES {
                 for attrs in ATTR_BUNDLES {
@@ -262,6 +310,11 @@ fn declines(op_type: &str, domain: &str) -> bool {
     true
 }
 
+fn declines(op_type: &str, domain: &str) -> bool {
+    const OPSETS: &[i64] = &[1, 13, 18, 22, 23, 27, 28, 29];
+    declines_at(op_type, domain, OPSETS)
+}
+
 /// Enumerate from `OpRegistry::keys()`, not from
 /// `build_cpu_registry_with_descriptors()`.
 ///
@@ -285,6 +338,22 @@ fn registered_ops() -> Vec<(String, String)> {
     ops
 }
 
+fn registered_op_versions() -> std::collections::BTreeMap<(String, String), Vec<i64>> {
+    let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::for_ort_plugin();
+    let mut versions = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for key in ep.registry().keys() {
+        if TEST_ONLY.contains(&key.op_type.as_str()) {
+            continue;
+        }
+        let version = i64::try_from(key.since_version).expect("ONNX opsets fit in i64");
+        versions
+            .entry((key.domain.clone(), key.op_type.clone()))
+            .or_default()
+            .push(version);
+    }
+    versions
+}
+
 #[test]
 fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
     use onnx_runtime_ep_plugin::ep::{NATIVE_RANDOM_EXCLUSIONS, first_excluded_revision};
@@ -297,13 +366,14 @@ fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
         .collect();
     // Managed host kernels and operators excluded at every revision never
     // reach the raw plugin's shape filter.
-    let actual: Vec<(String, String)> = registered_ops()
+    let actual: Vec<(String, String)> = registered_op_versions()
         .into_iter()
-        .filter(|key| raw_abi_ops.contains(key))
-        .filter(|(domain, op)| {
+        .filter(|(key, _)| raw_abi_ops.contains(key))
+        .filter(|((domain, op), _)| {
             first_excluded_revision(NATIVE_RANDOM_EXCLUSIONS, domain, op) != Some(0)
         })
-        .filter(|(domain, op)| declines(op, domain))
+        .filter(|((domain, op), versions)| declines_at(op, domain, versions))
+        .map(|(key, _)| key)
         .collect();
 
     let mut expected: Vec<(String, String)> = DECLINED

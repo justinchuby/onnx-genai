@@ -395,7 +395,8 @@ impl Kernel for StagedRmsNormKernel {
                 self.axis
             };
             let groups = if axis >= 0 && axis < rank {
-                crate::trace::product(inputs[0].shape[..axis as usize].iter().copied())
+                onnx_runtime_ir::checked_numel(&inputs[0].shape[..axis as usize])
+                    .map_or(u64::MAX, |groups| groups as u64)
             } else {
                 0
             };

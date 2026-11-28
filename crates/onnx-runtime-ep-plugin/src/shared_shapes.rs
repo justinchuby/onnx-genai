@@ -95,6 +95,14 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
     let opset = node.local_opset()?;
     let op = node.op_type.as_str();
     if node.is_default_domain() {
+        match (op, opset) {
+            ("Det", 11)
+            | ("NegativeLogLikelihoodLoss", 12 | 13 | 22)
+            | ("RNN", 1 | 14)
+            | ("ReverseSequence", 10) => return Some(&[]),
+            ("MaxUnpool", 9 | 11 | 22) => return Some(&[2]),
+            _ => {}
+        }
         if (op == "DeformConv" && opset >= 19)
             || (opset >= 26 && matches!(op, "BitCast" | "CumProd"))
         {
