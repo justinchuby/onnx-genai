@@ -1,24 +1,43 @@
 //! Attribute-driven float activation kernels.
 
-use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
-use crate::dtype::{to_dense_f32_widen, to_dense_float, write_dense_f32_narrow, write_dense_float};
+use crate::dtype::{
+    FloatElem, to_dense_f32_widen, to_dense_float, write_dense_f32_narrow, write_dense_float,
+};
 
 const SELU_ALPHA_DEFAULT: f32 = 1.673_263_2;
 const SELU_GAMMA_DEFAULT: f32 = 1.050_701;
 
 #[derive(Clone, Copy)]
 enum Activation {
-    Elu { alpha: f32 },
-    LeakyRelu { alpha: f32 },
-    HardSigmoid { alpha: f32, beta: f32 },
-    Selu { alpha: f32, gamma: f32 },
-    ThresholdedRelu { alpha: f32 },
-    Swish { alpha: f32 },
+    Elu {
+        alpha: f32,
+    },
+    LeakyRelu {
+        alpha: f32,
+    },
+    HardSigmoid {
+        alpha: f32,
+        beta: f32,
+    },
+    Selu {
+        alpha: f32,
+        gamma: f32,
+    },
+    ThresholdedRelu {
+        alpha: f32,
+    },
+    Swish {
+        alpha: f32,
+    },
     Silu,
-    Celu { alpha: f32 },
+    Celu {
+        alpha: f32,
+        require_same_dtype: bool,
+    },
     Mish,
 }
 
@@ -76,7 +95,7 @@ impl Activation {
             // Shared with the slice path rather than transcribed again: the
             // literal ONNX formula loses NaN through `f32::max`/`min`, and one
             // copy of that guard is easier to keep true than two.
-            Self::Celu { alpha } => crate::kernels::simd_activations::celu_scalar(x, alpha),
+            Self::Celu { alpha, .. } => crate::kernels::simd_activations::celu_scalar(x, alpha),
             // Mish(x) = x * tanh(softplus(x)), with softplus in its stable
             // form so large `x` neither overflows nor loses the identity.
             Self::Mish => x * (x.max(0.0) + (-x.abs()).exp().ln_1p()).tanh(),
@@ -132,7 +151,7 @@ impl Activation {
                 x * s
             }
             Self::Silu => silu_f64(x),
-            Self::Celu { alpha } => {
+            Self::Celu { alpha, .. } => {
                 // See `simd_activations::celu_scalar`: `max`/`min` return the
                 // other operand for NaN, so without this the f64 path -- which
                 // every `Float64` tensor takes -- would answer `0.0` where ORT
@@ -193,7 +212,10 @@ pub struct SeluFactory;
 pub struct ThresholdedReluFactory;
 pub struct SwishFactory;
 pub struct SiluFactory;
-pub struct CeluFactory;
+pub struct CeluFactory {
+    pub require_same_dtype: bool,
+}
+pub struct Celu28Factory;
 pub struct MishFactory;
 
 impl KernelFactory for EluFactory {
@@ -279,8 +301,89 @@ impl KernelFactory for CeluFactory {
         // fall back to the documented default rather than produce Inf/NaN.
         let alpha = if alpha == 0.0 { 1.0 } else { alpha };
         Ok(Box::new(ActivationKernel {
-            activation: Activation::Celu { alpha },
+            activation: Activation::Celu {
+                alpha,
+                require_same_dtype: self.require_same_dtype,
+            },
         }))
+    }
+}
+
+struct Celu28Kernel {
+    alpha: f32,
+}
+
+impl KernelFactory for Celu28Factory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let alpha = match node.attr("alpha") {
+            None => 1.0,
+            Some(attr) => attr.as_float().ok_or_else(|| {
+                EpError::KernelFailed("Celu-28: 'alpha' must be an ONNX FLOAT attribute".into())
+            })?,
+        };
+        Ok(Box::new(Celu28Kernel { alpha }))
+    }
+}
+
+fn celu28_f32<T: FloatElem>(alpha: f32, input: &TensorView, output: &mut TensorMut) -> Result<()> {
+    let round = |value| T::from_f32(value).to_f32();
+    let alpha = round(alpha);
+    let y: Vec<T> = to_dense_float::<T>(input)?
+        .into_iter()
+        .map(|x| {
+            // The schema casts alpha and materializes Div, Exp, Sub and Mul
+            // outputs in the tensor dtype. Do not fuse away those roundings.
+            let scaled = round(x.to_f32() / alpha);
+            let elu = if scaled < 0.0 {
+                round(round(scaled.exp()) - 1.0)
+            } else {
+                scaled
+            };
+            T::from_f32(alpha * elu)
+        })
+        .collect();
+    write_dense_float::<T>(output, &y)
+}
+
+impl Kernel for Celu28Kernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("Celu-28", inputs, outputs, 1, 1, 1)?;
+        let input = &inputs[0];
+        let output = &mut outputs[0];
+        if input.dtype != output.dtype || input.shape != output.shape {
+            return Err(EpError::KernelFailed(format!(
+                "Celu-28: output dtype and shape ({:?}, {:?}) must match X ({:?}, {:?})",
+                output.dtype, output.shape, input.dtype, input.shape
+            )));
+        }
+        match input.dtype {
+            DataType::Float32 => celu28_f32::<f32>(self.alpha, input, output),
+            DataType::Float16 => celu28_f32::<half::f16>(self.alpha, input, output),
+            DataType::BFloat16 => celu28_f32::<half::bf16>(self.alpha, input, output),
+            DataType::Float64 => {
+                let alpha = f64::from(self.alpha);
+                let y: Vec<f64> = to_dense_float::<f64>(input)?
+                    .into_iter()
+                    .map(|x| {
+                        let scaled = x / alpha;
+                        alpha
+                            * if scaled < 0.0 {
+                                scaled.exp() - 1.0
+                            } else {
+                                scaled
+                            }
+                    })
+                    .collect();
+                write_dense_float::<f64>(output, &y)
+            }
+            other => Err(EpError::KernelFailed(format!(
+                "Celu-28: X dtype {other:?} is unsupported; use Float16, BFloat16, Float32, or Float64"
+            ))),
+        }
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
     }
 }
 
@@ -303,6 +406,19 @@ impl KernelFactory for SiluFactory {
 impl Kernel for ActivationKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.activation.name(), inputs, outputs, 1, 1, 1)?;
+        if matches!(
+            self.activation,
+            Activation::Celu {
+                require_same_dtype: true,
+                ..
+            }
+        ) && inputs[0].dtype != outputs[0].dtype
+        {
+            return Err(EpError::KernelFailed(format!(
+                "Celu-12: output dtype {:?} must match X dtype {:?}",
+                outputs[0].dtype, inputs[0].dtype
+            )));
+        }
         // Straight from the input tensor into the output tensor, for the
         // activations that have a slice kernel. The generic path below borrows
         // its input but still builds the result in a fresh `Vec` and copies
@@ -310,9 +426,11 @@ impl Kernel for ActivationKernel {
         // and 2n words of memory traffic that buy nothing.
         let ran = match self.activation {
             Activation::Silu => contiguous_f32(&inputs[0], &mut outputs[0], silu_f32_slice),
-            Activation::Celu { alpha } => contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
-                crate::kernels::simd_activations::celu_f32_slice(i, o, alpha);
-            }),
+            Activation::Celu { alpha, .. } => {
+                contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                    crate::kernels::simd_activations::celu_f32_slice(i, o, alpha);
+                })
+            }
             Activation::Mish => contiguous_f32(
                 &inputs[0],
                 &mut outputs[0],
@@ -360,7 +478,7 @@ impl Kernel for ActivationKernel {
             let mut output = vec![0.0; input.len()];
             silu_f32_slice(&input, &mut output);
             output
-        } else if let Activation::Celu { alpha } = self.activation {
+        } else if let Activation::Celu { alpha, .. } = self.activation {
             let mut output = vec![0.0; input.len()];
             crate::kernels::simd_activations::celu_f32_slice(&input, &mut output, alpha);
             output
@@ -664,7 +782,186 @@ fn silu_f32_neon<const PRECISE_REPAIR_MASK: bool, const OBSERVE_REPAIRS: bool>(
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::{Attribute, NodeId};
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
+
+    #[test]
+    fn celu_ort_cpu_preserves_legacy_registration_and_routing() {
+        let (_, descriptors) = crate::build_cpu_registry_with_descriptors();
+        let entries: Vec<_> = descriptors
+            .iter()
+            .filter(|entry| entry.domain.is_empty() && entry.op_type == "Celu")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let [entry] = entries.as_slice() else {
+            unreachable!()
+        };
+        assert_eq!((entry.since_version, entry.end_version), (12, u64::MAX));
+        assert_eq!(
+            entry.supported_dtypes,
+            &[
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Float64
+            ]
+        );
+        assert!(entry.supports_raw_tensor_abi);
+
+        let ep = crate::CpuExecutionProvider::for_ort_plugin();
+        let node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+        let x = Owned::f64(&[2], &[-2.0, -0.0]);
+        for opset in [12, 27, 28, 29] {
+            assert!(
+                ep.supports_op(&node, opset, &[static_shape([2])], &[x.dtype], &[])
+                    .is_supported()
+            );
+            let mut y = Owned::zeros(x.dtype, &[2]);
+            ep.get_kernel(&node, &[vec![2]], opset)
+                .unwrap()
+                .execute(&[x.view()], &mut [y.view_mut()])
+                .unwrap();
+            let y = y.to_f64();
+            assert!((y[0] - (-0.864_664_716_763_387_3)).abs() < 1e-14);
+            assert_eq!(
+                y[1].to_bits(),
+                0,
+                "ORT uses legacy Celu even at opset {opset}"
+            );
+        }
+    }
+
+    #[test]
+    fn celu28_native_cpu_matches_typed_schema() {
+        let ep = crate::CpuExecutionProvider::new();
+        let mut node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+        let run = |node: &Node, opset, x: Owned| {
+            let claim = ep.supports_op(node, opset, &[static_shape([x.shape[0]])], &[x.dtype], &[]);
+            assert!(
+                claim.is_supported(),
+                "Celu at opset {opset}: {:?}",
+                claim.reason()
+            );
+            let mut y = Owned::zeros(x.dtype, &x.shape);
+            ep.get_kernel(node, std::slice::from_ref(&x.shape), opset)
+                .unwrap()
+                .execute(&[x.view()], &mut [y.view_mut()])
+                .unwrap();
+            y
+        };
+        // Pinned ONNX 622adf94: Celu-28 expanded through Elu-22, via NumPy
+        // with round-to-nearest-even after each typed node (not op_celu.py).
+        node.attributes
+            .insert("alpha".into(), Attribute::Float(1.3));
+        let x = [-0.001, -0.01, -0.5, 100.125, -0.0, f32::NEG_INFINITY];
+        for (x, expected) in [
+            (
+                Owned::f16(&[6], &x),
+                [0x9533u16, 0xa133, 0xb6a4, 0x5641, 0x8000, 0xbd33],
+            ),
+            (
+                Owned::bf16(&[6], &x),
+                [0, 0xbc26, 0xbed5, 0x42c8, 0x8000, 0xbfa6],
+            ),
+        ] {
+            let y = run(&node, 28, x);
+            assert_eq!(
+                y.bytes,
+                expected
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+                "{:?}",
+                y.dtype
+            );
+        }
+        let x = [-0.001, -0.01, -0.5, 100.125, -0.0, f64::INFINITY, f64::NAN];
+        let y = run(&node, 28, Owned::f64(&[7], &x)).to_f64();
+        for (got, expected) in y.iter().zip([
+            -0.000999615483201602,
+            -0.009961636890103128,
+            -0.4150738794389706,
+            100.12500000000001,
+        ]) {
+            assert!(
+                (got - expected).abs() <= 2e-15,
+                "got {got}, want {expected}"
+            );
+        }
+        assert_eq!(y[4].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(y[5], f64::INFINITY);
+        assert!(y[6].is_nan());
+        node.attributes.clear();
+        for opset in [12, 27, 28, 29] {
+            let y = run(&node, opset, Owned::f32(&[2], &[-2.0, -0.0])).to_f32();
+            assert!((y[0] - (-0.864_664_73)).abs() < 2e-7);
+            assert_eq!(y[1].is_sign_negative(), opset >= 28);
+        }
+        for (alpha, expected) in [(-2.0, 1.264_241_2), (0.0, f32::NAN)] {
+            node.attributes
+                .insert("alpha".into(), Attribute::Float(alpha));
+            let y = run(&node, 28, Owned::f32(&[1], &[2.0])).to_f32()[0];
+            assert!(if expected.is_nan() {
+                y.is_nan()
+            } else {
+                (y - expected).abs() < 2e-7
+            });
+        }
+        node.attributes
+            .insert("alpha".into(), Attribute::Float(1e-10));
+        let y = run(&node, 28, Owned::f16(&[1], &[2.0]));
+        assert!(half::f16::from_le_bytes(y.bytes.try_into().unwrap()).is_nan());
+
+        node.attributes.insert("alpha".into(), Attribute::Int(1));
+        let err = ep
+            .get_kernel(&node, &[vec![1]], 28)
+            .err()
+            .expect("integer alpha must be rejected");
+        assert!(err.to_string().contains("'alpha' must be an ONNX FLOAT"));
+    }
+
+    #[test]
+    fn celu12_native_cpu_preserves_legacy_float_dtypes() {
+        let ep = crate::CpuExecutionProvider::new();
+        let mut node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+        node.attributes
+            .insert("alpha".into(), Attribute::Float(-2.0));
+        for opset in [12, 27] {
+            for (x, expected) in [
+                (
+                    Owned::f16(&[3], &[2.0, -2.0, -0.0]),
+                    Owned::f16(&[3], &[2.0, -3.436_563_7, 0.0]),
+                ),
+                (
+                    Owned::bf16(&[3], &[2.0, -2.0, -0.0]),
+                    Owned::bf16(&[3], &[2.0, -3.436_563_7, 0.0]),
+                ),
+                (
+                    Owned::f64(&[3], &[16_777_217.0, -2.0, -0.0]),
+                    Owned::f64(&[3], &[16_777_217.0, -3.436_563_656_918_09, 0.0]),
+                ),
+            ] {
+                let claim = ep.supports_op(&node, opset, &[static_shape([3])], &[x.dtype], &[]);
+                assert!(claim.is_supported(), "{:?}: {:?}", x.dtype, claim.reason());
+                let kernel = ep.get_kernel(&node, &[vec![3]], opset).unwrap();
+                let mut y = Owned::zeros(x.dtype, &[3]);
+                kernel.execute(&[x.view()], &mut [y.view_mut()]).unwrap();
+                if x.dtype == DataType::Float64 {
+                    let y = y.to_f64();
+                    assert_eq!(y[0], 16_777_217.0);
+                    assert!((y[1] - expected.to_f64()[1]).abs() < 2e-15);
+                    assert_eq!(y[2].to_bits(), 0);
+                } else {
+                    assert_eq!(y.bytes, expected.bytes, "{:?}", x.dtype);
+                }
+                let mut wrong_dtype = Owned::zeros(DataType::Float32, &[3]);
+                let err = kernel
+                    .execute(&[x.view()], &mut [wrong_dtype.view_mut()])
+                    .unwrap_err();
+                assert!(err.to_string().contains("must match X dtype"));
+            }
+        }
+    }
 
     /// `Float64` tensors never touch the SIMD kernels, so `apply_f64` is the
     /// only implementation a `double` model sees. It has to agree with the
@@ -712,7 +1009,10 @@ mod tests {
     #[test]
     fn celu_and_mish_propagate_nan_on_every_path() {
         for alpha in [0.5f32, 1.0, 3.0] {
-            let act = Activation::Celu { alpha };
+            let act = Activation::Celu {
+                alpha,
+                require_same_dtype: false,
+            };
             assert!(act.apply(f32::NAN).is_nan(), "f32 Celu(NaN), alpha={alpha}");
             assert!(
                 act.apply_f64(f64::NAN).is_nan(),

@@ -97,6 +97,15 @@ pub(crate) fn unsupported_reason_at_opset(
             input_dtypes,
             conv_transpose_contract,
         ),
+        "Celu"
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) =>
+        {
+            required_arity(node, input_dtypes, 1, 1, 1)
+                .and_then(|()| require_one_of(input_dtypes, 0, super::celu_dtypes(opset), "X"))
+        }
         "DepthToSpace" | "SpaceToDepth"
             if matches!(
                 conv_transpose_contract,

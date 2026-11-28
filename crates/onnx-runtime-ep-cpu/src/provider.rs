@@ -127,7 +127,7 @@ impl CpuExecutionProvider {
         ep
     }
 
-    /// CPU provider for the ORT plugin: exclude standalone-only registry entries and passes.
+    /// CPU provider for ORT: retain legacy Celu and omit standalone-only kernels and passes.
     pub fn for_ort_plugin() -> Self {
         Self::shared_kernels(CpuMemoryResources::default(), false)
     }
@@ -528,6 +528,16 @@ impl ExecutionProvider for CpuExecutionProvider {
             onnx_runtime_ep_api::standard_math::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
+        }
+        if self.standalone
+            && op.op_type == "Celu"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Some(&dtype) = input_dtypes.first()
+        {
+            let allowed = crate::kernels::supported_dtypes_for_op("Celu", "");
+            if !allowed.contains(&dtype) {
+                deny!("Celu at opset {opset}: X dtype {dtype:?} is unsupported; use {allowed:?}");
+            }
         }
         if let Some(reason) =
             onnx_runtime_ep_api::det::unsupported_reason(op, opset, shapes, input_dtypes)

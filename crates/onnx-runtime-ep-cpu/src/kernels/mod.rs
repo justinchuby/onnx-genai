@@ -2021,11 +2021,25 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     // Celu is opset 12, Mish opset 18 -- registering at their introducing
     // opset keeps older models routing to whatever handled them before.
-    rec.register(
-        OpKey::new("Celu", "", 12),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(activations::CeluFactory),
-    );
+    let celu12 = OpKey::new("Celu", "", 12);
+    let legacy = Box::new(activations::CeluFactory {
+        require_same_dtype: standalone,
+    });
+    if standalone {
+        rec.register_through(
+            celu12,
+            27,
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            legacy,
+        );
+        rec.register(
+            OpKey::new("Celu", "", 28),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(activations::Celu28Factory),
+        );
+    } else {
+        rec.register(celu12, onnx_runtime_ep_api::WorkspacePlanning::None, legacy);
+    }
     rec.register(
         OpKey::new("Mish", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3825,7 +3839,7 @@ mod tests {
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
-        // Opset-28 Cast and standalone Mod each add one registration.
+        // Opset-28 Cast, standalone Celu, and standalone Mod each add one registration.
         // MeanVarianceNormalization-29 adds one registration.
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
         // Opset-29 LinearAttention adds one standalone registration.
@@ -3835,7 +3849,7 @@ mod tests {
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 143
+                + 144
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
                 + onnx_runtime_ep_api::reverse_sequence::VERSIONS.len()
@@ -4135,7 +4149,8 @@ mod tests {
         // `InstanceNormalization`, `GroupNormalization`, `Conv`, pooling,
         // `Resize`, ...) was claimed by `supports_op` and then silently handed
         // back to ORT's CPU EP at capability time.
-        let reg = build_cpu_registry();
+        let provider = crate::CpuExecutionProvider::new();
+        let reg = provider.registry();
         let (_reg2, descriptors) = shared_registry_with_descriptors();
 
         let described: std::collections::BTreeSet<(&str, &str, u64)> = descriptors
@@ -4152,6 +4167,21 @@ mod tests {
         let expected: std::collections::BTreeSet<_> = [
             ("Mod", "", onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE),
             ("LinearAttention", "", 29),
+            ("Cast", "", 19),
+            ("Cast", "", 24),
+            ("CastLike", "", 19),
+            ("CastLike", "", 24),
+            (
+                "QLinearMatMul",
+                "",
+                onnx_runtime_ir::qlinear_matmul::HALF_SCALE_SINCE_VERSION,
+            ),
+            ("Celu", "", 28),
+            (
+                onnx_runtime_optimizer::affine_moe::OP,
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1,
+            ),
         ]
         .into_iter()
         .chain(

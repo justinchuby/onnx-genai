@@ -447,6 +447,20 @@ pub struct CudaOpDescriptor {
 
 /// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
 static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+const CELU28_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+];
+
+fn celu_dtypes(opset: u64) -> &'static [DataType] {
+    if opset >= 28 {
+        CELU28_DTYPES
+    } else {
+        CUDA_FLOAT_DTYPES
+    }
+}
 
 /// DFT data/output are f32; its optional length and axis inputs are i64.
 static CUDA_DFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
@@ -1809,14 +1823,31 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
-        OpKey::new("Celu", "", 12),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(ActivationFactory {
-            name: "Celu",
-            runtime: runtime.clone(),
-        }),
-    );
+    let celu12 = OpKey::new("Celu", "", 12);
+    let legacy = Box::new(ActivationFactory {
+        name: "Celu",
+        runtime: runtime.clone(),
+    });
+    if matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
+    ) {
+        reg.register_through(
+            celu12,
+            27,
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            legacy,
+        );
+        reg.register(
+            OpKey::new("Celu", "", 28),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(activations::Celu28Factory {
+                runtime: runtime.clone(),
+            }),
+        );
+    } else {
+        reg.register(celu12, onnx_runtime_ep_api::WorkspacePlanning::None, legacy);
+    }
     reg.register(
         OpKey::new("Swish", "", 24),
         onnx_runtime_ep_api::WorkspacePlanning::None,
