@@ -108,18 +108,12 @@ impl Manifest {
     /// artifact to reject symlink escapes before execution.
     pub fn portable_reference(&self, reference: &str) -> Result<PathBuf, PackageError> {
         let path = if let Some(asset) = reference.strip_prefix("sha256:") {
+            validate_portable_reference(Path::new(asset))?;
             self.shared_asset_path(Path::new(""), asset, true)?
         } else {
             validate_portable_reference(Path::new(reference))?;
             PathBuf::from(reference)
         };
-        if path.to_string_lossy().contains(['\\', ':'])
-            || path.to_string_lossy().chars().any(char::is_control)
-        {
-            return Err(PackageError::Invalid(format!(
-                "download reference is not portable across platforms: {reference}"
-            )));
-        }
         let mut result = PathBuf::new();
         for part in path.components() {
             match part {
@@ -761,8 +755,11 @@ fn validate_version(version: &str, kind: &str) -> Result<(), PackageError> {
 }
 
 fn validate_portable_reference(path: &Path) -> Result<(), PackageError> {
+    let text = path.to_string_lossy();
     if path.as_os_str().is_empty()
         || path.is_absolute()
+        || text.contains(['\\', ':'])
+        || text.chars().any(char::is_control)
         || path.components().any(|component| {
             matches!(
                 component,

@@ -954,17 +954,23 @@ impl WorkflowNodeHost for StagedOutputObserverHost<'_> {
         &mut self,
         tokens: &[crate::TokenId],
     ) -> anyhow::Result<()> {
-        if let Some((output, options)) = self.output.as_mut() {
-            output
-                .observe(self.tokenizer, tokens, options)
-                .context("observe staged output for normal generation stops")?;
-        }
+        let observed = if let Some((output, options)) = self.output.as_mut() {
+            if output.stop_reason().is_some() {
+                0
+            } else {
+                output
+                    .observe_prefix(self.tokenizer, tokens, options)
+                    .context("observe staged output for normal generation stops")?
+            }
+        } else {
+            tokens.len()
+        };
         if let Some(observer) = self.observer.as_deref_mut() {
             observer
                 .observe_tokens(
                     self.tokenizer
                         .context("tool-call output observation requires the package tokenizer")?,
-                    tokens,
+                    &tokens[..observed],
                 )
                 .context("observe staged generated output before output publication")?;
         }
