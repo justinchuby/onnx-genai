@@ -159,7 +159,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Add`, `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with NumPy right-aligned broadcasting. Host-computed output shape plus zero-stride metadata drives one generic device index walk; half arithmetic computes in f32. |
 | `Sum`, `Mean` | `` | ✅ | **NVRTC-custom** | Variadic f32/f16/bf16 with NumPy right-aligned broadcasting (`nary.rs`); accumulates each input into an f32 scratch buffer, then `Mean` divides by the input count before narrowing once on store. |
-| `Mod` (v10) | `` | ✅ | **NVRTC-custom** | Broadcasting modulo (`mod_op.rs`); f32 requires `fmod=1` (`fmodf`), i32/i64 support both C-truncated (`fmod=1`) and Python floor (`fmod=0`) modes; a zero divisor yields `0`, matching the CPU EP. |
+| `Mod` | `` | ✅ | **NVRTC-custom** | Before opset 28 (and on the ORT CUDA plugin at all opsets): f32 truncating remainder, i32/i64 floor or truncating remainder. Standalone nxrt at opset 28+: both modes for all schema numeric types, with f16/bf16 computed in f32. Integer zero divisors yield `0` (nxrt convention); floating zero divisors yield NaN. |
 
 ### Normalization & softmax
 
@@ -260,11 +260,11 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `AffineGrid` | `` | ✅ | **NVRTC-custom** | Two- and three-dimensional sampling-grid construction for f32/f16/bf16/f64 theta, including `align_corners` and singleton spatial dimensions; f64 uses native double arithmetic (`data_transform.rs`). |
 | `Compress` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width selection with omitted-axis flattening, positive/negative axes, and short conditions (`data_transform.rs`). |
 | `DynamicQuantizeLinear` | `` | ✅ | **NVRTC-custom** | Float32 per-tensor dynamic uint8 quantization; one block derives min/max, scale, and ties-to-even zero point before quantizing (`quantization.rs`). |
-| `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
+| `Pad` | `` | ✅ | **NVRTC-custom** | Constant/reflect/edge/wrap, cropping, and subset/negative axes. Byte-aligned storage (including Pad-24 FLOAT8E8M0); native packed INT4/UINT4 (21+), FLOAT4E2M1 (23+), and INT2/UINT2 (25+) (`pad.rs`). |
 | `Range` | `` | ✅ | **NVRTC-custom** | FP32/FP64, FP16/BF16, and Int16/32/64; opset 27 supports FLOAT and DOUBLE stash precision. CUDA graph capture cannot resolve a scalar-dependent output length. The ORT CUDA plugin declines runtime-valued shape reads rather than claiming them. |
 | `ScatterND` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16/Int64 slice updates with negative index wrapping and ordered assignment/legacy reductions. Opset 29 adds Int32 indices and parallel `mean` including the original data, with exact integer sums and truncation toward zero (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
-| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | f32 full forward/inverse transforms and real-input forward onesided output (RFFT), arbitrary signal axis, and truncating/zero-padding `dft_length`. **IRFFT (`inverse=1, onesided=1`) is declined at claim and construction; use the CPU EP for its Hermitian reconstruction and real output.** A bounded 16-entry plan cache reuses stream-bound C2C plans; execution scratch and packed data use governed EP workspace. Plan selection and scalar staging deliberately decline CUDA-graph capture (`dft.rs`, `cufft.rs`). |
+| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | Native v17 supports f32 full transforms and RFFT; select CPU for v17 IRFFT. Native v20 adds IRFFT, f64/f16/bf16, Int32 or Int64 `dft_length`, and an optional Int64 axis. f16/bf16 compute in f32. Arbitrary signal axes and truncation/zero padding use governed workspace with cached C2C/Z2Z plans. CUDA-graph capture is unsupported (`dft.rs`, `cufft.rs`). |
 | `NonMaxSuppression` (v10) | `` | ✅ | **NVRTC bounded sort/suppress + DeviceWorkspace** | Static contiguous f32 boxes `[B,N,4]` and scores `[B,C,N]`, with `N <= 256` and `B*C <= 256`. One block per batch/class filters and bitonic-sorts scores deterministically, then performs bounded sequential suppression; a second metadata launch reduces per-group counts. Only the 8-byte selected count crosses D2H before one device materialization launch writes exact Int64 rows. Optional scalar inputs remain device-resident. |
 | `STFT` (v17) | `` | ✅ | **cuFFT + fused NVRTC frame/window pack + unpack** | Contiguous f32 `[batch, signal, 1|2]`, dynamic Int32/Int64 `frame_step` and optional `frame_length`, optional matching f32 window, complete unpadded frames, full spectrum or real-input onesided output. All frames across the signal batch execute in one PlanMany call through DFT's shared 16-entry plan cache and governed workspace. Runtime scalar reads/plan selection deliberately decline CUDA-graph capture (`stft.rs`, `cufft.rs`). |
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
@@ -274,10 +274,11 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `GatherBlockQuantized` | `com.microsoft` | ✅ | **NVRTC quantized kernel** | Block-quantized embedding gather; packed formats, scales, indices, and device geometry are validated by its claim gate. |
 | `Mish`, `IsInf`, `IsNaN`, `PRelu`, `LogSoftmax`, `Hardmax` | `` | ✅ | **NVRTC-custom** | Implemented activation, predicate, and softmax-family kernels with dtype/attribute bounds locked by the conformance profile. |
 | `Celu` | `` | ✅ | **NVRTC-custom** | Legacy Float32, Float16, and BFloat16 at opsets 12–27; typed Float16, BFloat16, Float32, and Float64 at opset 28 onward. The conformance cases execute directly on device buffers. |
-| `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family, including broadcasting and CPU-matched over-shift behavior. |
+| `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family with broadcasting. Standalone nxrt supports signed and unsigned 8/16/32/64-bit `BitShift` from opset 11. Signed types are a native extension before opset 28; the shipped ORT plugin remains unsigned-only. |
 | `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
 | `RandomNormal`, `RandomNormalLike`, `RandomUniform`, `RandomUniformLike` | `` | ✅ | **NVRTC** | Standalone nxrt only. FP16/FP32/FP64 since opset 1; BF16 since opset 22. Seeded streams advance per node across calls and shape changes; samples are not required to match other runtimes or devices. CUDA graph capture is declined; managed string Like inputs require the CPU EP. |
-| `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
+| `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
+| `QLinearMatMul` | `` | ✅ | **NVRTC quantization** | Int8/Uint8 operands and output. Standalone nxrt accepts a common scale dtype of Float32, Float16, or BFloat16 at opset 10+. Half scales before opset 21 are an nxrt extension, not ONNX conformance. The ORT plugin still requires Float32 scales. FP8 storage is not supported. |
 | `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling subsets; unsupported coordinate modes and sampling policies fail closed. |
@@ -286,6 +287,12 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `RoiAlign` | `` | ✅ | **NVRTC-custom** | Standalone nxrt only, opsets 10/16/22. Supports f16/f32/f64 (bf16 from opset 22), Int64 batch indices, average/max pooling, and fixed/adaptive sampling. Device-side index validation requires eager execution; the ORT CUDA plugin does not advertise this op. |
 
 <!-- CUDA_COVERAGE_MATRIX_END -->
+
+Standalone INT16/UINT16 `QuantizeLinear` and `DequantizeLinear` support scalar
+scales from opset 10, per-axis scales from opset 13, and blocked scales from
+opset 21. Before opset 21, quantization needs a typed zero point to select
+16-bit storage. Opset 23 adds explicit division `precision` and independently
+typed floating dequantization output.
 
 ### Exporting quantized expert projections
 
@@ -466,13 +473,18 @@ worth stating precisely:
   prevent future re-investigation.
 
 `ai.onnx::DFT` and `ai.onnx::STFT` are implemented for CUDA in `kernels/dft.rs`
-and `kernels/stft.rs`. The CUDA adapter does not implement IRFFT
-(`inverse=1, onesided=1`); it rejects that mode explicitly before plan creation,
-and the CPU EP supplies the real-inverse path. The DFT path
-packs arbitrary ONNX signal axes into contiguous complex f32 batches, executes
-cuFFT C2C, and unpacks to the requested full or half spectrum. This common
+and `kernels/stft.rs`. DFT packs arbitrary ONNX signal axes into contiguous
+complex batches and executes cuFFT C2C or Z2Z. DFT-20 IRFFT reconstructs the
+Hermitian spectrum before the inverse transform and returns a real signal;
+without an explicit length it uses `2 * (bins - 1)`. CUDA IRFFT is standalone
+only; the shipped CUDA ORT plugin still declines it, including with both
+optional controls omitted. This common
 packed-batch/plan-cache seam is reused by STFT, whose fused pack kernel extracts
 complete frames and applies the optional window before one batched cuFFT call.
+
+The CPU EP uses governed scratch for one transform at a time, reusing it
+across batches. Float64 DFT stays in double precision; it uses radix-2 FFT
+for power-of-two lengths and a direct transform for other lengths.
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
@@ -545,13 +557,15 @@ coverage to **99 / 141**.
 
 The issue #67 operator-coverage batch 4 adds seven more advertised op names — the
 integer **bitwise** family (`BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
-over all integer dtypes, broadcasting) plus unsigned `BitShift` (LEFT/RIGHT), and
+over all integer dtypes, broadcasting) plus integer `BitShift` (LEFT/RIGHT), and
 the softmax-family axis reductions `LogSoftmax` (f32/f16/bf16, opset-13 per-axis
 and legacy opset-≤12 coerce-to-2D) and `Hardmax` (f32/f16/bf16, first-argmax
 one-hot). All are **NVRTC-custom** kernels matched to the CPU EP: `LogSoftmax`
 uses the stable shifted-`logsumexp` formulation (`max + log(sum(exp(x - max)))`,
-the #266 overflow lesson), and `BitShift` mirrors the CPU `checked_shl`/
-`checked_shr` contract (an amount `>=` the operand width yields `0`). Each is
+the #266 overflow lesson), and `BitShift` preserves the CPU's unsigned
+`checked_shl`/`checked_shr` behavior. Signed right shifts are arithmetic; a
+negative or out-of-width count produces sign fill for right shifts and zero
+for left shifts. Each is
 GPU-validated against the CPU oracle on the local CUDA host across the
 dtypes/attributes it claims (signed + unsigned bitwise with broadcasting,
 over-shift, `LogSoftmax` large-magnitude rows and interior axes, `Hardmax` ties
@@ -602,6 +616,13 @@ axes, cropping, reflect/wrap modes, fractional float steps, narrow float
 storage, and descending Int64 sequences. This raises the machine-verified
 `CUDA_COVERED_OPS` count from **134** to **136** and current CPU standard-domain
 parity from **105 / 141** to **107 / 141**.
+
+Packed `Pad` crops before selecting source lanes and uses one CUDA thread per
+output byte to avoid races and clear unused tail bits. These packed dtypes and
+FLOAT8E8M0 are supported in standalone nxrt only; ORT plugin registration and
+claim dtypes are unchanged. The
+`pad_low_bit_native_cuda_conformance` selector in `cuda_conformance_gpu` checks
+independently packed reference bytes on the CUDA provider without CPU fallback.
 
 The issue #67 operator-coverage batch 8 adds `ScatterND`, `HannWindow`,
 `HammingWindow`, and `BlackmanWindow`. `ScatterND` performs deterministic,

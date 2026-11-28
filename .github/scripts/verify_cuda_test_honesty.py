@@ -261,6 +261,7 @@ CUDA_CANARY_FEATURES = "cuda,cuda-13000"
 CUDA_PLUGIN_EXPECTED_TESTS = frozenset(
     {
         "cuda_nms_dynamic_output_runs_through_real_ort_plugin",
+        "cuda_plugin_dft_declines_implicit_irfft_but_claims_rfft",
         "cuda_shape_value_ops_decline_before_device_scalar_host_reads",
         "cuda_unique_is_claimed_and_materialized_through_real_ort_plugin",
         "cuda_unique_optional_outputs_stay_positional_through_real_ort_plugin",

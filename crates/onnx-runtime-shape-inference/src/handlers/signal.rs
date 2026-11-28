@@ -45,19 +45,6 @@ fn onesided_bins(n: i64) -> i64 {
     (n >> 1) + 1
 }
 
-/// Normalize and validate a DFT `axis`. The last dimension carries the
-/// real/imaginary components and is never a valid signal axis, so the accepted
-/// range is `[-rank, -2] ∪ [0, rank - 2]`. Returns the non-negative index, or
-/// `None` when the axis is out of range.
-fn dft_axis_index(axis: i64, rank: usize) -> Option<usize> {
-    let r = rank as i64;
-    if axis < -r || axis == -1 || axis >= r - 1 {
-        return None;
-    }
-    let normalized = if axis >= 0 { axis } else { axis + r };
-    usize::try_from(normalized).ok()
-}
-
 /// `DFT` (opset 17 and 20): the discrete Fourier transform along one signal
 /// axis.
 ///
@@ -102,13 +89,7 @@ fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let axis_value: Option<i64> = if axis_is_input {
         scalar_int(ctx, 2)
     } else {
-        let default_axis = if ctx.opset("") >= 20 { -2 } else { 1 };
-        Some(
-            ctx.node
-                .attr("axis")
-                .and_then(Attribute::as_int)
-                .unwrap_or(default_axis),
-        )
+        Some(onnx_runtime_ir::dft::default_axis(ctx.node, ctx.opset("")))
     };
 
     let mut out = input.shape.clone();
@@ -130,22 +111,13 @@ fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         return Ok(());
     };
 
-    let Some(axis_idx) = dft_axis_index(axis, rank) else {
-        return Err(ShapeInferError::Invalid {
-            op: "DFT".into(),
-            detail: format!("axis {axis} is invalid for a tensor of rank {rank}"),
-        });
-    };
+    let axis_idx = onnx_runtime_ir::dft::normalize_axis(axis, rank).map_err(invalid)?;
 
     let length = if has_dft_length {
         scalar_int(ctx, 1)
-            .map(|n| {
-                let n = usize::try_from(n)
-                    .map_err(|_| invalid(format!("dft_length must be positive, got {n}")))?;
-                onnx_runtime_ir::dft::DftMode::validate_length(n).map_err(invalid)?;
-                Ok(n)
-            })
-            .transpose()?
+            .map(onnx_runtime_ir::dft::explicit_length)
+            .transpose()
+            .map_err(invalid)?
     } else {
         input.shape[axis_idx]
             .as_const()

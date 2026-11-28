@@ -108,6 +108,19 @@ pub enum LoaderError {
     InvalidSplitToSequence { node: String, detail: String },
 
     #[error(
+        "illegal ONNX Compress at node {node}: {port} dtype {dtype:?} is not admitted by \
+         Compress-{schema} (effective ai.onnx opset {opset}). Cast the data and output to a \
+         dtype supported by this schema, or export with ai.onnx opset 28+ for BFloat16"
+    )]
+    InvalidCompressDtype {
+        node: String,
+        port: &'static str,
+        dtype: onnx_runtime_ir::DataType,
+        schema: u64,
+        opset: u64,
+    },
+
+    #[error(
         "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
          subgraph attribute '{attr}' (control-flow / nested-graph op) that this runtime cannot \
          execute. RULES #1: ep-cpu recursively executes the standard control-flow ops \

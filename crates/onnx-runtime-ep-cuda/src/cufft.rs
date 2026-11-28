@@ -23,6 +23,7 @@ type CufftType = c_int;
 
 const CUFFT_SUCCESS: CufftResult = 0;
 const CUFFT_C2C: CufftType = 0x29;
+const CUFFT_Z2Z: CufftType = 0x69;
 const CUFFT_FORWARD: c_int = -1;
 const CUFFT_INVERSE: c_int = 1;
 
@@ -47,11 +48,23 @@ type CufftSetStream = unsafe extern "C" fn(CufftHandle, CUstream) -> CufftResult
 type CufftSetWorkArea = unsafe extern "C" fn(CufftHandle, *mut c_void) -> CufftResult;
 type CufftExecC2C =
     unsafe extern "C" fn(CufftHandle, *mut CufftComplex, *mut CufftComplex, c_int) -> CufftResult;
+type CufftExecZ2Z = unsafe extern "C" fn(
+    CufftHandle,
+    *mut CufftDoubleComplex,
+    *mut CufftDoubleComplex,
+    c_int,
+) -> CufftResult;
 
 #[repr(C)]
 struct CufftComplex {
     real: f32,
     imag: f32,
+}
+
+#[repr(C)]
+struct CufftDoubleComplex {
+    real: f64,
+    imag: f64,
 }
 
 struct CufftApi {
@@ -62,6 +75,7 @@ struct CufftApi {
     set_stream: CufftSetStream,
     set_work_area: CufftSetWorkArea,
     exec_c2c: CufftExecC2C,
+    exec_z2z: CufftExecZ2Z,
 }
 
 impl CufftApi {
@@ -74,6 +88,7 @@ impl CufftApi {
             set_stream: symbol(CudaLibrary::Cufft, b"cufftSetStream\0")?,
             set_work_area: symbol(CudaLibrary::Cufft, b"cufftSetWorkArea\0")?,
             exec_c2c: symbol(CudaLibrary::Cufft, b"cufftExecC2C\0")?,
+            exec_z2z: symbol(CudaLibrary::Cufft, b"cufftExecZ2Z\0")?,
         })
     }
 }
@@ -162,6 +177,7 @@ pub(crate) struct CufftPlanKey {
 pub(crate) struct CufftPlan {
     handle: CufftHandle,
     work_bytes: usize,
+    transform_type: CufftType,
     direction: DftDirection,
     runtime: Arc<CudaRuntime>,
 }
@@ -172,12 +188,15 @@ unsafe impl Send for CufftPlan {}
 
 impl CufftPlan {
     fn new(runtime: Arc<CudaRuntime>, key: &CufftPlanKey) -> Result<Self> {
-        if key.dtype != DataType::Float32 {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep cuFFT: C2C plans support Float32 only, got {:?}",
-                key.dtype
-            )));
-        }
+        let transform_type = match key.dtype {
+            DataType::Float32 => CUFFT_C2C,
+            DataType::Float64 => CUFFT_Z2Z,
+            dtype => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep cuFFT: expected Float32 or Float64 packed precision, got {dtype:?}"
+                )));
+            }
+        };
         let length = c_int::try_from(key.length).map_err(|_| {
             EpError::KernelFailed(format!(
                 "cuda_ep cuFFT: transform length {} exceeds PlanMany's 32-bit limit",
@@ -205,7 +224,7 @@ impl CufftPlan {
         let mut work_bytes = 0usize;
         // SAFETY: the rank is one; both embed pointers address one live i32,
         // and `handle` remains exclusively owned while the plan is configured.
-        check("cufftMakePlanMany(C2C)", unsafe {
+        check("cufftMakePlanMany", unsafe {
             (api.make_plan_many)(
                 handle,
                 1,
@@ -216,7 +235,7 @@ impl CufftPlan {
                 dimensions.as_mut_ptr(),
                 1,
                 length,
-                CUFFT_C2C,
+                transform_type,
                 batch,
                 &mut work_bytes,
             )
@@ -230,6 +249,7 @@ impl CufftPlan {
         Ok(Self {
             handle,
             work_bytes,
+            transform_type,
             direction: key.direction,
             runtime,
         })
@@ -242,7 +262,7 @@ impl CufftPlan {
     /// Execute an in-place packed C2C transform using caller-owned workspace.
     ///
     /// # Safety
-    /// `data` covers `batch * length` complex f32 values from this plan's key,
+    /// `data` covers `batch * length` complex values of this plan's precision,
     /// and `work_area` covers at least [`Self::work_bytes`] bytes when non-zero.
     pub(crate) unsafe fn execute(
         &mut self,
@@ -256,12 +276,27 @@ impl CufftPlan {
         check("cufftSetWorkArea", unsafe {
             (api.set_work_area)(self.handle, work_area)
         })?;
-        let complex = data.cast::<CufftComplex>();
-        // SAFETY: caller upholds the packed-buffer extent; in-place C2C is a
-        // supported cuFFT execution mode.
-        check("cufftExecC2C", unsafe {
-            (api.exec_c2c)(self.handle, complex, complex, self.direction.cufft())
-        })
+        // SAFETY: the caller upholds the packed extent and precision, and both
+        // cuFFT entry points support in-place transforms.
+        if self.transform_type == CUFFT_Z2Z {
+            check("cufftExecZ2Z", unsafe {
+                (api.exec_z2z)(
+                    self.handle,
+                    data.cast(),
+                    data.cast(),
+                    self.direction.cufft(),
+                )
+            })
+        } else {
+            check("cufftExecC2C", unsafe {
+                (api.exec_c2c)(
+                    self.handle,
+                    data.cast(),
+                    data.cast(),
+                    self.direction.cufft(),
+                )
+            })
+        }
     }
 }
 

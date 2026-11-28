@@ -2509,6 +2509,7 @@ dependencies = [
  "libc",
  "libm",
  "mlas-sys",
+ "num-traits",
  "onnx-runtime-einsum-conformance",
  "onnx-runtime-ep-api",
  "onnx-runtime-hostmon",

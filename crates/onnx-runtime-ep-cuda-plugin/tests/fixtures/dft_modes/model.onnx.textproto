@@ -1,0 +1,47 @@
+ir_version: 11
+graph {
+  name: "dft_modes"
+  node {
+    name: "rfft"
+    op_type: "DFT"
+    input: "X"
+    output: "spectrum"
+    attribute { name: "onesided" i: 1 type: INT }
+  }
+  node {
+    name: "irfft"
+    op_type: "DFT"
+    input: "spectrum"
+    output: "Y"
+    attribute { name: "inverse" i: 1 type: INT }
+    attribute { name: "onesided" i: 1 type: INT }
+  }
+  input {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim { dim_value: 1 } dim { dim_value: 4 } dim { dim_value: 1 } }
+      }
+    }
+  }
+  value_info {
+    name: "spectrum"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim { dim_value: 1 } dim { dim_value: 3 } dim { dim_value: 2 } }
+      }
+    }
+  }
+  output {
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape { dim { dim_value: 1 } dim { dim_value: 4 } dim { dim_value: 1 } }
+      }
+    }
+  }
+}
+opset_import { domain: "" version: 20 }

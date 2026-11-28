@@ -539,12 +539,28 @@ impl ExecutionProvider for CpuExecutionProvider {
                 deny!("Celu at opset {opset}: X dtype {dtype:?} is unsupported; use {allowed:?}");
             }
         }
+        if let Some(reason) =
+            onnx_runtime_ep_api::det::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.is_default_domain()
             && op.op_type == "MaxUnpool"
             && let Err(reason) =
                 onnx_runtime_ir::max_unpool::validate_claim(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
+        }
+        if self.standalone
+            && op.op_type == "Mod"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) = onnx_runtime_ir::modulo::ModMode::parse(op).and_then(|mode| {
+                input_dtypes
+                    .first()
+                    .map_or(Ok(()), |&dtype| mode.validate_dtype(opset, dtype))
+            })
+        {
+            deny!("Mod: {reason}");
         }
         if op.op_type == "Equal"
             && onnx_runtime_ir::is_default_domain(&op.domain)
@@ -667,6 +683,13 @@ impl ExecutionProvider for CpuExecutionProvider {
             )
         {
             return KernelMatch::unsupported(format!("{}: {reason}", op.op_type));
+        }
+        if op.op_type == "Pad"
+            && op.is_default_domain()
+            && let Some(&dtype) = input_dtypes.first().filter(|&&t| t != DataType::Undefined)
+            && let Err(reason) = onnx_runtime_ir::pad::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
         }
         if let Some(reason) = onnx_runtime_ep_api::reverse_sequence::unsupported_reason(
             op,
@@ -2218,6 +2241,7 @@ mod tests {
     #[test]
     fn qlinear_matmul_claim_gate_checks_quantized_dtypes() {
         let ep = CpuExecutionProvider::new();
+        let ort = CpuExecutionProvider::for_ort_plugin();
         let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
         let valid = [
             DataType::Uint8,
@@ -2233,6 +2257,41 @@ mod tests {
             ep.supports_op(&node, 10, &[], &valid, &[]).is_supported(),
             "valid QLinearMatMul types should be claimed"
         );
+        assert!(ort.supports_op(&node, 21, &[], &valid, &[]).is_supported());
+        let (_, descriptors) = crate::build_cpu_registry_with_descriptors();
+        let versions: Vec<_> = descriptors
+            .iter()
+            .filter(|op| op.op_type == "QLinearMatMul" && op.domain.is_empty())
+            .map(|op| (op.since_version, op.end_version))
+            .collect();
+        assert_eq!(versions, [(10, u64::MAX)]);
+
+        for half in [DataType::Float16, DataType::BFloat16] {
+            let mut types = valid;
+            for index in [1, 4, 6] {
+                types[index] = half;
+            }
+            assert!(!ep.supports_op(&node, 9, &[], &types, &[]).is_supported());
+            for opset in [10, 21] {
+                assert!(
+                    ep.supports_op(&node, opset, &[], &types, &[])
+                        .is_supported()
+                );
+                let legacy = ort.supports_op(&node, opset, &[], &types, &[]);
+                let reason = legacy.reason().unwrap();
+                assert!(
+                    reason.contains("half scales are only supported by standalone nxrt"),
+                    "{reason}"
+                );
+            }
+            types[6] = DataType::Float32;
+            let mixed = ep.supports_op(&node, 21, &[], &types, &[]);
+            let reason = mixed.reason().unwrap();
+            assert!(
+                reason.contains("y_scale dtype to match a_scale"),
+                "{reason}"
+            );
+        }
 
         let mut invalid = valid;
         invalid[0] = DataType::Float32;

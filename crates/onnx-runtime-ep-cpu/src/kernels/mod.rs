@@ -523,6 +523,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // IsInf, IsNaN: float inputs.
         ("IsInf", "") | ("IsNaN", "") => FLOAT_DTYPES,
         ("EyeLike", "") => onnx_runtime_ir::eye_like::DTYPES,
+        ("Det", "") => onnx_runtime_ep_api::det::DTYPES,
 
         // Quantization: specific types but advertise broad.
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
@@ -658,6 +659,7 @@ pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
 pub mod dense_elementwise;
+mod det;
 pub mod dft;
 pub mod dropout;
 pub mod dsa_index_select;
@@ -915,6 +917,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "TopK",
     "NonZero",
     "NonMaxSuppression",
+    "Det",
     // GEMM.
     "Gemm",
     "QuantizeLinear",
@@ -1136,7 +1139,9 @@ pub fn build_cpu_registry() -> OpRegistry {
     build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), true)
 }
 
-/// Build the shared CPU registry and derive the ORT plugin's advertised keys.
+/// Build the CPU registry AND return its plugin-visible registrations for
+/// kernel-registry type-constraint advertisement. Native-only revisions remain
+/// dispatchable without changing the shipped ORT plugin contract.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
     let reg = build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), false);
     let descriptors = descriptors_from_registry(&reg);
@@ -1175,7 +1180,9 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                         .iter()
                         .any(|dtype| !matches!(dtype, DataType::String | DataType::Undefined))
                 });
-            let supported_dtypes = if key.op_type == "Conv"
+            let supported_dtypes = if key.op_type == "BitShift" && key.domain.is_empty() {
+                onnx_runtime_ep_api::bitshift::ORT_DTYPES
+            } else if key.op_type == "Conv"
                 && key.domain.is_empty()
                 && key.since_version < onnx_runtime_ir::conv::SCHEMA_BF16_SINCE_OPSET
             {
@@ -1623,11 +1630,22 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::DivFactory),
     );
-    rec.register(
+    let mod_28 = onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE;
+    rec.register_through(
         OpKey::new("Mod", "", 10),
+        if standalone { mod_28 - 1 } else { u64::MAX },
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(elementwise::ModFactory),
+        Box::new(elementwise::ModFactory { since_version: 10 }),
     );
+    if standalone {
+        rec.register(
+            OpKey::new("Mod", "", mod_28),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(elementwise::ModFactory {
+                since_version: mod_28,
+            }),
+        );
+    }
     rec.register(
         OpKey::new("Pow", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1836,20 +1854,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(gemm::GemmFactory::new(resources.clone())),
     );
-    // Linear quantization evolved at opsets 10, 13, 19, 21, 23, and 25. The
-    // implementation accepts the newest parameter set for all these revisions.
-    for version in [10, 13, 19, 21, 23, 25] {
-        rec.register(
-            OpKey::new("QuantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::QuantizeLinearFactory),
-        );
-        rec.register(
-            OpKey::new("DequantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::DequantizeLinearFactory),
-        );
-    }
+    quantization::register_linear_quantization(&mut rec, standalone);
     rec.register(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1872,11 +1877,26 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("QLinearMatMul", "", 10),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(qlinear_matmul::QLinearMatMulFactory::new(
-            retain_caches,
-            derived_weights.clone(),
-        )),
+        Box::new(
+            qlinear_matmul::QLinearMatMulFactory::new(retain_caches, derived_weights.clone())
+                .with_scale_support(
+                    onnx_runtime_ir::qlinear_matmul::ScaleSupport::for_standalone(standalone),
+                ),
+        ),
     );
+    if standalone {
+        let version = onnx_runtime_ir::qlinear_matmul::HALF_SCALE_SINCE_VERSION;
+        rec.register(
+            OpKey::new("QLinearMatMul", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(
+                qlinear_matmul::QLinearMatMulFactory::new(retain_caches, derived_weights.clone())
+                    .with_scale_support(
+                        onnx_runtime_ir::qlinear_matmul::ScaleSupport::FloatAndHalf,
+                    ),
+            ),
+        );
+    }
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
     rec.register(
@@ -2226,7 +2246,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(onehot::OneHotFactory),
     );
     rec.register(
-        OpKey::new("BitShift", "", 11),
+        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SINCE_VERSION),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitshift::BitShiftFactory),
     );
@@ -2286,6 +2306,11 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("BlackmanWindow", "", 17),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(window::BlackmanWindowFactory),
+    );
+    rec.register(
+        OpKey::new("Det", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(det::Factory),
     );
     rec.register(
         OpKey::new("DFT", "", 17),
@@ -3814,16 +3839,17 @@ mod tests {
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
-        // Opset-28 Cast and Celu each add one registration.
+        // Opset-28 Cast, standalone Celu, and standalone Mod each add one registration.
         // MeanVarianceNormalization-29 adds one registration.
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
         // Opset-29 LinearAttention adds one standalone registration.
+        // Standalone QLinearMatMul-21 adds one registration.
         // RNN has separate opset-14-through-21 and opset-22 registrations.
         // The four random generators each have a second (opset-22) revision.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 142
+                + 144
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
                 + onnx_runtime_ep_api::reverse_sequence::VERSIONS.len()
@@ -4113,8 +4139,7 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op revision other than the standalone-only
-        // revisions must have a plugin descriptor.
+        // Every plugin-visible registration must have a descriptor.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -4139,34 +4164,63 @@ mod tests {
             })
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        #[cfg(feature = "ops-cnn")]
-        let cnn_only = onnx_runtime_ir::roi_align::VERSIONS
-            .into_iter()
-            .map(|version| ("RoiAlign", "", version))
-            .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
-            .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)]);
-        #[cfg(not(feature = "ops-cnn"))]
-        let cnn_only = std::iter::empty();
-        let expected = cnn_only
-            .chain([
-                ("Cast", "", 19),
-                ("Cast", "", 24),
-                ("CastLike", "", 19),
-                ("CastLike", "", 24),
-                ("LinearAttention", "", 29),
-                ("Celu", "", 28),
-                (
-                    onnx_runtime_optimizer::affine_moe::OP,
-                    onnx_runtime_ir::RUNTIME_DOMAIN,
-                    1,
-                ),
-            ])
-            .collect();
+        let expected: std::collections::BTreeSet<_> = [
+            ("Mod", "", onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE),
+            ("LinearAttention", "", 29),
+            ("Cast", "", 19),
+            ("Cast", "", 24),
+            ("CastLike", "", 19),
+            ("CastLike", "", 24),
+            (
+                "QLinearMatMul",
+                "",
+                onnx_runtime_ir::qlinear_matmul::HALF_SCALE_SINCE_VERSION,
+            ),
+            ("Celu", "", 28),
+            (
+                onnx_runtime_optimizer::affine_moe::OP,
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1,
+            ),
+        ]
+        .into_iter()
+        .chain(
+            onnx_runtime_ir::roi_align::VERSIONS
+                .into_iter()
+                .map(|version| ("RoiAlign", "", version))
+                .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
+                .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)])
+                .filter(|_| cfg!(feature = "ops-cnn")),
+        )
+        .collect();
         assert_eq!(missing, expected);
         assert_eq!(
             descriptors.len() + missing.len(),
             reg.len(),
             "plugin descriptors plus standalone-only entries must match the registry exactly"
+        );
+    }
+
+    #[test]
+    fn bitshift_plugin_descriptor_keeps_open_ended_unsigned_coverage() {
+        let (_, descriptors) = shared_registry_with_descriptors();
+        let shifts: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.domain.is_empty() && d.op_type == "BitShift")
+            .collect();
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(
+            (shifts[0].since_version, shifts[0].end_version),
+            (11, u64::MAX)
+        );
+        assert_eq!(
+            shifts[0].supported_dtypes,
+            &[
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
         );
     }
 

@@ -4,6 +4,8 @@
 //! matrices. Keep their placement checks in sync with those runtime limits so a
 //! node is never claimed only to fail while constructing or executing a kernel.
 
+use onnx_runtime_ir::modulo::ModMode;
+use onnx_runtime_ir::qlinear_matmul::{ScaleSupport, ScaleType};
 use onnx_runtime_ir::scatter::{ScatterReduction, validate_nd_index_type};
 use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 
@@ -18,9 +20,38 @@ pub(crate) fn unsupported_reason_at_opset(
         return onnx_runtime_ir::max_unpool::validate_claim(node, opset, input_dtypes).err();
     }
     let result = match node.op_type.as_str() {
+        "Pad" => {
+            return input_dtypes
+                .first()
+                .filter(|&&dtype| dtype != DataType::Undefined)
+                .and_then(|&dtype| onnx_runtime_ir::pad::validate_dtype(dtype, opset).err());
+        }
         "RNN" => return onnx_runtime_ep_api::rnn::unsupported_reason(node, input_dtypes),
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "Mod"
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) =>
+        {
+            mod_op(node, opset, input_dtypes)
+        }
+        "QuantizeLinear" | "DequantizeLinear" => {
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) && let Some(result) =
+                super::quantization::claim_int16(node, opset, input_shapes, input_dtypes)
+            {
+                return result
+                    .err()
+                    .map(|reason| format!("{}: {reason}", node.op_type));
+            }
+            return unsupported_reason(node, input_shapes, input_dtypes).or_else(|| {
+                super::quantization::unsupported_reason(node, input_shapes, input_dtypes)
+            });
+        }
         "OneHot" => one_hot(node, opset, input_dtypes),
         "GridSample" => match conv_transpose_contract {
             super::conv_transpose::Contract::Standalone => {
@@ -30,6 +61,11 @@ pub(crate) fn unsupported_reason_at_opset(
                 grid_sample(node, input_shapes, input_dtypes)
             }
         },
+        "QLinearMatMul" => qlinear_matmul(
+            node,
+            super::qlinear_matmul::scale_support(conv_transpose_contract),
+            input_dtypes,
+        ),
         "Dropout" => {
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
         }
@@ -114,7 +150,7 @@ pub(crate) fn unsupported_reason(
         | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
-        "Mod" => mod_op(node, input_dtypes),
+        "Mod" => legacy_mod(node, input_dtypes),
         "QuantizeLinear" => quantize_linear(node, input_dtypes),
         "DequantizeLinear" => dequantize_linear(node, input_dtypes),
         "DequantizePacked" => {
@@ -131,7 +167,6 @@ pub(crate) fn unsupported_reason(
         "GroupNormalization" => normalization(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
         "Col2Im" => col2im(node, input_dtypes),
-        "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
         _ => return None,
     };
@@ -245,7 +280,11 @@ fn col2im(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     require_dtype(input_dtypes, 2, DataType::Int64, "block_shape")
 }
 
-fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn qlinear_matmul(
+    node: &Node,
+    scale_support: ScaleSupport,
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
     required_arity(node, input_dtypes, 8, 1, 1)?;
     for (index, name) in [(0, "A"), (3, "B"), (7, "y_zero_point")] {
         require_one_of(
@@ -256,9 +295,12 @@ fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
         )?;
     }
 
-    for (index, name) in [(1, "a_scale"), (4, "b_scale"), (6, "y_scale")] {
-        require_dtype(input_dtypes, index, DataType::Float32, name)?;
-    }
+    ScaleType::resolve(
+        scale_support,
+        input_dtypes[1],
+        input_dtypes[4],
+        input_dtypes[6],
+    )?;
     if input_dtypes[2] != input_dtypes[0] {
         return Err("a_zero_point dtype must match A".into());
     }
@@ -892,25 +934,158 @@ fn variadic_float(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
     Ok(())
 }
 
-/// `Mod`: two same-dtype operands over f32/i32/i64; f32 requires `fmod=1`.
-fn mod_op(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn mod_op(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
-    require_one_of(
-        input_dtypes,
-        0,
-        &[DataType::Float32, DataType::Int32, DataType::Int64],
-        "A",
-    )?;
     require_dtype(input_dtypes, 1, input_dtypes[0], "B")?;
-    let fmod = match node.attr("fmod") {
-        None => 0,
-        Some(attribute) => match attribute.as_int() {
-            Some(value @ (0 | 1)) => value,
-            _ => return Err("attribute 'fmod' must be 0 or 1".into()),
-        },
-    };
-    if input_dtypes[0] == DataType::Float32 && fmod != 1 {
+    super::mod_op::entry_for(input_dtypes[0], opset, ModMode::parse(node)?)?;
+    Ok(())
+}
+
+fn legacy_mod(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_one_of(input_dtypes, 0, super::mod_op::LEGACY_DTYPES, "A")?;
+    require_dtype(input_dtypes, 1, input_dtypes[0], "B")?;
+    let mode = ModMode::parse(node).map_err(|_| "attribute 'fmod' must be 0 or 1")?;
+    if input_dtypes[0] == DataType::Float32 && mode == ModMode::Floor {
         return Err("Float32 Mod requires fmod=1".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod linear_quantization_tests {
+    use super::super::conv_transpose::Contract::{OrtPlugin, Standalone};
+    use super::*;
+    use onnx_runtime_ir::{Dim, NodeId, ValueId};
+
+    fn node(op: &str, zp: Option<ValueId>) -> Node {
+        Node::new(
+            NodeId(0),
+            op,
+            vec![Some(ValueId(0)), Some(ValueId(1)), zp],
+            vec![ValueId(3)],
+        )
+    }
+
+    #[test]
+    fn int16_codes_are_admitted_for_standalone_revision_compatible_forms() {
+        for code in [DataType::Int16, DataType::Uint16] {
+            for (op, dtypes) in [
+                (
+                    "QuantizeLinear",
+                    [DataType::Float32, DataType::Float32, code],
+                ),
+                ("DequantizeLinear", [code, DataType::Float32, code]),
+            ] {
+                let node = node(op, Some(ValueId(2)));
+                let shapes = [vec![Dim::Static(2)], vec![], vec![]];
+                for opset in [10, 13, 19, 20, 21] {
+                    assert!(
+                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, Standalone)
+                            .is_none()
+                    );
+                    assert!(
+                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, OrtPlugin)
+                            .is_some()
+                    );
+                }
+                let per_axis = vec![vec![Dim::Static(2)]; 3];
+                assert!(
+                    unsupported_reason_at_opset(&node, 10, &per_axis, &dtypes, Standalone)
+                        .is_some_and(|reason| reason.contains("requires a scalar scale"))
+                );
+                let mut half_types = dtypes;
+                half_types[1] = DataType::Float16;
+                if op == "QuantizeLinear" {
+                    half_types[0] = DataType::Float16;
+                }
+                assert!(
+                    unsupported_reason_at_opset(&node, 13, &shapes, &half_types, Standalone)
+                        .is_some_and(|reason| reason.contains("FLOAT scale"))
+                );
+                assert!(
+                    unsupported_reason_at_opset(&node, 19, &shapes, &half_types, Standalone)
+                        .is_none()
+                );
+                let mut newer = node;
+                let attr = if op == "QuantizeLinear" {
+                    "precision"
+                } else {
+                    "output_dtype"
+                };
+                newer
+                    .attributes
+                    .insert(attr.into(), Attribute::Int(DataType::Float16 as i64));
+                assert!(
+                    unsupported_reason_at_opset(&newer, 21, &shapes, &dtypes, Standalone)
+                        .is_some_and(|reason| reason
+                            == format!("{op}: {attr} requires opset 23 or later (got 21)"))
+                );
+                assert!(
+                    unsupported_reason_at_opset(&newer, 23, &shapes, &dtypes, Standalone).is_none()
+                );
+            }
+
+            // Legacy placement does not inspect the Q output attribute; its
+            // shipped descriptor rejects that output at the ABI boundary.
+            let mut q = Node::new(
+                NodeId(0),
+                "QuantizeLinear",
+                vec![Some(ValueId(0)), Some(ValueId(1))],
+                vec![ValueId(3)],
+            );
+            q.attributes
+                .insert("output_dtype".into(), Attribute::Int(code as i64));
+            let shapes = [vec![Dim::Static(2)], vec![Dim::Static(2)]];
+            let dtypes = [DataType::Float32, DataType::Float32];
+            assert!(unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, Standalone).is_none());
+            assert!(
+                unsupported_reason_at_opset(&q, 20, &shapes, &dtypes, Standalone)
+                    .is_some_and(|reason| reason.contains("output_dtype requires opset 21"))
+            );
+            assert_eq!(
+                unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, OrtPlugin).as_deref(),
+                Some("QuantizeLinear CUDA coverage requires a scalar scale")
+            );
+            assert!(
+                !super::super::cuda_supported_dtypes_for_op("QuantizeLinear", "").contains(&code)
+            );
+            assert!(
+                !super::super::cuda_supported_dtypes_for_op("DequantizeLinear", "").contains(&code)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_qdq_preserves_scalar_and_blocked_claims_and_rejections() {
+        let q = node("QuantizeLinear", Some(ValueId(2)));
+        let q_types = [DataType::Float32, DataType::Float32, DataType::Uint8];
+        let scalar = [vec![Dim::Static(2)], vec![], vec![]];
+        let axis = [
+            vec![Dim::Static(2)],
+            vec![Dim::Static(2)],
+            vec![Dim::Static(2)],
+        ];
+        let mut dq = node("DequantizeLinear", None);
+        dq.attributes.insert("block_size".into(), Attribute::Int(2));
+        let blocked = [vec![Dim::Static(4)], vec![Dim::Static(2)]];
+        let dq_types = [DataType::Int4, DataType::Float32];
+        for native in [OrtPlugin, Standalone] {
+            assert!(unsupported_reason_at_opset(&q, 21, &scalar, &q_types, native).is_none());
+            assert_eq!(
+                unsupported_reason_at_opset(&q, 21, &axis, &q_types, native).as_deref(),
+                Some("QuantizeLinear CUDA coverage requires a scalar scale")
+            );
+            assert!(unsupported_reason_at_opset(&dq, 21, &blocked, &dq_types, native).is_none());
+            let mut half_output = dq.clone();
+            half_output
+                .attributes
+                .insert("output_dtype".into(), Attribute::Int(10));
+            assert_eq!(
+                unsupported_reason_at_opset(&half_output, 23, &blocked, &dq_types, native)
+                    .as_deref(),
+                Some("DequantizeLinear CUDA supports Float32 scale and output")
+            );
+        }
+    }
 }

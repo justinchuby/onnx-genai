@@ -714,6 +714,173 @@ fn qlinear_matmul_cases() -> Vec<Case> {
     ]
 }
 
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+fn qlinear_matmul_scale_types_match_expected_integer_bytes() {
+    let ep = require_cuda();
+    for case in qlinear_matmul_cases() {
+        run_case(&ep, &case);
+    }
+    for (opset, scale_dtype) in [
+        (10, DataType::Float32),
+        (10, DataType::Float16),
+        (10, DataType::BFloat16),
+        (21, DataType::Float16),
+        (21, DataType::BFloat16),
+    ] {
+        let mut case = Case {
+            label: format!("QLinearMatMul-{opset}[{scale_dtype:?},per-row-column,ties]"),
+            op: "QLinearMatMul",
+            domain: "",
+            opset,
+            inputs: vec![
+                input(DataType::Uint8, &[2, 1], &[4u8, 6]),
+                float_input(scale_dtype, &[2], &[0.5, 1.5]),
+                input(DataType::Uint8, &[2], &[3u8, 3]),
+                input(DataType::Int8, &[1, 2], &[2i8, -2]),
+                float_input(scale_dtype, &[2], &[1.0, 0.5]),
+                input(DataType::Int8, &[2], &[1i8, -1]),
+                float_input(scale_dtype, &[], &[1.0]),
+                input(DataType::Uint8, &[], &[10u8]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![2, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        };
+        assert_eq!(
+            run_case(&ep, &case),
+            vec![vec![10, 10, 14, 8]],
+            "{}",
+            case.label
+        );
+        case.inputs[6] = float_input(scale_dtype, &[], &[f32::NAN]);
+        let err = try_run_cuda(
+            &ep,
+            case.op,
+            case.domain,
+            case.opset,
+            &case.inputs,
+            &case.outputs,
+            &case.attrs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("y_scale values must be finite and positive"),
+            "{err}"
+        );
+    }
+
+    for (dtype, scales, accumulator, output_zero, expected) in [
+        (DataType::Float16, [0.2, 0.75, 0.2], 2u8, 0u8, 1),
+        (DataType::BFloat16, [0.5, 1024.0, 76.0], 2, 0, 14),
+        (DataType::Float16, [256.0; 3], 1, 0, 255),
+        (
+            DataType::BFloat16,
+            [f32::from_bits(0x5f80_0000); 3],
+            1,
+            0,
+            255,
+        ),
+        (DataType::Float16, [256.0; 3], 0, 17, 0),
+        (
+            DataType::BFloat16,
+            [f32::from_bits(0x5f80_0000); 3],
+            0,
+            17,
+            0,
+        ),
+    ] {
+        let [a_scale, b_scale, y_scale] = scales.map(|scale| float_input(dtype, &[], &[scale]));
+        let case = Case {
+            label: format!("QLinearMatMul-21[{dtype:?},scale-arithmetic,{scales:?}]"),
+            op: "QLinearMatMul",
+            domain: "",
+            opset: 21,
+            inputs: vec![
+                input(DataType::Uint8, &[1, 1], &[accumulator]),
+                a_scale,
+                input(DataType::Uint8, &[], &[0u8]),
+                input(DataType::Int8, &[1, 1], &[1i8]),
+                b_scale,
+                input(DataType::Int8, &[], &[0i8]),
+                y_scale,
+                input(DataType::Uint8, &[], &[output_zero]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![1, 1])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        };
+        assert_eq!(run_case(&ep, &case), vec![vec![expected]], "{}", case.label);
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+fn qlinear_matmul_half_scale_admission_is_native_only() {
+    let native = require_cuda();
+    let legacy = CudaExecutionProvider::new_for_ort_plugin().expect("construct legacy CUDA EP");
+    let node = Node::new(
+        NodeId(0),
+        "QLinearMatMul",
+        (0..8).map(|id| Some(ValueId(id))).collect(),
+        vec![ValueId(8)],
+    );
+    let mut case = qlinear_matmul_cases().remove(0);
+    case.opset = 21;
+    let shapes: Vec<_> = case
+        .inputs
+        .iter()
+        .map(|tensor| static_shape(tensor.shape.iter().copied()))
+        .collect();
+    let mut dtypes: Vec<_> = case.inputs.iter().map(|tensor| tensor.dtype).collect();
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        for index in [1, 4, 6] {
+            dtypes[index] = dtype;
+        }
+        assert!(
+            native
+                .supports_op(&node, 21, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !native
+                .supports_op(&node, 9, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            native
+                .supports_op(&node, 10, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !legacy
+                .supports_op(&node, 10, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !legacy
+                .supports_op(&node, 21, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+    }
+
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(legacy.registry());
+    let entries: Vec<_> = descriptors
+        .iter()
+        .filter(|op| op.op_type == "QLinearMatMul" && op.domain.is_empty())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        (entries[0].since_version, entries[0].end_version),
+        (10, u64::MAX)
+    );
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        assert!(entries[0].supported_dtypes.contains(&dtype));
+    }
+    assert_eq!(run_case(&legacy, &case), run_case(&native, &case));
+}
+
 fn resize_cases() -> Vec<Case> {
     let image = [1.0, 2.0, 4.0, 8.0, 3.0, 5.0];
     let mut cases = vec![
@@ -2385,6 +2552,56 @@ fn bitshift_cases() -> Vec<Case> {
     ]
 }
 
+fn signed_bitshift_cases() -> Vec<(Case, Vec<u8>)> {
+    let mut cases = Vec::new();
+    macro_rules! cases_for_type {
+        ($dtype:ident, $ty:ty, $($extra_count:expr),*) => {{
+            let dtype = DataType::$dtype;
+            let width = <$ty>::BITS as $ty;
+            let counts = [0, 1, width - 1, width, width + 1, -1, $($extra_count),*];
+            let extra = counts.len() - 6;
+            // Pinned ONNX vectors distinguish arithmetic RIGHT and wrapping LEFT;
+            // two-sided broadcasting combines positive/negative X with all counts.
+            for (direction, positive, negative, negative_fill) in [
+                ("LEFT", [1, 2, <$ty>::MIN], [-8, -16, 0], 0),
+                ("RIGHT", [1, 0, 0], [-8, -4, -1], -1),
+            ] {
+                let expected: Vec<_> = positive.into_iter()
+                    .chain(std::iter::repeat_n(0, 3 + extra))
+                    .chain(negative)
+                    .chain(std::iter::repeat_n(negative_fill, 3 + extra))
+                    .flat_map(<$ty>::to_le_bytes)
+                    .collect();
+                let opsets: &[u64] = if dtype == DataType::Int32 && direction == "RIGHT" {
+                    &[11, 28]
+                } else {
+                    &[28]
+                };
+                for &opset in opsets {
+                    cases.push((Case {
+                        label: format!("BitShift-{opset}[{dtype:?},{direction}]"),
+                        op: "BitShift",
+                        domain: "",
+                        opset,
+                        inputs: vec![
+                            input(dtype, &[2, 1], &[1 as $ty, -8]),
+                            input(dtype, &[1, counts.len()], &counts),
+                        ],
+                        outputs: vec![(dtype, vec![2, counts.len()])],
+                        attrs: vec![("direction", Attribute::String(direction.as_bytes().to_vec()))],
+                        compare: Compare::ExactBytes,
+                    }, expected.clone()));
+                }
+            }
+        }};
+    }
+    cases_for_type!(Int8, i8,);
+    cases_for_type!(Int16, i16,);
+    cases_for_type!(Int32, i32,);
+    cases_for_type!(Int64, i64, 1 << 32, -0xffff_ffff);
+    cases
+}
+
 /// `LogSoftmax` parity, f32/f16/bf16, opset-13 last-axis and legacy opset-11
 /// coerce-to-2D, including a large-magnitude row to exercise the stable
 /// shifted-logsumexp path (the #266 overflow lesson).
@@ -3331,7 +3548,9 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("BitwiseOr", bitwise_binary_cases("BitwiseOr")));
     p.push(sweep("BitwiseXor", bitwise_binary_cases("BitwiseXor")));
     p.push(sweep("BitwiseNot", bitwise_not_cases()));
-    p.push(sweep("BitShift", bitshift_cases()));
+    let mut shifts = bitshift_cases();
+    shifts.extend(signed_bitshift_cases().into_iter().map(|(case, _)| case));
+    p.push(sweep("BitShift", shifts));
     p.push(sweep("LogSoftmax", log_softmax_cases()));
     p.push(sweep("Hardmax", hardmax_cases()));
 
@@ -4043,6 +4262,19 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) -> Vec<Vec<u8>> {
     cuda
 }
 
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn bitshift_native_cuda_conformance() {
+    let ep = require_cuda();
+    for (case, expected) in signed_bitshift_cases() {
+        let output = run_case(&ep, &case);
+        assert_eq!(output, [expected], "{}", case.label);
+    }
+    for case in bitshift_cases() {
+        run_case(&ep, &case);
+    }
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -4611,4 +4843,172 @@ fn eye_like_22_native_cuda_matches_onnx_reference() {
             "{input_dtype:?} to {output_dtype:?}"
         );
     }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn pad_low_bit_native_cuda_conformance() {
+    let ep = require_cuda();
+    // Raw lanes, least-significant lane first. Expected bytes are hand-packed
+    // from the ONNX index/fill result, not produced by the CPU kernel.
+    for (dtype, opset, mode, raw, in_shape, pads, out_shape, fill, axes, expected) in [
+        (
+            DataType::Int4,
+            21,
+            "constant",
+            &[0xf8u8, 0xe7][..],
+            &[3usize][..],
+            [1i64, 1],
+            &[5usize][..],
+            None,
+            None,
+            &[0x80u8, 0x7f, 0][..],
+        ),
+        (
+            DataType::Uint4,
+            21,
+            "constant",
+            &[0x21, 0x43, 0x65],
+            &[2, 3],
+            [2, 0],
+            &[2, 5],
+            Some(0xfdu8),
+            Some(-1i32),
+            &[0xdd, 0x21, 0xd3, 0x4d, 0x65],
+        ),
+        (
+            DataType::Float4E2M1,
+            23,
+            "reflect",
+            &[0x28, 0x6d],
+            &[4],
+            [-1, 2],
+            &[5],
+            None,
+            None,
+            &[0xd2, 0xd6, 0x02],
+        ),
+        (
+            DataType::Int2,
+            25,
+            "wrap",
+            &[0xe4, 0xfd],
+            &[5],
+            [3, -1],
+            &[7],
+            None,
+            None,
+            &[0x39, 0x39],
+        ),
+        (
+            DataType::Uint2,
+            25,
+            "edge",
+            &[0xf2],
+            &[3],
+            [-1, 3],
+            &[5],
+            None,
+            None,
+            &[0xfc, 0x03],
+        ),
+        (
+            DataType::Uint2,
+            25,
+            "constant",
+            &[0xf2],
+            &[3],
+            [-4, 6],
+            &[5],
+            None,
+            None,
+            &[0, 0],
+        ),
+        (
+            DataType::Float8E8M0,
+            24,
+            "constant",
+            &[0x7f, 0x80],
+            &[2],
+            [1, 0],
+            &[3],
+            None,
+            Some(-1),
+            &[0xff, 0x7f, 0x80],
+        ),
+    ] {
+        let mut inputs = vec![
+            input(dtype, in_shape, raw),
+            input(DataType::Int64, &[2], &pads),
+        ];
+        if let Some(fill) = fill {
+            inputs.push(input(dtype, &[], &[fill]));
+        } else if axes.is_some() {
+            inputs.push(common::absent_input(dtype));
+        }
+
+        if let Some(axis) = axes {
+            inputs.push(input(DataType::Int32, &[1], &[axis]));
+        }
+        let outputs = [(dtype, out_shape.to_vec())];
+        let attrs = [("mode", Attribute::String(mode.into()))];
+        let (graph, node) = common::build_graph("Pad", "", opset, &inputs, &outputs, &attrs);
+        let claim = onnx_runtime_ep_api::ExecutionProvider::supports_op(
+            &ep,
+            graph.node(node),
+            opset - 1,
+            &[],
+            &[dtype],
+            &[],
+        );
+        assert!(
+            claim
+                .reason()
+                .is_some_and(|reason| reason.contains(&format!("requires opset {opset}"))),
+            "{dtype:?}: {:?}",
+            claim.reason()
+        );
+        let got = run_cuda(&ep, "Pad", "", opset, &inputs, &outputs, &attrs);
+        assert_eq!(got[0], expected, "{dtype:?}, {mode}");
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn pad_preserves_cuda_ort_descriptor_and_byte_axes_contract() {
+    let ep = require_cuda();
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
+    let pad = descriptors
+        .iter()
+        .find(|entry| entry.op_type == "Pad" && entry.domain.is_empty())
+        .unwrap();
+    for (dtype, accepted) in [
+        (DataType::Float32, true),
+        (DataType::Float64, false),
+        (DataType::Int4, false),
+        (DataType::Uint4, false),
+        (DataType::Float4E2M1, false),
+        (DataType::Float8E8M0, false),
+        (DataType::Int2, false),
+        (DataType::Uint2, false),
+    ] {
+        assert_eq!(pad.supported_dtypes.contains(&dtype), accepted, "{dtype:?}");
+    }
+
+    let mut inputs = [
+        input(DataType::Uint8, &[2], &[1u8, 2]),
+        input(DataType::Int64, &[2], &[1i64, 0]),
+        common::absent_input(DataType::Uint8),
+        input(DataType::Int32, &[1], &[-1i32]),
+    ];
+    let outputs = [(DataType::Uint8, vec![3])];
+    let error = common::try_run_cuda(&ep, "Pad", "", 25, &inputs, &outputs, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("axes must have Int64 dtype"), "{error}");
+    inputs[3] = input(DataType::Int64, &[1], &[-1i64]);
+    assert_eq!(
+        run_cuda(&ep, "Pad", "", 25, &inputs, &outputs, &[])[0],
+        [0, 1, 2]
+    );
 }
