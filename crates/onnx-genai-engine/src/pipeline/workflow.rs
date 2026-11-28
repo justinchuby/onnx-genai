@@ -1021,7 +1021,17 @@ fn servingless_token_contract_is_single_request(
     use onnx_genai_metadata::{BatchLayout, TensorDimension};
 
     let (axis, expansion) = match &contract.batch_layout {
-        BatchLayout::Shared => return Ok(true),
+        BatchLayout::Shared => {
+            return match contract.shape.as_slice() {
+                [] | [_] => Ok(true),
+                [leading, _] => match leading {
+                    TensorDimension::Fixed(extent) => Ok(*extent == 1),
+                    TensorDimension::Symbol(symbol) => Ok(symbols.get(symbol) == Some(&1)),
+                    TensorDimension::Any => Ok(false),
+                },
+                _ => Ok(false),
+            };
+        }
         BatchLayout::RequestAligned { axis } => (*axis, 1_i64),
         BatchLayout::RequestExpanded { axis, factor } => {
             let factor = i64::try_from(*factor)?;
@@ -1075,6 +1085,7 @@ mod servingless_generation_tests {
         let symbols = HashMap::from([("batch".to_string(), 1)]);
         for contract in [
             contract("dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: shared }\n"),
+            contract("dtype: int64\nshape: [tokens]\nbatch_layout: { kind: shared }\n"),
             contract(
                 "dtype: int64\nshape: [1, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",
             ),
@@ -1094,6 +1105,22 @@ mod servingless_generation_tests {
         let two_requests = HashMap::from([("batch".to_string(), 2)]);
         let unresolved = HashMap::new();
         for (contract, symbols) in [
+            (
+                contract("dtype: int64\nshape: [2, 1]\nbatch_layout: { kind: shared }\n"),
+                &symbols,
+            ),
+            (
+                contract("dtype: int64\nshape: [batch, 1]\nbatch_layout: { kind: shared }\n"),
+                &two_requests,
+            ),
+            (
+                contract("dtype: int64\nshape: [Any, 1]\nbatch_layout: { kind: shared }\n"),
+                &symbols,
+            ),
+            (
+                contract("dtype: int64\nshape: [1, 1, 1]\nbatch_layout: { kind: shared }\n"),
+                &symbols,
+            ),
             (
                 contract(
                     "dtype: int64\nshape: [2, 1]\nbatch_layout: { kind: request_aligned, axis: 0 }\n",

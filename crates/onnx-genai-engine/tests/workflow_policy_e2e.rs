@@ -2142,18 +2142,55 @@ pipeline:
         &[("update.onnx.textproto", MASKED_UPDATE)],
     )?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
-    let request =
+    let request = || -> anyhow::Result<_> {
+        Ok(
+            PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+                .with_input("current", Value::from_slice_i64(&[1, 99, 99], &[1, 3])?)
+                .with_input("proposed", Value::from_slice_i64(&[4, 5, 6], &[1, 3])?)
+                .with_input(
+                    "mask",
+                    Value::from_raw_bytes(vec![0, 1, 1], &[1, 3], onnx_genai_ort::DataType::Bool)?,
+                )
+                .with_input("step", Value::from_slice_i64(&[0], &[1])?),
+        )
+    };
+    assert_eq!(
+        engine.run_pipeline(request()?)?["tokens"].to_vec_i64()?,
+        [1, 5, 6]
+    );
+    assert_eq!(
+        engine.generate_with_pipeline_request(request()?)?.token_ids,
+        [1, 5, 6]
+    );
+
+    let multiple_rows =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
-            .with_input("current", Value::from_slice_i64(&[1, 99, 99], &[1, 3])?)
-            .with_input("proposed", Value::from_slice_i64(&[4, 5, 6], &[1, 3])?)
+            .with_input(
+                "current",
+                Value::from_slice_i64(&[1, 99, 99, 2, 99, 99], &[2, 3])?,
+            )
+            .with_input(
+                "proposed",
+                Value::from_slice_i64(&[4, 5, 6, 7, 8, 9], &[2, 3])?,
+            )
             .with_input(
                 "mask",
-                Value::from_raw_bytes(vec![0, 1, 1], &[1, 3], onnx_genai_ort::DataType::Bool)?,
+                Value::from_raw_bytes(
+                    vec![0, 1, 1, 0, 1, 1],
+                    &[2, 3],
+                    onnx_genai_ort::DataType::Bool,
+                )?,
             )
-            .with_input("step", Value::from_slice_i64(&[0], &[1])?);
-    assert_eq!(
-        engine.run_pipeline(request)?["tokens"].to_vec_i64()?,
-        [1, 5, 6]
+            .with_input("step", Value::from_slice_i64(&[0, 0], &[2])?);
+    let error = engine
+        .generate_with_pipeline_request(multiple_rows)
+        .expect_err("shared [2, sequence] tokens must not flatten into one generated stream");
+    let message = error.to_string();
+    assert!(
+        message.contains("tokens")
+            && message.contains("shared")
+            && message.contains("tensor workflow API"),
+        "{message}"
     );
 
     let speculative_metadata = r#"
