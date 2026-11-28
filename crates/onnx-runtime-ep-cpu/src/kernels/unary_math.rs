@@ -193,7 +193,7 @@ impl UnaryMathKernel {
         // where a call dominates the dispatch anyway. The ops that are one or
         // two instructions get their own arm, because for those the per-element
         // `match` was the entire cost (`Neg` measured 0.049x of ORT).
-        simd_activations::write_mapped(name, &mut outputs[0], &x, |x, y| match op {
+        simd_activations::write_mapped!(name, &mut outputs[0], &x, |x, y| match op {
             MathOp::Sigmoid => simd_activations::sigmoid_f32_slice(x, y),
             MathOp::Exp => simd_activations::exp_f32_slice(x, y),
             MathOp::Neg => simd_activations::neg_f32_slice(x, y),

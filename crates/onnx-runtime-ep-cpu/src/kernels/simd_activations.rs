@@ -119,12 +119,19 @@ use onnx_runtime_ep_api::{Result, TensorMut};
 /// different window per chunk. Those callers exist ([`write_mapped_reading`]'s
 /// `also_read` cases), and declaring their extra range is what keeps them off
 /// the chunked path; the gate is structural rather than a convention.
-pub(crate) fn write_mapped<F>(op: &str, out: &mut TensorMut, x: &[f32], f: F) -> Result<()>
-where
-    F: Fn(&[f32], &mut [f32]),
-{
-    write_mapped_reading(op, out, x, &[], f)
+macro_rules! write_mapped {
+    ($op:expr, $out:expr, $x:expr, $f:expr $(,)?) => {{
+        match ($op, &mut *$out) {
+            (op, out) => {
+                $crate::kernels::simd_activations::prepare_mapped_reading(op, out, $x, &[], $f)
+                    .and_then(|prepared| {
+                        $crate::kernels::simd_activations::finish_mapped(op, out, prepared)
+                    })
+            }
+        }
+    }};
 }
+pub(crate) use write_mapped;
 
 /// Bulk `f32` → 16-bit narrow, as selected by the output's dtype.
 ///
@@ -162,7 +169,7 @@ fn chunk_end(start: usize, n: usize) -> usize {
 /// whole tensor and made three passes over it — widen, compute, narrow — which
 /// on a 1 Mi tensor is 4 MB streamed twice more than it needs to be.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const NARROW_CHUNK: usize = 8192;
+pub(crate) const NARROW_CHUNK: usize = 8192;
 
 /// [`write_mapped`] for closures that read a slice *besides* `x`.
 ///
@@ -175,13 +182,44 @@ const NARROW_CHUNK: usize = 8192;
 /// depends on — and we would be holding `&mut` and `&` over the same bytes.
 /// Callers declare those extra ranges here and the direct-write arm is skipped
 /// when any of them overlaps the output.
-pub(crate) fn write_mapped_reading<F>(
+macro_rules! write_mapped_reading {
+    ($op:expr, $out:expr, $x:expr, $also_read:expr, $f:expr $(,)?) => {{
+        match ($op, &mut *$out) {
+            (op, out) => $crate::kernels::simd_activations::prepare_mapped_reading(
+                op, out, $x, $also_read, $f,
+            )
+            .and_then(|prepared| {
+                $crate::kernels::simd_activations::finish_mapped(op, out, prepared)
+            }),
+        }
+    }};
+}
+pub(crate) use write_mapped_reading;
+
+// Overlapping inputs cannot remain function arguments while their backing is
+// written through a raw output pointer: Miri strongly protects those shared
+// references until this function returns. Compute first, then let the macros
+// publish the owned result only after every read argument and captured read has
+// left `prepare_mapped_reading`.
+pub(crate) enum PreparedMapped {
+    Complete,
+    Owned(Vec<f32>),
+}
+
+pub(crate) fn finish_mapped(op: &str, out: &mut TensorMut, prepared: PreparedMapped) -> Result<()> {
+    match prepared {
+        PreparedMapped::Complete => Ok(()),
+        PreparedMapped::Owned(values) => write_dense_f32_narrow(op, out, &values),
+    }
+}
+
+pub(crate) fn prepare_mapped_reading<F>(
     op: &str,
     out: &mut TensorMut,
     x: &[f32],
     also_read: &[core::ops::Range<usize>],
     f: F,
-) -> Result<()>
+) -> Result<PreparedMapped>
 where
     F: Fn(&[f32], &mut [f32]),
 {
@@ -197,7 +235,7 @@ where
     };
     if eligible {
         if n == 0 {
-            return Ok(());
+            return Ok(PreparedMapped::Complete);
         }
         // SAFETY: `output_direct_write_eligible` confirmed a validated,
         // contiguous, host-accessible Float32 tensor holding exactly `n`
@@ -205,7 +243,7 @@ where
         // closure still reads (`x` plus `also_read`).
         let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<f32>(), n) };
         f(x, dst);
-        return Ok(());
+        return Ok(PreparedMapped::Complete);
     }
     // Fuse the kernel and the narrow for a contiguous 16-bit output, the shape
     // every f16/bf16 activation lands in. Chunking keeps each intermediate in
@@ -255,7 +293,7 @@ where
                         start = end;
                     }
                 });
-                return Ok(());
+                return Ok(PreparedMapped::Complete);
             }
         }
     }
@@ -263,7 +301,7 @@ where
     // Serial on purpose: see `serial_scope`. This arm always ends in a full
     // serial pass over `y`, so splitting the kernel only costs locality.
     serial_scope(|| f(x, &mut y));
-    write_dense_f32_narrow(op, out, &y)
+    Ok(PreparedMapped::Owned(y))
 }
 
 /// Smallest slice length for which the vector path is worth its dispatch
@@ -3883,24 +3921,30 @@ mod tests {
         sqrt_f32_slice(&src, &mut expected);
 
         let mut disjoint = Owned::f32(&[n], &vec![0.0f32; n]);
-        write_mapped("Sqrt", &mut disjoint.view_mut(), &src, sqrt_f32_slice).unwrap();
+        write_mapped!("Sqrt", &mut disjoint.view_mut(), &src, sqrt_f32_slice).unwrap();
         assert_eq!(disjoint.to_f32(), expected);
 
-        let mut aliased = Owned::f32(&[n], &src);
+        let mut aliased = src.clone();
         {
-            let mut view = aliased.view_mut();
-            // SAFETY: `view` addresses `n` contiguous f32; the slice is only
-            // read while `write_mapped` decides which arm to take, which is
-            // exactly the aliasing `output_direct_write_eligible` must detect.
-            let borrowed: &[f32] =
-                unsafe { std::slice::from_raw_parts(view.data_ptr_mut::<f32>(), n) };
-            let borrowed: &[f32] = unsafe { std::mem::transmute(borrowed) };
-            write_mapped("Sqrt", &mut view, borrowed, sqrt_f32_slice).unwrap();
+            let pointer = aliased.as_mut_ptr();
+            // SAFETY: `pointer` addresses all `n` initialized elements. The
+            // macro finishes reading this slice before publishing the result.
+            let borrowed = unsafe { std::slice::from_raw_parts(pointer, n) };
+            let shape = [n];
+            let strides = [1];
+            let mut view = TensorMut::new(
+                onnx_runtime_ep_api::DevicePtrMut(pointer.cast()),
+                onnx_runtime_ir::DataType::Float32,
+                &shape,
+                &strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            );
+            write_mapped!("Sqrt", &mut view, borrowed, sqrt_f32_slice).unwrap();
         }
-        assert_eq!(aliased.to_f32(), expected);
+        assert_eq!(aliased, expected);
 
         let mut narrowed = Owned::f16(&[n], &vec![0.0f32; n]);
-        write_mapped("Sqrt", &mut narrowed.view_mut(), &src, sqrt_f32_slice).unwrap();
+        write_mapped!("Sqrt", &mut narrowed.view_mut(), &src, sqrt_f32_slice).unwrap();
         let got = narrowed.to_u16_bits();
         for (g, e) in got.iter().zip(&expected) {
             assert_eq!(*g, half::f16::from_f32(*e).to_bits());
@@ -4262,7 +4306,7 @@ mod tests {
 
     /// `write_mapped` must produce the same bytes whether it took the
     /// direct-write arm or the owned-scratch arm. The interesting case is an
-    /// in-place node (`y = tanh(y)`), where the widened input borrows the
+    /// in-place node (`y = map(y)`), where the widened input borrows the
     /// output's own storage: writing through would corrupt the tail of the
     /// input mid-kernel, so `output_direct_write_eligible` has to reject it and
     /// send us to the scratch buffer.
@@ -4271,38 +4315,43 @@ mod tests {
         let n = 257; // not a multiple of 8, so the masked tail runs too
         let src: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.11).collect();
 
+        let map = |x: &[f32], y: &mut [f32]| {
+            for (&x, y) in x.iter().zip(y) {
+                *y = x * 1.5 + 0.25;
+            }
+        };
         let mut expected = vec![0.0f32; n];
-        tanh_f32_slice(&src, &mut expected);
+        map(&src, &mut expected);
 
         // Disjoint output: takes the direct-write arm.
         let mut disjoint = Owned::f32(&[n], &vec![0.0f32; n]);
-        write_mapped("Tanh", &mut disjoint.view_mut(), &src, |x, y| {
-            tanh_f32_slice(x, y)
-        })
-        .unwrap();
+        write_mapped!("test map", &mut disjoint.view_mut(), &src, map).unwrap();
         assert_eq!(disjoint.to_f32(), expected);
 
         // Aliased output: the input slice *is* the output storage.
-        let mut aliased = Owned::f32(&[n], &src);
+        let mut aliased = src.clone();
         {
-            let mut view = aliased.view_mut();
-            // SAFETY: `view` addresses `n` contiguous f32; the slice is only
-            // read while `write_mapped` decides which arm to take, which is
-            // exactly the aliasing `output_direct_write_eligible` must detect.
-            let borrowed: &[f32] =
-                unsafe { std::slice::from_raw_parts(view.data_ptr_mut::<f32>(), n) };
-            let borrowed: &[f32] = unsafe { std::mem::transmute(borrowed) };
-            write_mapped("Tanh", &mut view, borrowed, tanh_f32_slice).unwrap();
+            let pointer = aliased.as_mut_ptr();
+            // SAFETY: `pointer` addresses all `n` initialized elements. The
+            // macro finishes reading this slice before publishing the result.
+            let borrowed = unsafe { std::slice::from_raw_parts(pointer, n) };
+            let shape = [n];
+            let strides = [1];
+            let mut view = TensorMut::new(
+                onnx_runtime_ep_api::DevicePtrMut(pointer.cast()),
+                onnx_runtime_ir::DataType::Float32,
+                &shape,
+                &strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            );
+            write_mapped!("test map", &mut view, borrowed, map).unwrap();
         }
-        assert_eq!(aliased.to_f32(), expected);
+        assert_eq!(aliased, expected);
 
         // A non-f32 output can never take the direct arm; it must still narrow
         // correctly.
         let mut narrowed = Owned::f16(&[n], &vec![0.0f32; n]);
-        write_mapped("Tanh", &mut narrowed.view_mut(), &src, |x, y| {
-            tanh_f32_slice(x, y)
-        })
-        .unwrap();
+        write_mapped!("test map", &mut narrowed.view_mut(), &src, map).unwrap();
         let got = narrowed.to_u16_bits();
         for (g, e) in got.iter().zip(&expected) {
             assert_eq!(*g, half::f16::from_f32(*e).to_bits());
@@ -4387,7 +4436,7 @@ mod tests {
                 kernel(&src, &mut expected);
 
                 let mut got = Owned::f16(&[n], &vec![0.0f32; n]);
-                write_mapped(name, &mut got.view_mut(), &src, kernel).unwrap();
+                write_mapped!(name, &mut got.view_mut(), &src, kernel).unwrap();
                 for (i, (g, e)) in got.to_u16_bits().iter().zip(&expected).enumerate() {
                     assert_eq!(
                         *g,
@@ -4428,7 +4477,7 @@ mod tests {
                 kernel(&src, &mut expected);
 
                 let mut f16_out = Owned::f16(&[n], &vec![0.0f32; n]);
-                write_mapped(name, &mut f16_out.view_mut(), &src, kernel).unwrap();
+                write_mapped!(name, &mut f16_out.view_mut(), &src, kernel).unwrap();
                 for (i, (g, e)) in f16_out.to_u16_bits().iter().zip(&expected).enumerate() {
                     assert_eq!(
                         *g,
@@ -4439,7 +4488,7 @@ mod tests {
                 }
 
                 let mut bf16_out = Owned::bf16(&[n], &vec![0.0f32; n]);
-                write_mapped(name, &mut bf16_out.view_mut(), &src, kernel).unwrap();
+                write_mapped!(name, &mut bf16_out.view_mut(), &src, kernel).unwrap();
                 for (i, (g, e)) in bf16_out.to_u16_bits().iter().zip(&expected).enumerate() {
                     assert_eq!(
                         *g,
@@ -4509,7 +4558,7 @@ mod tests {
         erf_gelu_bias_f32_slice(&src, &bias, width, &mut expected);
 
         let mut out = Owned::f16(&[n], &vec![0.0f32; n]);
-        write_mapped_reading(
+        write_mapped_reading!(
             "BiasGelu",
             &mut out.view_mut(),
             &src,
@@ -4592,31 +4641,44 @@ mod tests {
         let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 8.0).collect();
         let bias: Vec<f32> = (0..width).map(|i| (i as f32) * 0.05 - 1.0).collect();
 
-        let mut want = vec![0.0f32; n];
-        tanh_gelu_bias_f32_slice(&x, &bias, width, &mut want);
+        let want: Vec<f32> = x
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| value + bias[i % width])
+            .collect();
 
         // Place the bias inside the output buffer itself.
         let mut seeded = vec![0.0f32; n];
         seeded[..width].copy_from_slice(&bias);
-        let mut out = Owned::f32(&[n], &seeded);
+        let mut out = seeded;
         {
-            let mut view = out.view_mut();
-            // SAFETY: `view` addresses `n` contiguous f32, the first `width` of
-            // which hold the bias. This is exactly the overlap that the extra
-            // read range must make `write_mapped_reading` detect.
-            let aliased: &[f32] =
-                unsafe { std::slice::from_raw_parts(view.data_ptr_mut::<f32>(), width) };
-            let aliased: &[f32] = unsafe { std::mem::transmute(aliased) };
-            write_mapped_reading(
+            let pointer = out.as_mut_ptr();
+            // SAFETY: `pointer` addresses all `n` initialized elements, and
+            // `width <= n`. The macro finishes reading the bias before publish.
+            let aliased = unsafe { std::slice::from_raw_parts(pointer, width) };
+            let shape = [n];
+            let strides = [1];
+            let mut view = TensorMut::new(
+                onnx_runtime_ep_api::DevicePtrMut(pointer.cast()),
+                onnx_runtime_ir::DataType::Float32,
+                &shape,
+                &strides,
+                onnx_runtime_ir::DeviceId::cpu(),
+            );
+            write_mapped_reading!(
                 "FastGelu",
                 &mut view,
                 &x,
                 &[crate::dtype::slice_byte_range(aliased)],
-                |x, y| tanh_gelu_bias_f32_slice(x, aliased, width, y),
+                |x, y| {
+                    for (i, (&value, output)) in x.iter().zip(y).enumerate() {
+                        *output = value + aliased[i % width];
+                    }
+                },
             )
             .unwrap();
         }
-        assert_eq!(out.to_f32(), want);
+        assert_eq!(out, want);
     }
 
     /// A tensor whose length is not a whole number of bias rows must still have

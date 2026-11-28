@@ -73,7 +73,7 @@ impl Kernel for BiasGeluKernel {
         // Bias folded in-register, exactly as `FastGelu` does — see
         // `kernels::simd_activations::erf_gelu_bias_f32_slice`. `bias` may
         // borrow the input tensor's storage, so it is declared as a read range.
-        simd_activations::write_mapped_reading(
+        simd_activations::write_mapped_reading!(
             "BiasGelu",
             &mut outputs[0],
             &x,
@@ -118,14 +118,14 @@ impl Kernel for FastGeluKernel {
             // tensor is contiguous f32 that slice borrows its storage — so it
             // has to be declared as a read range too, or a direct write could
             // clobber it mid-kernel.
-            (Some(bias), Some(width)) if width != 0 => simd_activations::write_mapped_reading(
+            (Some(bias), Some(width)) if width != 0 => simd_activations::write_mapped_reading!(
                 "FastGelu",
                 &mut outputs[0],
                 &x,
                 &[crate::dtype::slice_byte_range(bias)],
                 |x, y| simd_activations::tanh_gelu_bias_f32_slice(x, bias, width, y),
             ),
-            _ => simd_activations::write_mapped("FastGelu", &mut outputs[0], &x, |x, y| {
+            _ => simd_activations::write_mapped!("FastGelu", &mut outputs[0], &x, |x, y| {
                 simd_activations::tanh_gelu_f32_slice(x, y)
             }),
         }
@@ -159,7 +159,7 @@ impl Kernel for QuickGeluKernel {
         require_fused_float_dtype("QuickGelu", inputs, outputs)?;
         let x = to_dense_f32_widen("QuickGelu", &inputs[0])?;
         let alpha = self.alpha;
-        simd_activations::write_mapped("QuickGelu", &mut outputs[0], &x, |x, y| {
+        simd_activations::write_mapped!("QuickGelu", &mut outputs[0], &x, |x, y| {
             simd_activations::quick_gelu_f32_slice(x, y, alpha)
         })
     }

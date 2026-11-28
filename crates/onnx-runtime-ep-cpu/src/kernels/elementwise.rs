@@ -1017,7 +1017,7 @@ impl Kernel for UnaryKernel {
         if matches!(op, UnOp::Tanh | UnOp::Sqrt | UnOp::Erf) && inputs[0].dtype != DataType::Float64
         {
             let x = to_dense_f32_widen(op.name(), &inputs[0])?;
-            return simd_activations::write_mapped(
+            return simd_activations::write_mapped!(
                 op.name(),
                 &mut outputs[0],
                 &x,

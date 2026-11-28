@@ -2023,7 +2023,8 @@ mod tests {
                 DeviceId::cpu(),
             );
             out.validate().unwrap();
-            crate::kernels::simd_activations::write_mapped("test", &mut out, &values, map).unwrap();
+            crate::kernels::simd_activations::write_mapped!("test", &mut out, &values, map)
+                .unwrap();
             for (i, &v) in values.iter().enumerate() {
                 assert_eq!(
                     unsafe { pointer.add(1 + i * 2).cast::<u16>().read_unaligned() },
@@ -2043,7 +2044,7 @@ mod tests {
                 &[1],
                 DeviceId::cpu(),
             );
-            crate::kernels::simd_activations::write_mapped("test", &mut out, input, map).unwrap();
+            crate::kernels::simd_activations::write_mapped!("test", &mut out, input, map).unwrap();
             for (i, &v) in values.iter().enumerate() {
                 assert_eq!(
                     unsafe { pointer.cast::<u16>().add(i).read_unaligned() },
@@ -2051,6 +2052,49 @@ mod tests {
                 );
             }
             assert_eq!(&shared[32..], &values[32..]);
+        }
+
+        #[cfg(all(not(miri), any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let n = crate::kernels::simd_activations::NARROW_CHUNK
+                + crate::kernels::simd_activations::SIMD_MIN_LEN
+                + 1;
+            let output_offset = crate::kernels::simd_activations::NARROW_CHUNK;
+            let values = (0..n).map(|i| i as f32 * 0.25 - 4.).collect::<Vec<_>>();
+            let mut backing = vec![0.0f32; output_offset + n.div_ceil(2)];
+            backing[..n].copy_from_slice(&values);
+            let pointer = backing.as_mut_ptr();
+            // SAFETY: `pointer` addresses at least the first `n` initialized
+            // elements. The macro finishes reading them before publication.
+            let input = unsafe { std::slice::from_raw_parts(pointer, n) };
+            let shape = [n];
+            let strides = [1];
+            let mut out = TensorMut::new(
+                DevicePtrMut(unsafe { pointer.add(output_offset).cast() }),
+                DataType::Float16,
+                &shape,
+                &strides,
+                DeviceId::cpu(),
+            );
+            let calls = std::cell::RefCell::new(Vec::new());
+            crate::kernels::simd_activations::write_mapped!("test", &mut out, input, |x, y| {
+                calls.borrow_mut().push(x.len());
+                for (&x, y) in x.iter().zip(y) {
+                    *y = x * 2.;
+                }
+            },)
+            .unwrap();
+            assert_eq!(
+                calls.borrow().as_slice(),
+                &[n],
+                "overlap with a later input chunk must use one complete snapshot"
+            );
+            for (i, &value) in values.iter().enumerate() {
+                assert_eq!(
+                    unsafe { pointer.add(output_offset).cast::<u16>().add(i).read() },
+                    half::f16::from_f32(value * 2.).to_bits()
+                );
+            }
         }
     }
     #[test]
@@ -2075,7 +2119,7 @@ mod tests {
                 "{error}"
             );
             let called = std::cell::Cell::new(false);
-            let error = crate::kernels::simd_activations::write_mapped(
+            let error = crate::kernels::simd_activations::write_mapped!(
                 "mapped probe",
                 &mut out,
                 &[1., 2.],
