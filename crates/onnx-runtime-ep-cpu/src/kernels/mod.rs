@@ -320,6 +320,9 @@ pub fn input_dtype_constraints_for_op(
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
         ("DFT", "") => DFT_SLOTS,
         ("STFT", "") => STFT_SLOTS,
+        (onnx_runtime_ep_api::negative_log_likelihood_loss::OP, "") => {
+            onnx_runtime_ep_api::negative_log_likelihood_loss::INPUT_DTYPES
+        }
         ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
         ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_SLOTS,
@@ -347,6 +350,9 @@ pub fn output_dtype_constraints_for_op(
         ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_OUTPUTS,
         ("RegexFullMatch", "") => REGEX_OUTPUTS,
         ("StringSplit", "") => STRING_SPLIT_OUTPUTS,
+        (onnx_runtime_ep_api::negative_log_likelihood_loss::OP, "") => {
+            onnx_runtime_ep_api::negative_log_likelihood_loss::OUTPUT_DTYPES
+        }
         _ => &[],
     }
 }
@@ -417,6 +423,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("Pack", "") => &[DataType::Uint8],
         ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
         ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
+        (onnx_runtime_ep_api::negative_log_likelihood_loss::OP, "") => {
+            onnx_runtime_ep_api::negative_log_likelihood_loss::EDGE_DTYPES
+        }
         (name, "")
             if onnx_runtime_ir::standard_math::OPS
                 .iter()
@@ -706,6 +715,7 @@ pub mod moe;
 pub mod movement_ops;
 pub mod msft_attention;
 pub mod multi_head_attention;
+mod negative_log_likelihood_loss;
 pub mod onehot;
 pub mod packed_multi_head_attention;
 pub mod packed_varlen_attention;
@@ -1742,6 +1752,17 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(reduce::ReduceMeanFactory),
     );
+    for version in onnx_runtime_ep_api::negative_log_likelihood_loss::VERSIONS {
+        rec.register(
+            OpKey::new(
+                onnx_runtime_ep_api::negative_log_likelihood_loss::OP,
+                "",
+                version,
+            ),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(negative_log_likelihood_loss::Factory(version)),
+        );
+    }
     // Softmax: legacy coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13. The
     // provider's opset-aware lookup selects the version-correct kernel.
     rec.register(
@@ -3846,6 +3867,7 @@ mod tests {
         // Standalone QLinearMatMul-21 adds one registration.
         // RNN has separate opset-14-through-21 and opset-22 registrations.
         // The four random generators each have a second (opset-22) revision.
+        // NegativeLogLikelihoodLoss adds opset 12, 13, and 22 entries.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
@@ -3853,6 +3875,7 @@ mod tests {
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
                 + onnx_runtime_ep_api::reverse_sequence::VERSIONS.len()
+                + onnx_runtime_ep_api::negative_log_likelihood_loss::VERSIONS.len()
         );
         for op in PHASE1_OPS {
             let since = reg
