@@ -1159,7 +1159,51 @@ fn is_inf_matches_cpu() {
             );
         }
     }
+
     eprintln!("IsInf: CUDA matches CPU EP across f32/f16/bf16 and every detect flag combo");
+}
+
+/// `IsInf` must classify f64 directly rather than narrowing to f32: finite
+/// values outside the f32 range stay finite while both infinities and NaN retain
+/// their categories. Every detect flag combination runs through strict CUDA
+/// claim, kernel creation, device-buffer execution, and CPU parity.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn is_inf_float64_preserves_finite_range() {
+    let ep = require_cuda();
+    let values = [
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::MAX,
+        -f64::MAX,
+        1.0e300,
+        -1.0e300,
+        0.0,
+        -0.0,
+    ];
+    let attr_cases: &[Option<(i64, i64)>] =
+        &[None, Some((1, 1)), Some((1, 0)), Some((0, 1)), Some((0, 0))];
+    for &flags in attr_cases {
+        let inputs = [input(DataType::Float64, &[values.len()], &values)];
+        let outputs = [(DataType::Bool, vec![values.len()])];
+        let attrs: Vec<(&str, Attribute)> = match flags {
+            None => vec![],
+            Some((dp, dn)) => vec![
+                ("detect_positive", Attribute::Int(dp)),
+                ("detect_negative", Attribute::Int(dn)),
+            ],
+        };
+        let cuda = run_cuda(&ep, "IsInf", 10, &inputs, &outputs, &attrs);
+        let cpu = run_cpu("IsInf", 10, &inputs, &outputs, &attrs);
+        assert_eq!(
+            cuda, cpu,
+            "IsInf Float64 flags {flags:?} bool bytes mismatch"
+        );
+    }
 }
 
 /// `IsNaN` across f32/f16/bf16, fed NaN/inf/finite values. Bool output compared
@@ -1203,7 +1247,41 @@ fn is_nan_matches_cpu() {
         let cpu_empty = run_cpu("IsNaN", 13, &empty, &empty_out, &[]);
         assert_eq!(cuda_empty, cpu_empty, "IsNaN {dtype:?} empty mismatch");
     }
+
     eprintln!("IsNaN: CUDA matches CPU EP across f32/f16/bf16 (incl. empty)");
+}
+
+/// `IsNaN` must classify f64 directly rather than narrowing to f32: finite
+/// values outside the f32 range stay non-NaN while both infinities and NaN
+/// retain their categories. Execution uses the strict CUDA device-buffer path.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn is_nan_float64_preserves_finite_range() {
+    let ep = require_cuda();
+    let values = [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::MAX,
+        -f64::MAX,
+        1.0e300,
+        -1.0e300,
+        0.0,
+    ];
+    let inputs = [input(DataType::Float64, &[values.len()], &values)];
+    let outputs = [(DataType::Bool, vec![values.len()])];
+    let cuda = run_cuda(&ep, "IsNaN", 13, &inputs, &outputs, &[]);
+    let cpu = run_cpu("IsNaN", 13, &inputs, &outputs, &[]);
+    assert_eq!(cuda, cpu, "IsNaN Float64 bool bytes mismatch");
+
+    let empty = [input(DataType::Float64, &[0], &[] as &[f64])];
+    let empty_out = [(DataType::Bool, vec![0usize])];
+    let cuda_empty = run_cuda(&ep, "IsNaN", 13, &empty, &empty_out, &[]);
+    let cpu_empty = run_cpu("IsNaN", 13, &empty, &empty_out, &[]);
+    assert_eq!(cuda_empty, cpu_empty, "IsNaN Float64 empty mismatch");
 }
 
 /// `PRelu` across f32/f16/bf16 with several slope broadcast shapes (scalar,
