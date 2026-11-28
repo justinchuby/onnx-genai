@@ -521,8 +521,19 @@ pub unsafe extern "C" fn CreateEpFactories(
                     stream_handle,
                 )
             };
-            if status.is_null() && !out_factories.is_null() && max_factories != 0 {
+            if status.is_null()
+                && !out_factories.is_null()
+                && max_factories != 0
+                && !out_num_raw.is_null()
+                && unsafe { *out_num_raw } > 0
+            {
                 let factory = unsafe { *out_factories };
+                unsafe {
+                    onnx_runtime_ep_plugin::factory::exclude_operators(
+                        factory,
+                        onnx_runtime_ep_plugin::ep::STANDALONE_CAUSAL_CONV,
+                    );
+                }
                 let api = unsafe {
                     (*api_base)
                         .GetApi
@@ -899,9 +910,19 @@ mod tests {
             .filter(|entry| entry.domain.is_empty() && entry.op_type == "LinearAttention")
             .map(|entry| (entry.since_version, entry.end_version))
             .collect();
+        let mut causal_ranges: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.op_type == "CausalConvWithState")
+            .map(|entry| (entry.domain, entry.since_version, entry.end_version))
+            .collect();
         let status = unsafe { super::ReleaseEpFactory(factory) };
         assert!(status.is_null());
         assert_eq!(ranges, [(27, 28)]);
+        causal_ranges.sort_unstable();
+        assert_eq!(
+            causal_ranges,
+            [("", 27, 28), ("com.microsoft", 1, i32::MAX)]
+        );
     }
 
     /// Verify that a panicking constructor is caught at the macro guard boundary.

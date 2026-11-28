@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        305,
+        307,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -2557,7 +2557,92 @@ fn opset27_recurrent_outputs_infer_carry_without_past_state() {
     for op in ["LinearAttention", "CausalConvWithState"] {
         assert!(registry.get("", op, 26).is_none());
         assert!(registry.get("", op, 28).is_some());
-        assert_eq!(registry.get("", op, 29).is_some(), op == "LinearAttention");
+        assert!(registry.get("", op, 29).is_some());
+    }
+}
+
+#[test]
+fn causal_conv_opset29_infers_and_checks_dilated_history() {
+    let causal = with_attr(
+        node("CausalConvWithState", 4, 2),
+        "dilation",
+        Attribute::Int(3),
+    );
+    let inputs = |history| {
+        vec![
+            f32in(vec![c(2), c(4), c(0)]),
+            f32in(vec![c(4), c(1), c(4)]),
+            f32in(vec![c(4)]),
+            f32in(vec![c(2), c(4), c(history)]),
+        ]
+    };
+    let outputs = run(&causal, inputs(9), 29);
+    assert_eq!(out_shape(&outputs), vec![c(2), c(4), c(0)]);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(2), c(4), c(9)]
+    );
+    let wrong_history = try_run(&causal, inputs(3), 29).unwrap_err().to_string();
+    assert!(
+        wrong_history.contains("past_state history must be 9"),
+        "{wrong_history}"
+    );
+    for version in [27, 28] {
+        let wrong_version = try_run(&causal, inputs(9), version)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_version.contains("opset 29"), "{wrong_version}");
+    }
+
+    let causal = with_attr(
+        node("CausalConvWithState", 2, 2),
+        "dilation",
+        Attribute::Int(i64::MAX),
+    );
+    let inputs = |k| vec![f32in(vec![c(1), c(1), c(0)]), f32in(vec![c(1), c(1), c(k)])];
+    let overflow = try_run(&causal, inputs(2), 29).unwrap_err().to_string();
+    assert!(overflow.contains("exceeds int64"), "{overflow}");
+    assert_eq!(
+        run(&causal, inputs(1), 29)[1]
+            .type_info
+            .as_ref()
+            .unwrap()
+            .shape,
+        vec![c(1), c(1), c(0)]
+    );
+}
+
+#[test]
+fn causal_conv_opset29_checks_known_history_with_symbolic_kernel() {
+    let causal = with_attr(
+        node("CausalConvWithState", 4, 2),
+        "dilation",
+        Attribute::Int(3),
+    );
+    let inputs = |history| {
+        vec![
+            f32in(vec![c(2), c(4), c(0)]),
+            f32in(vec![c(4), c(1), sym(7)]),
+            f32in(vec![c(4)]),
+            f32in(vec![c(2), c(4), c(history)]),
+        ]
+    };
+    for history in [0, 9] {
+        let output = run(&causal, inputs(history), 29);
+        assert_eq!(
+            output[1].type_info.as_ref().unwrap().shape,
+            vec![c(2), c(4), c(history)]
+        );
+    }
+    for (history, expected) in [
+        (-3, "nonnegative multiple of dilation"),
+        (4, "nonnegative multiple of dilation"),
+        (i64::MAX, "exceeds int64"),
+    ] {
+        let error = try_run(&causal, inputs(history), 29)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
     }
 }
 
@@ -7677,6 +7762,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Cast", 1),
     ("", "CastLike", 1),
     ("", "CausalConvWithState", 27),
+    ("", "CausalConvWithState", 29),
     ("", "Ceil", 1),
     ("", "Celu", 12),
     ("", "CenterCropPad", 18),

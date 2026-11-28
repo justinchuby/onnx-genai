@@ -8,16 +8,16 @@
 //! * `x` — `[B, C, L]` activations.
 //! * `weight` — `[C, 1, K]` depthwise filter (`group == C`).
 //! * `bias` — optional `[C]`.
-//! * `past_state` — optional `[B, C, K-1]`; treated as zeros when absent.
+//! * `past_state` — optional `[B, C, H]`; treated as zeros when absent.
 //!
 //! Outputs:
 //!
 //! * `y` — `[B, C, L]`.
-//! * `present_state` — optional `[B, C, K-1]`.
+//! * `present_state` — `[B, C, H]`.
 //!
-//! Per `(b, c)` let `seq = concat(past_state[b, c, :], x[b, c, :])`. Then
-//! `y[b, c, t] = activation(bias[c] + Σ_{k} weight[c, 0, k] · seq[t + k])` and
-//! `present_state[b, c, :] = seq[-(K-1):]`. `activation` is `none` or
+//! Let `H = (K-1) * dilation` and `seq = concat(past_state[b,c,:], x[b,c,:])`.
+//! Then `y[b,c,t] = activation(bias[c] + Σ_{k} weight[c,0,k] · seq[t+k*dilation])`
+//! and `present_state[b,c,:] = seq[L:L+H]`. `activation` is `none` or
 //! `silu`/`swish` (both `x·sigmoid(x)`; the op has no learnable β).
 //!
 //! Each device thread owns one `(b, c)` row and accumulates in `f32` in the same
@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::causal_conv_with_state::Dilation;
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
@@ -37,9 +38,8 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 
-/// One row `(b, c)` per thread. Templated per storage dtype via three named
-/// entry points that only differ in their load/store helpers (accumulation is
-/// always `f32`). `bias`/`state`/`present` pointers may be null (`has_*` flags).
+/// One `(b, c)` row per thread, specialized on dtype and unit dilation so
+/// the usual contiguous-tap path retains its existing indexing.
 const SOURCE: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -48,13 +48,13 @@ __device__ __forceinline__ float ccws_silu(float v) {
   return v / (1.0f + expf(-v));
 }
 
-#define CCWS_KERNEL(NAME, T, LOAD, STORE)                                       \
+#define CCWS_KERNEL(NAME, T, LOAD, STORE, DILATED)                             \
 extern "C" __global__ void NAME(                                               \
     const T* __restrict__ x, const T* __restrict__ weight,                     \
     const T* __restrict__ bias, const T* __restrict__ state,                   \
     T* __restrict__ y, T* __restrict__ present,                                \
     long long batch, long long channels, long long length,                     \
-    long long kernel_size, long long pad,                                       \
+    long long kernel_size, long long pad, long long dilation,                   \
     int has_bias, int has_state, int has_present, int activation) {            \
   const long long rows = batch * channels;                                     \
   for (long long row = (long long)blockIdx.x * blockDim.x + threadIdx.x;        \
@@ -67,7 +67,7 @@ extern "C" __global__ void NAME(                                               \
     for (long long t = 0; t < length; ++t) {                                    \
       float acc = bias_c;                                                       \
       for (long long k = 0; k < kernel_size; ++k) {                             \
-        const long long pos = t + k;                                           \
+        const long long pos = t + (DILATED ? k * dilation : k);                 \
         float val;                                                              \
         if (pos < pad) {                                                        \
           val = has_state ? LOAD(state[s_base + pos]) : 0.0f;                    \
@@ -85,22 +85,21 @@ extern "C" __global__ void NAME(                                               \
     if (has_present) {                                                          \
       for (long long p = 0; p < pad; ++p) {                                     \
         const long long pos = length + p;                                      \
-        float val;                                                              \
-        if (pos < pad) {                                                        \
-          val = has_state ? LOAD(state[s_base + pos]) : 0.0f;                    \
-        } else {                                                                \
-          val = LOAD(x[x_base + (pos - pad)]);                                  \
-        }                                                                       \
-        present[s_base + p] = STORE(val);                                       \
+        present[s_base + p] = pos < pad                                         \
+            ? (has_state ? state[s_base + pos] : STORE(0.0f))                  \
+            : x[x_base + (pos - pad)];                                          \
       }                                                                         \
     }                                                                           \
   }                                                                             \
 }
 
 #define CCWS_ID(v) (v)
-CCWS_KERNEL(causal_conv_with_state_f32, float, CCWS_ID, CCWS_ID)
-CCWS_KERNEL(causal_conv_with_state_f16, __half, __half2float, __float2half_rn)
-CCWS_KERNEL(causal_conv_with_state_bf16, __nv_bfloat16, __bfloat162float, __float2bfloat16_rn)
+CCWS_KERNEL(causal_conv_with_state_f32, float, CCWS_ID, CCWS_ID, false)
+CCWS_KERNEL(causal_conv_with_state_f16, __half, __half2float, __float2half_rn, false)
+CCWS_KERNEL(causal_conv_with_state_bf16, __nv_bfloat16, __bfloat162float, __float2bfloat16_rn, false)
+CCWS_KERNEL(causal_conv_with_state_dilated_f32, float, CCWS_ID, CCWS_ID, true)
+CCWS_KERNEL(causal_conv_with_state_dilated_f16, __half, __half2float, __float2half_rn, true)
+CCWS_KERNEL(causal_conv_with_state_dilated_bf16, __nv_bfloat16, __bfloat162float, __float2bfloat16_rn, true)
 "#;
 
 /// Post-convolution activation. `Swish` with the op's implicit `β = 1` equals
@@ -113,7 +112,14 @@ enum ConvActivation {
 
 /// Claim-time gate: keep placement in sync with the runtime limits so a node is
 /// never claimed only to fail while constructing or executing the kernel.
-pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Option<String> {
+pub(crate) fn unsupported_reason(
+    node: &Node,
+    opset: u64,
+    input_dtypes: &[DataType],
+) -> Option<String> {
+    if let Err(detail) = Dilation::parse(node, node.local_opset().unwrap_or(opset)) {
+        return Some(format!("CausalConvWithState: {detail}"));
+    }
     let ndim = node.attr("ndim").and_then(|a| a.as_int()).unwrap_or(1);
     if ndim != 1 {
         return Some(format!(
@@ -181,6 +187,8 @@ impl KernelFactory for CausalConvWithStateFactory {
             runtime: self.runtime.clone(),
             activation,
             standard: node.is_default_domain(),
+            dilation: Dilation::parse(node, node.local_opset().unwrap_or(1))
+                .map_err(|detail| not_implemented(format!("CausalConvWithState: {detail}")))?,
         }))
     }
 }
@@ -190,6 +198,7 @@ pub struct CausalConvWithStateKernel {
     runtime: Arc<CudaRuntime>,
     activation: ConvActivation,
     standard: bool,
+    dilation: Dilation,
 }
 
 impl std::fmt::Debug for ConvActivation {
@@ -229,12 +238,15 @@ impl Kernel for CausalConvWithStateKernel {
             )));
         }
         let kernel_size = weight.shape[2];
-        if kernel_size == 0 {
-            return Err(EpError::KernelFailed(
-                "cuda_ep CausalConvWithState: kernel size K must be >= 1".into(),
-            ));
-        }
-        let pad = kernel_size - 1;
+        let pad = self.dilation.history_usize(kernel_size).map_err(|detail| {
+            EpError::KernelFailed(format!("cuda_ep CausalConvWithState: {detail}"))
+        })?;
+        let length_i64 = i64::try_from(length)
+            .ok()
+            .filter(|&length| length.checked_add(pad as i64).is_some())
+            .ok_or_else(|| EpError::KernelFailed(format!(
+                "cuda_ep CausalConvWithState: input length {length} plus history {pad} exceeds int64; reduce chunk length or dilation"
+            )))?;
 
         let dtype = x.dtype;
         if !matches!(
@@ -271,7 +283,7 @@ impl Kernel for CausalConvWithStateKernel {
             && state.shape != [batch, channels, pad]
         {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep CausalConvWithState: past_state must be [B={batch}, C={channels}, K-1={pad}], got {:?}",
+                "cuda_ep CausalConvWithState: past_state must be [B={batch}, C={channels}, history={pad}], got {:?}",
                 state.shape
             )));
         }
@@ -290,7 +302,7 @@ impl Kernel for CausalConvWithStateKernel {
             let present = &outputs[1];
             if present.dtype != dtype || present.shape != [batch, channels, pad] {
                 return Err(EpError::KernelFailed(format!(
-                    "cuda_ep CausalConvWithState: present_state must be {dtype:?} [B, C, K-1]={:?}, got {:?} {:?}",
+                    "cuda_ep CausalConvWithState: present_state must be {dtype:?} [B, C, history]={:?}, got {:?} {:?}",
                     [batch, channels, pad],
                     present.dtype,
                     present.shape
@@ -321,10 +333,14 @@ impl Kernel for CausalConvWithStateKernel {
             return Ok(());
         }
 
-        let stem = match dtype {
-            DataType::Float32 => "causal_conv_with_state_f32",
-            DataType::Float16 => "causal_conv_with_state_f16",
-            DataType::BFloat16 => "causal_conv_with_state_bf16",
+        let dilation = self.dilation.value();
+        let stem = match (dtype, dilation != 1 && kernel_size != 1) {
+            (DataType::Float32, false) => "causal_conv_with_state_f32",
+            (DataType::Float16, false) => "causal_conv_with_state_f16",
+            (DataType::BFloat16, false) => "causal_conv_with_state_bf16",
+            (DataType::Float32, true) => "causal_conv_with_state_dilated_f32",
+            (DataType::Float16, true) => "causal_conv_with_state_dilated_f16",
+            (DataType::BFloat16, true) => "causal_conv_with_state_dilated_bf16",
             _ => unreachable!(),
         };
         if dtype != DataType::Float32 {
@@ -333,7 +349,7 @@ impl Kernel for CausalConvWithStateKernel {
         }
         let func = self
             .runtime
-            .nvrtc_function("causal_conv_with_state_v1", SOURCE, stem)?;
+            .nvrtc_function("causal_conv_with_state_v2", SOURCE, stem)?;
 
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let weight_ptr = cuptr(weight.data_ptr::<u8>() as *const c_void);
@@ -352,7 +368,6 @@ impl Kernel for CausalConvWithStateKernel {
 
         let batch_i64 = batch as i64;
         let channels_i64 = channels as i64;
-        let length_i64 = length as i64;
         let kernel_size_i64 = kernel_size as i64;
         let pad_i64 = pad as i64;
         let has_bias = i32::from(bias.is_some());
@@ -385,6 +400,7 @@ impl Kernel for CausalConvWithStateKernel {
             .arg(&length_i64)
             .arg(&kernel_size_i64)
             .arg(&pad_i64)
+            .arg(&dilation)
             .arg(&has_bias)
             .arg(&has_state)
             .arg(&has_present_flag)

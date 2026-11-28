@@ -1453,10 +1453,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
-    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    // The factory resolves the versioned dilation attribute for the standard op.
     rec.register_through(
         OpKey::new("CausalConvWithState", "", 27),
         28,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(causal_conv::CausalConvWithStateFactory),
+    );
+    rec.register(
+        OpKey::new("CausalConvWithState", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
@@ -3774,7 +3779,7 @@ mod tests {
         // kernel-supported dtypes when the operator semantics are unchanged.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         // `TensorScatter` (opset-24 KV-cache update) adds one more, and the
-        // standard-domain `CausalConvWithState` (opset 27) adds one alongside
+        // standard-domain `CausalConvWithState` (opsets 27 and 29) adds two alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
@@ -3790,7 +3795,7 @@ mod tests {
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 137
+                + 138
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
@@ -3907,7 +3912,8 @@ mod tests {
         for op in ["LinearAttention", "CausalConvWithState"] {
             assert!(!reg.supports(op, "", 26));
             assert!(reg.supports(op, "ai.onnx", 28));
-            assert_eq!(reg.supports(op, "", 29), op == "LinearAttention");
+            assert!(reg.supports(op, "", 29));
+            assert!(reg.lookup(op, "", 29).is_some());
         }
         assert!(
             reg.lookup("GatherBlockQuantized", "com.microsoft", 1)

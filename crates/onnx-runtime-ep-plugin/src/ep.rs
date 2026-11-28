@@ -164,6 +164,50 @@ pub struct KernelRegistryEntry {
     pub output_dtype_constraints: &'static [(usize, &'static [DataType])],
 }
 
+/// Exclude an operator starting at a particular schema revision (inclusive).
+#[derive(Clone, Copy, Debug)]
+pub struct OperatorExclusion {
+    pub domain: &'static str,
+    pub op_type: &'static str,
+    /// Zero excludes every revision.
+    pub since_version: u32,
+}
+
+pub type OperatorExclusions = &'static [OperatorExclusion];
+
+/// Tensor-state convolution with dilated history is currently standalone only.
+pub const STANDALONE_CAUSAL_CONV: OperatorExclusions = &[OperatorExclusion {
+    domain: "",
+    op_type: "CausalConvWithState",
+    since_version: 29,
+}];
+
+pub(crate) fn first_excluded_revision(
+    exclusions: OperatorExclusions,
+    domain: &str,
+    op_type: &str,
+) -> Option<u32> {
+    let domain = onnx_runtime_ir::normalize_domain(domain);
+    exclusions
+        .iter()
+        .filter(|rule| {
+            onnx_runtime_ir::normalize_domain(rule.domain) == domain && rule.op_type == op_type
+        })
+        .map(|rule| rule.since_version)
+        .min()
+}
+
+pub(crate) fn excludes_schema_revision(
+    exclusions: OperatorExclusions,
+    node: &onnx_runtime_ir::Node,
+) -> bool {
+    first_excluded_revision(exclusions, &node.domain, &node.op_type).is_some_and(|since| {
+        // ORT's Node_GetSinceVersion is authoritative, not the graph import.
+        node.version
+            .is_none_or(|version| version <= 0 || version >= i64::from(since))
+    })
+}
+
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
 ///
 /// The first field is `OrtEp` so the pointer can be cast directly.
@@ -183,6 +227,7 @@ pub struct ExportedEp {
     /// that `GetCapability` can dtype-filter claims against the same source of
     /// truth. Empty when no registry entries were provided.
     pub registry_entries: Vec<KernelRegistryEntry>,
+    pub(crate) operator_exclusions: OperatorExclusions,
     /// Whether ORT places this EP's tensors in host-accessible memory, copied
     /// from the factory's `DeviceSupport::host_accessible` in `CreateEp`.
     ///
@@ -330,6 +375,7 @@ impl ExportedEp {
             name_cstr,
             kernel_registry: registry,
             registry_entries: entries,
+            operator_exclusions: &[],
             host_accessible: false,
             workspace_execution: None,
         }
@@ -433,11 +479,13 @@ fn ep_get_capability_inner(
     // so the deferral cannot be reintroduced by overriding a default — there is
     // nothing left to override.
     let mut graph_kernel_nodes = std::collections::HashSet::new();
+    let exclusions = exported.operator_exclusions;
     let claims = exported.ep.with(|ep| {
         query_plugin_capabilities(
             &view,
             ep,
             &exported.registry_entries,
+            exclusions,
             |node, graph_kernel| {
                 let ir_node = view.node(node);
                 if exceeded_ort_schema_max(ir_node, ir_graph.effective_opset(ir_node).unwrap_or(0))
@@ -714,12 +762,17 @@ fn query_plugin_capabilities(
     view: &onnx_runtime_ir::GraphView<'_>,
     ep: &dyn ExecutionProvider,
     entries: &[KernelRegistryEntry],
+    exclusions: OperatorExclusions,
     mut node_admissible: impl FnMut(NodeIndex, bool) -> bool,
 ) -> onnx_runtime_ep_api::Result<Vec<onnx_runtime_ep_api::SubgraphClaim>> {
     onnx_runtime_ep_api::abi::OrtGraphView::new(view).query_capabilities_filtered(
         ep,
         |index, graph_kernel| {
-            plugin_bitshift_is_admissible(view.node(index), view.graph(), entries)
+            let node = view.node(index);
+            // Exclude before partitioning so an unsupported node cannot take
+            // supported neighbors out with it in the later registry filter.
+            !excludes_schema_revision(exclusions, node)
+                && plugin_bitshift_is_admissible(node, view.graph(), entries)
                 && node_admissible(index, graph_kernel)
         },
     )
@@ -967,6 +1020,21 @@ fn ep_compile_inner(
             }
         };
         let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
+
+        if let Some(node) = view
+            .nodes()
+            .map(|index| view.node(index))
+            .find(|node| excludes_schema_revision(exported.operator_exclusions, node))
+        {
+            cleanup_partial_infos(out_infos, i);
+            return fail_status(&format!(
+                "Compile: the ORT plugin cannot run {}::{} node '{}' at schema revision {:?}; use standalone nxrt or a plugin supporting that revision",
+                onnx_runtime_ir::normalize_domain(&node.domain),
+                node.op_type,
+                node.name,
+                node.version,
+            ));
+        }
 
         let graph_claims = match exported
             .ep
@@ -2328,6 +2396,109 @@ mod tests {
     }
 
     #[test]
+    fn causal_conv_plugin_claims_legacy_schema_not_graph_import() {
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, static_shape};
+
+        let mut provider = CpuExecutionProvider::new();
+        provider
+            .initialize(&onnx_runtime_ep_api::EpConfig::default())
+            .unwrap();
+        for (domain, revision, allowed) in [
+            ("", Some(27), true),
+            ("ai.onnx", Some(28), true),
+            ("com.microsoft", Some(1), true),
+            ("", Some(29), false),
+            ("ai.onnx", Some(29), false),
+            ("", None, false),
+            ("", Some(0), false),
+        ] {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(
+                domain.into(),
+                if domain == "com.microsoft" { 1 } else { 29 },
+            );
+            let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 2, 4]));
+            let w = graph.create_named_value("w", DataType::Float32, static_shape([2, 1, 3]));
+            let y = graph.create_named_value("y", DataType::Float32, static_shape([1, 2, 4]));
+            let state =
+                graph.create_named_value("state", DataType::Float32, static_shape([1, 2, 2]));
+            graph.add_input(x);
+            graph.add_input(w);
+            graph.add_output(y);
+            graph.add_output(state);
+            let mut node = Node::new(
+                NodeId(0),
+                "CausalConvWithState",
+                vec![Some(x), Some(w)],
+                vec![y, state],
+            );
+            node.domain = domain.into();
+            node.version = revision;
+            let id = graph.insert_node(node);
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+
+            let standalone =
+                super::query_plugin_capabilities(&view, &provider, &[], &[], |_, _| true).unwrap();
+            assert_eq!(standalone[0].node_ids, [id], "{domain:?} {revision:?}");
+            let claims = super::query_plugin_capabilities(
+                &view,
+                &provider,
+                &[],
+                super::STANDALONE_CAUSAL_CONV,
+                |_, _| {
+                    assert!(allowed, "{domain:?} {revision:?} reached plugin admission");
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                claims.len(),
+                usize::from(allowed),
+                "{domain:?} {revision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_conv_plugin_shapes_decline_standalone_schema() {
+        use crate::compute::ShapeInference;
+        use onnx_runtime_ir::{Node, NodeId};
+
+        for (domain, revision, allowed) in [
+            ("", 27, true),
+            ("ai.onnx", 28, true),
+            ("com.microsoft", 1, true),
+            ("", 29, false),
+            ("ai.onnx", 29, false),
+        ] {
+            let mut node = Node::new(NodeId(0), "CausalConvWithState", vec![], vec![]);
+            node.domain = domain.into();
+            node.version = Some(revision);
+            let strategy = ShapeInference::for_node(
+                &node,
+                &[
+                    vec![Some(1), Some(2), Some(4)],
+                    vec![Some(2), Some(1), Some(3)],
+                ],
+                2,
+            );
+            assert_eq!(
+                matches!(
+                    strategy,
+                    ShapeInference::NativeRegistry { .. } | ShapeInference::CausalConvWithState
+                ),
+                allowed,
+                "{domain:?} {revision}"
+            );
+            if !allowed {
+                assert!(matches!(strategy, ShapeInference::Declined { .. }));
+            }
+        }
+    }
+
+    #[test]
     fn bitshift_plugin_admission_preserves_unsigned_partition() {
         for opset in [11, 28] {
             check_bitshift_plugin_admission(opset);
@@ -2393,7 +2564,8 @@ mod tests {
             native_claims[0].node_ids.as_slice(),
             &[signed_id, cast_id, unsigned_id]
         );
-        let plugin_claims = query_plugin_capabilities(&view, &ep, &entries, |_, _| true).unwrap();
+        let plugin_claims =
+            query_plugin_capabilities(&view, &ep, &entries, &[], |_, _| true).unwrap();
         assert_eq!(plugin_claims.len(), 1);
         assert_eq!(
             plugin_claims[0].node_ids.as_slice(),

@@ -414,6 +414,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/range.yaml"),
     include_str!("../../schemas/standard/range_v27.yaml"),
     include_str!("../../schemas/standard/causal_conv_with_state.yaml"),
+    include_str!("../../schemas/standard/causal_conv_with_state_v29.yaml"),
     include_str!("../../schemas/standard/linear_attention.yaml"),
     include_str!("../../schemas/standard/linear_attention_v29.yaml"),
     include_str!("../../schemas/standard/split.yaml"),
@@ -824,13 +825,13 @@ type_constraints:
         for op in ["LinearAttention", "CausalConvWithState"] {
             assert!(registry.lookup(op, "", 26).is_none());
             assert_eq!(registry.lookup(op, "", 28).unwrap().since_version, 27);
-            assert_eq!(
-                registry
-                    .lookup(op, "", 29)
-                    .map(|schema| schema.since_version),
-                (op == "LinearAttention").then_some(29)
-            );
+            assert_eq!(registry.lookup(op, "", 29).unwrap().since_version, 29);
         }
+        let earlier = registry.lookup("CausalConvWithState", "", 28).unwrap();
+        let current = registry.lookup("CausalConvWithState", "", 29).unwrap();
+        assert_eq!(current.since_version, 29);
+        assert!(!earlier.attributes.iter().any(|a| a.name == "dilation"));
+        assert!(current.attributes.iter().any(|a| a.name == "dilation"));
 
         assert_eq!(registry.lookup("Range", "", 26).unwrap().since_version, 11);
         assert_eq!(registry.lookup("Range", "", 27).unwrap().since_version, 27);

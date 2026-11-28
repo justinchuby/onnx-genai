@@ -1,0 +1,17 @@
+domain: ""
+name: CausalConvWithState
+since_version: 29
+doc: Stateful causal depthwise convolution retaining (K - 1) * dilation chronological samples.
+attributes:
+  - { name: activation, type: string, default: "none" }
+  - { name: dilation, type: int, default: 1 }
+inputs:
+  - { name: input, type_str: T }
+  - { name: weight, type_str: T }
+  - { name: bias, type_str: T, optional: true }
+  - { name: past_state, type_str: T, optional: true }
+outputs:
+  - { name: output, type_str: T }
+  - { name: present_state, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float32, float16, bfloat16] }

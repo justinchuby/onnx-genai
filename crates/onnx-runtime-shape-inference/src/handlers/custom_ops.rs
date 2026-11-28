@@ -380,8 +380,15 @@ pub fn causal_conv_with_state(ctx: &mut InferenceContext) -> Result<(), ShapeInf
     Ok(())
 }
 
-fn causal_conv_with_state_v27(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+fn causal_conv_with_state_standard(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     require_outputs(ctx, 2)?;
+    let invalid = |detail: String| ShapeInferError::Invalid {
+        op: "CausalConvWithState".into(),
+        detail,
+    };
+    let dilation =
+        onnx_runtime_ir::causal_conv_with_state::Dilation::parse(ctx.node, ctx.opset(""))
+            .map_err(invalid)?;
     if let Some(activation) = ctx.node.attr("activation")
         && !matches!(activation.as_str(), Some("none" | "silu" | "swish"))
     {
@@ -394,10 +401,6 @@ fn causal_conv_with_state_v27(ctx: &mut InferenceContext) -> Result<(), ShapeInf
     let weight_shape = rank_shape(ctx, 1, 3)?;
     let bias_shape = rank_shape(ctx, 2, 1)?;
     let past_shape = rank_shape(ctx, 3, 3)?;
-    let invalid = |detail: String| ShapeInferError::Invalid {
-        op: "CausalConvWithState".into(),
-        detail,
-    };
     if let Some(w) = &weight_shape
         && (w[1].as_const().is_some_and(|d| d != 1) || w[2].as_const().is_some_and(|d| d < 1))
     {
@@ -405,10 +408,27 @@ fn causal_conv_with_state_v27(ctx: &mut InferenceContext) -> Result<(), ShapeInf
             "weight must be [C, 1, K] with K >= 1, got {w:?}"
         )));
     }
-    let history = if let Some(w) = &weight_shape {
-        w[2].sub(&c(1))
-    } else if let Some(past) = &past_shape {
-        past[2].clone()
+    let kernel = weight_shape.as_ref().map(|w| &w[2]);
+    let past_history = past_shape.as_ref().map(|past| &past[2]);
+    let history = if let Some(kernel) = kernel.and_then(DimExpr::as_const) {
+        c(dilation.history(kernel).map_err(invalid)?)
+    } else if let Some(history) = past_history.and_then(DimExpr::as_const) {
+        if history == i64::MAX {
+            return Err(invalid(format!(
+                "past_state history {history} plus one exceeds int64; reduce kernel width or dilation"
+            )));
+        }
+        if history < 0 || history % dilation.value() != 0 {
+            return Err(invalid(format!(
+                "past_state history must be a nonnegative multiple of dilation {}, got {history}",
+                dilation.value()
+            )));
+        }
+        c(history)
+    } else if let Some(kernel) = kernel {
+        kernel.sub(&c(1)).mul(&c(dilation.value()))
+    } else if let Some(history) = past_history {
+        history.clone()
     } else {
         ctx.fresh_dim()
     };
@@ -721,7 +741,13 @@ pub fn register(reg: &mut InferenceRegistry) {
         "CausalConvWithState",
         27,
         28,
-        causal_conv_with_state_v27,
+        causal_conv_with_state_standard,
+    );
+    reg.register(
+        "",
+        "CausalConvWithState",
+        29,
+        causal_conv_with_state_standard,
     );
     reg.register(
         "com.microsoft",

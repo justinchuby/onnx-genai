@@ -37,6 +37,7 @@ pub struct ExportedFactory {
     /// When non-empty, `create_ep` builds an ORT kernel registry so that ORT
     /// routes f16/bf16 (and other typed) nodes to this EP.
     pub kernel_registry_entries: Vec<crate::ep::KernelRegistryEntry>,
+    operator_exclusions: crate::ep::OperatorExclusions,
     /// Device support configuration for generalized enumeration.
     pub device_support: DeviceSupport,
     /// Device allocators remain factory-owned after ORT releases them. The
@@ -190,6 +191,7 @@ fn build_factory(
         version_cstr,
         constructor,
         kernel_registry_entries: Vec::new(),
+        operator_exclusions: &[],
         device_support: DeviceSupport::cpu_only(),
         device_allocators: Mutex::new(HashMap::new()),
         shared_ep: None,
@@ -458,6 +460,34 @@ pub unsafe fn register_ordered_workspace_execution(
     exported.workspace_execution =
         Some(unsafe { crate::workspace::OrderedWorkspace::new(preflight) });
     ok_status()
+}
+
+/// Exclude operators from both ORT registration and capability discovery.
+///
+/// # Safety
+/// Call once on a live factory returned by this module, after setting its
+/// registry entries and before returning it to ORT or constructing any EPs.
+pub unsafe fn exclude_operators(
+    factory: *mut ort::OrtEpFactory,
+    exclusions: crate::ep::OperatorExclusions,
+) {
+    let exported = unsafe { &mut *factory.cast::<ExportedFactory>() };
+    exported.operator_exclusions = exclusions;
+    exported.kernel_registry_entries.retain_mut(|entry| {
+        let Some(since) =
+            crate::ep::first_excluded_revision(exclusions, entry.domain, entry.op_type)
+        else {
+            return true;
+        };
+        let Ok(since) = i32::try_from(since) else {
+            return true;
+        };
+        if entry.since_version >= since {
+            return false;
+        }
+        entry.end_version = entry.end_version.min(since - 1);
+        true
+    });
 }
 
 /// Outcome of the explicit shared-EP teardown attempted by
@@ -932,6 +962,7 @@ unsafe extern "C" fn factory_create_ep(
         let mut exported_ep = exported_ep;
         exported_ep.host_accessible = exported.device_support.host_accessible;
         exported_ep.workspace_execution = exported.workspace_execution.clone();
+        exported_ep.operator_exclusions = exported.operator_exclusions;
 
         let ep_ptr = Box::into_raw(exported_ep);
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
