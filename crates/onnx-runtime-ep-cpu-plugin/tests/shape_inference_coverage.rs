@@ -80,6 +80,8 @@ fn newly_registered_native_rules_route_at_their_exact_schema_revisions() {
     for (op, version) in [
         ("Det", 11),
         ("NegativeLogLikelihoodLoss", 12),
+        ("NegativeLogLikelihoodLoss", 13),
+        ("NegativeLogLikelihoodLoss", 22),
         ("RNN", 1),
         ("RNN", 14),
         ("ReverseSequence", 10),

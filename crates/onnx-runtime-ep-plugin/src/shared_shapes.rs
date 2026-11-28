@@ -97,7 +97,7 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
     if node.is_default_domain() {
         match (op, opset) {
             ("Det", 11)
-            | ("NegativeLogLikelihoodLoss", 12)
+            | ("NegativeLogLikelihoodLoss", 12 | 13 | 22)
             | ("RNN", 1 | 14)
             | ("ReverseSequence", 10) => return Some(&[]),
             ("MaxUnpool", 9 | 11 | 22) => return Some(&[2]),
