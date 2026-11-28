@@ -1702,6 +1702,64 @@ fn group_normalization_cases() -> Vec<Case> {
     cases
 }
 
+fn negative_log_likelihood_loss_cases() -> Vec<Case> {
+    let op = onnx_runtime_ep_api::negative_log_likelihood_loss::OP;
+    let mut cases = vec![Case {
+        label: format!("{op}[f64,default-mean,rank2]"),
+        op,
+        domain: "",
+        opset: 19,
+        inputs: vec![
+            input(DataType::Float64, &[2, 2], &[-1_f64, -2., -3., -4.]),
+            input(DataType::Int64, &[2], &[0_i64, 1]),
+        ],
+        outputs: vec![(DataType::Float64, vec![])],
+        attrs: vec![],
+        compare: Compare::ExactBytes,
+    }];
+    for (dtype, opset) in [
+        (DataType::Float32, 21),
+        (DataType::Float16, 20),
+        (DataType::BFloat16, 22),
+        (DataType::BFloat16, 29),
+    ] {
+        for reduction in ["none", "sum", "mean"] {
+            cases.push(Case {
+                label: format!("{op}[{dtype:?},opset{opset},{reduction}]"),
+                op,
+                domain: "",
+                opset,
+                inputs: vec![
+                    float_input(
+                        dtype,
+                        &[2, 2, 1, 2],
+                        &[-1., -2., -3., -4., -5., -6., -7., -8.],
+                    ),
+                    input(DataType::Int32, &[2, 1, 2], &[1_i32, -99, 0, 1]),
+                    float_input(dtype, &[2], &[1., 2.]),
+                ],
+                outputs: vec![(
+                    dtype,
+                    if reduction == "none" {
+                        vec![2, 1, 2]
+                    } else {
+                        vec![]
+                    },
+                )],
+                attrs: vec![
+                    (
+                        "reduction",
+                        Attribute::String(reduction.as_bytes().to_vec()),
+                    ),
+                    ("ignore_index", Attribute::Int(-99)),
+                ],
+                compare: Compare::ExactBytes,
+            });
+        }
+    }
+    cases
+}
+
 fn lp_pool_cases() -> Vec<Case> {
     vec![
         Case {
@@ -3859,6 +3917,10 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "mean_variance_normalization_gpu.rs",
         "opset 29 native CPU/CUDA against independently calculated goldens",
     ));
+    p.push(sweep(
+        onnx_runtime_ep_api::negative_log_likelihood_loss::OP,
+        negative_log_likelihood_loss_cases(),
+    ));
     p.push(sweep("LpPool", lp_pool_cases()));
     p.push(sweep("CenterCropPad", center_crop_pad_cases()));
     p.push(sweep("Col2Im", col2im_cases()));
@@ -5237,4 +5299,13 @@ fn pad_preserves_cuda_ort_descriptor_and_byte_axes_contract() {
         run_cuda(&ep, "Pad", "", 25, &inputs, &outputs, &[])[0],
         [0, 1, 2]
     );
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn negative_log_likelihood_loss_native_cuda_conformance() {
+    let ep = require_cuda();
+    for case in negative_log_likelihood_loss_cases() {
+        run_case(&ep, &case);
+    }
 }

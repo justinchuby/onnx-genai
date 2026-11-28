@@ -192,6 +192,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `ReduceL2` | `` | ✅ | **NVRTC block reduction** (f32) | `sqrt` of the sum of squares over the group. |
 | `ReduceLogSum` | `` | ✅ | **NVRTC block reduction** (f32) | `log` of the sum over the group. |
 | `ReduceLogSumExp` | `` | ✅ | **NVRTC block reduction** (f32) | `log(sum(exp(x)))` over the group, matching the CPU EP's naive (no max-shift) accumulation; opset-1 attribute and opset-18 axes-input forms. |
+| `NegativeLogLikelihoodLoss` | `` | ✅ | **NVRTC gather and block reduction** | Standalone rank-2 and spatial loss with Int32/Int64 targets, optional class weights, and f16/f32/f64 (BF16 from opset 22). CUDA reads targets back for class-index validation, so this kernel does not participate in CUDA Graph capture. |
 
 > **Why NVRTC block reduction, not cub?** cub's `DeviceSegmentedReduce` is the
 > vendor primitive, and our kernel matches its shape (one block per output

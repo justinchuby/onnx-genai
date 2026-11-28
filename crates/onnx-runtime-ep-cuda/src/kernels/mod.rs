@@ -94,6 +94,7 @@ pub mod mod_op;
 pub mod movement;
 pub mod multi_head_attention;
 pub mod nary;
+mod negative_log_likelihood_loss;
 pub mod non_max_suppression;
 pub mod nonzero;
 pub mod normalization;
@@ -274,6 +275,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "BitCast",
     "ReduceSum",
     "ReduceMean",
+    onnx_runtime_ep_api::negative_log_likelihood_loss::OP,
     "ReduceMax",
     "ReduceMin",
     "ReduceProd",
@@ -625,6 +627,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("Pack", "") => &[DataType::Uint8],
         ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
         ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
+        (onnx_runtime_ep_api::negative_log_likelihood_loss::OP, "") =>
+            onnx_runtime_ep_api::negative_log_likelihood_loss::EDGE_DTYPES,
         (name, "") if onnx_runtime_ir::standard_math::OPS.iter().any(|&(op, _)| op == name) =>
             onnx_runtime_ir::standard_math::DTYPES,
 
@@ -2028,6 +2032,20 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    for version in onnx_runtime_ep_api::negative_log_likelihood_loss::VERSIONS {
+        reg.register(
+            OpKey::new(
+                onnx_runtime_ep_api::negative_log_likelihood_loss::OP,
+                "",
+                version,
+            ),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(negative_log_likelihood_loss::Factory(
+                runtime.clone(),
+                version,
+            )),
+        );
+    }
     reg.register(
         OpKey::new("ReduceMean", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
