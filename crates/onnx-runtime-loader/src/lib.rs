@@ -321,7 +321,6 @@ fn build_from_bytes_with_weights(
     infer_shapes(&mut graph)?;
     // Serialized graphs can omit intermediate value types until inference.
     validate_topk_nodes(&graph)?;
-    validate_shape_size_dtypes(&graph, &graph.opset_imports)?;
     validate_split_to_sequence_nodes(&graph)?;
     validate_shape_only_types(&graph, graph.opset_imports.get("").copied())?;
     validate_compress_dtypes(&graph)?;
@@ -622,16 +621,14 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 ///    imported opset and validate every statically known equation/type/shape.
 /// 3. [`validate_topk_nodes`] — check the BF16 TopK schema revision where X's
 ///    dtype is known.
-/// 4. [`validate_shape_size_dtypes`] — reject input types that require a newer
-///    revision of Shape or Size than the effective imported opset.
-/// 5. [`validate_split_to_sequence_nodes`] — enforce the v24 bfloat16 type
+/// 4. [`validate_split_to_sequence_nodes`] — enforce the v24 bfloat16 type
 ///    boundary before the executor's sequence-op routing bypasses EP claims.
-/// 6. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
+/// 5. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
 ///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
 ///    attribute the executor cannot run.
-/// 7. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
+/// 6. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
 ///    (graph input, initializer, or an upstream node output).
-/// 8. [`validate_no_initializer_producer`] — an initializer must be a constant
+/// 7. [`validate_no_initializer_producer`] — an initializer must be a constant
 ///    source; reject any initializer value that is also a node output (shares a
 ///    `ValueId` with a producer), which the IR structural check does not cover.
 /// 9. [`validate_compress_dtypes`] — check the versioned data/output dtype set
@@ -673,7 +670,6 @@ fn validate_model_structure(
     validate_opset_imports(graph)?;
     validate_einsum_nodes_with_policy(graph, einsum_policy)?;
     validate_topk_nodes(graph)?;
-    validate_shape_size_dtypes(graph, &graph.opset_imports)?;
     validate_split_to_sequence_nodes(graph)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
@@ -799,59 +795,6 @@ fn validate_shape_only_types(
     }
     for subgraph in graph.subgraphs.values() {
         validate_shape_only_types(subgraph, imported_opset)?;
-    }
-    Ok(())
-}
-
-fn validate_shape_size_dtypes(
-    graph: &Graph,
-    imports: &std::collections::HashMap<String, u64>,
-) -> Result<(), LoaderError> {
-    use onnx_runtime_ir::DataType;
-
-    for node in graph.nodes.values() {
-        if !node.is_default_domain() || !matches!(node.op_type.as_str(), "Shape" | "Size") {
-            continue;
-        }
-        let Some(id) = node.inputs.first().copied().flatten() else {
-            continue;
-        };
-        let Some(input) = graph
-            .values
-            .get(id)
-            .filter(|_| graph.value_type_is_known(id))
-        else {
-            continue;
-        };
-        // The two schema histories share the same input-type additions.
-        // Keep this table scoped to the ONNX 19–24 revisions.
-        let since = match input.dtype {
-            DataType::Float8E4M3FN
-            | DataType::Float8E4M3FNUZ
-            | DataType::Float8E5M2
-            | DataType::Float8E5M2FNUZ => 19,
-            DataType::Int4 | DataType::Uint4 => 21,
-            DataType::Float4E2M1 => 23,
-            DataType::Float8E8M0 => 24,
-            _ => continue,
-        };
-        let opset = node
-            .local_opset()
-            .or_else(|| imports.get("").copied())
-            .unwrap_or(1);
-        if opset < since {
-            return Err(LoaderError::ShapeSizeDtypeBeforeOpset {
-                op: node.op_type.clone(),
-                node: node_label(node),
-                input: input.name.clone().unwrap_or_else(|| format!("{id:?}")),
-                dtype: input.dtype,
-                opset,
-                since,
-            });
-        }
-    }
-    for subgraph in graph.subgraphs.values() {
-        validate_shape_size_dtypes(subgraph, imports)?;
     }
     Ok(())
 }

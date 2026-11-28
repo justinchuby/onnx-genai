@@ -15,6 +15,10 @@ const CASES: &[(i64, u64, DataType)] = &[
     (12, 24, DataType::Float8E8M0),
 ];
 
+const EARLIER_SHAPE_CASES: &[(i64, u64, DataType)] =
+    &[(10, 14, DataType::Uint4), (10, 20, DataType::Uint4)];
+const EARLIER_SIZE_CASES: &[(i64, u64, DataType)] = &[(11, 22, DataType::Float4E2M1)];
+
 #[derive(Clone, Copy, Debug)]
 enum MetadataOp {
     Shape,
@@ -43,12 +47,12 @@ impl MetadataOp {
         );
         graph.add_input(x);
         let shape = match self {
-            Self::Shape => static_shape([2]),
+            Self::Shape => static_shape([if opset >= 15 { 2 } else { 4 }]),
             Self::Size => vec![],
         };
         let y = graph.create_named_value("y", DataType::Int64, shape);
         let mut node = Node::new(NodeId(0), self.name(), vec![Some(x)], vec![y]);
-        if matches!(self, Self::Shape) {
+        if matches!(self, Self::Shape) && opset >= 15 {
             node.attributes.insert("start".into(), Attribute::Int(-3));
             node.attributes.insert("end".into(), Attribute::Int(-1));
         }
@@ -62,8 +66,13 @@ impl MetadataOp {
     }
 }
 
-fn check_cases(op: MetadataOp, preference: DevicePreference, device: DeviceId) {
-    for &(ir, opset, dtype) in CASES {
+fn check_cases(
+    op: MetadataOp,
+    preference: DevicePreference,
+    device: DeviceId,
+    cases: &[(i64, u64, DataType)],
+) {
+    for &(ir, opset, dtype) in cases {
         let case = format!("{op:?}-{opset} {dtype:?} on {device:?}");
         let mut session = InferenceSession::builder()
             .model_bytes(&op.model(ir, opset, dtype))
@@ -106,8 +115,10 @@ fn check_cases(op: MetadataOp, preference: DevicePreference, device: DeviceId) {
             assert_eq!(output.dtype, DataType::Int64, "{case}");
             match op {
                 MetadataOp::Shape => {
-                    assert_eq!(output.shape, [2], "{case}");
-                    assert_eq!(output.to_vec_i64(), [3, extent as i64], "{case}");
+                    let dims = [1, 3, extent as i64, 5];
+                    let expected = if opset >= 15 { &dims[1..3] } else { &dims[..] };
+                    assert_eq!(output.shape, [expected.len()], "{case}");
+                    assert_eq!(output.to_vec_i64(), expected, "{case}");
                 }
                 MetadataOp::Size => {
                     assert!(output.shape.is_empty(), "{case}: expected an INT64 scalar");
@@ -119,7 +130,7 @@ fn check_cases(op: MetadataOp, preference: DevicePreference, device: DeviceId) {
 }
 
 fn check_cpu(op: MetadataOp) {
-    check_cases(op, DevicePreference::Cpu, DeviceId::cpu());
+    check_cases(op, DevicePreference::Cpu, DeviceId::cpu(), CASES);
 }
 
 #[test]
@@ -133,53 +144,39 @@ fn modern_size_dynamic_cpu() {
 }
 
 #[test]
-fn modern_shape_size_reject_pre_revision_dtypes() {
-    for op in [MetadataOp::Shape, MetadataOp::Size] {
-        for &(ir, opset, dtype) in CASES {
-            // Keep the tensor's IR version valid so only the operator's
-            // imported schema revision is under test.
-            let older = opset - 1;
-            let result = InferenceSession::builder()
-                .model_bytes(&op.model(ir, older, dtype))
-                .device(DevicePreference::Cpu)
-                .build();
-            let err = match result {
-                Ok(_) => panic!("{}-{older} unexpectedly admitted {dtype:?}", op.name()),
-                Err(err) => err.to_string(),
-            };
-            for expected in [
-                op.name().to_owned(),
-                format!("{dtype:?}"),
-                format!("not admitted at opset {older}"),
-                format!("export with opset {opset} or newer"),
-            ] {
-                assert!(err.contains(&expected), "expected {expected:?} in {err}");
-            }
-        }
-    }
+fn shape_earlier_opsets_accept_packed_input() {
+    check_cases(
+        MetadataOp::Shape,
+        DevicePreference::Cpu,
+        DeviceId::cpu(),
+        EARLIER_SHAPE_CASES,
+    );
 }
 
 #[test]
-fn modern_shape_size_reject_pre_revision_dtype_without_rank() {
-    for op in [MetadataOp::Shape, MetadataOp::Size] {
-        let mut graph = op.graph(12, 23, DataType::Float8E8M0);
-        graph.mark_value_shape_unknown(graph.inputs[0]);
-        let err = match InferenceSession::from_graph(graph) {
-            Ok(_) => panic!("{}-23 unexpectedly admitted Float8E8M0", op.name()),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("not admitted at opset 23"), "{err}");
-        assert!(err.contains("export with opset 24 or newer"), "{err}");
-    }
+fn size_earlier_opset_accepts_packed_input() {
+    check_cases(
+        MetadataOp::Size,
+        DevicePreference::Cpu,
+        DeviceId::cpu(),
+        EARLIER_SIZE_CASES,
+    );
 }
 
 #[cfg(feature = "cuda")]
 fn check_cuda(op: MetadataOp) {
-    check_cases(
-        op,
-        DevicePreference::Gpu { index: Some(0) },
-        DeviceId::cuda(0),
-    );
+    let earlier_cases = match op {
+        MetadataOp::Shape => EARLIER_SHAPE_CASES,
+        MetadataOp::Size => EARLIER_SIZE_CASES,
+    };
+    for cases in [CASES, earlier_cases] {
+        check_cases(
+            op,
+            DevicePreference::Gpu { index: Some(0) },
+            DeviceId::cuda(0),
+            cases,
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]

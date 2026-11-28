@@ -288,8 +288,8 @@ SESSION_METADATA_EXPECTED_TESTS = SESSION_METADATA_GPU_TESTS | frozenset(
     {
         "modern_shape_dynamic_cpu",
         "modern_size_dynamic_cpu",
-        "modern_shape_size_reject_pre_revision_dtypes",
-        "modern_shape_size_reject_pre_revision_dtype_without_rank",
+        "shape_earlier_opsets_accept_packed_input",
+        "size_earlier_opset_accepts_packed_input",
     }
 )
 ENGINE_PACKAGE = "onnx-genai-engine"
