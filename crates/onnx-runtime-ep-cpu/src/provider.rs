@@ -510,6 +510,11 @@ impl ExecutionProvider for CpuExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
+            onnx_runtime_ep_api::random::unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);

@@ -302,6 +302,112 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
     );
 }
 
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+fn native_random_cuda_distribution_dtype_seed_and_capture() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let ep = require_cuda();
+    const COUNT: usize = 4096;
+    for (op, dtype, version) in [
+        ("RandomNormal", DataType::Float64, 1),
+        ("RandomNormalLike", DataType::BFloat16, 22),
+        ("RandomUniform", DataType::Float16, 1),
+        ("RandomUniformLike", DataType::Float32, 1),
+    ] {
+        let inputs = if op.ends_with("Like") {
+            vec![input(DataType::Int32, &[COUNT], &[15_i32; COUNT])]
+        } else {
+            vec![]
+        };
+        let outputs = [(dtype, vec![COUNT])];
+        let mut attrs = vec![
+            ("dtype", Attribute::Int(dtype as i64)),
+            ("seed", Attribute::Float(0.25)),
+        ];
+        if inputs.is_empty() {
+            attrs.push(("shape", Attribute::Ints(vec![COUNT as i64])));
+        }
+        let normal = op.starts_with("RandomNormal");
+        attrs.extend(if normal {
+            [
+                ("mean", Attribute::Float(2.0)),
+                ("scale", Attribute::Float(0.5)),
+            ]
+        } else {
+            [
+                ("low", Attribute::Float(-2.0)),
+                ("high", Attribute::Float(3.0)),
+            ]
+        });
+        let first = run_cuda(&ep, op, "", version, &inputs, &outputs, &attrs);
+        assert_eq!(
+            first,
+            run_cuda(&ep, op, "", version, &inputs, &outputs, &attrs),
+            "{op}"
+        );
+        let values = decode_floats(&first[0], dtype);
+        let mean = values.iter().sum::<f32>() / COUNT as f32;
+        if normal {
+            let variance = values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f32>()
+                / COUNT as f32;
+            assert!((mean - 2.0).abs() < 0.06, "{op}: mean {mean}");
+            assert!((variance - 0.25).abs() < 0.04, "{op}: variance {variance}");
+        } else {
+            assert!(
+                values.iter().all(|value| (-2.0..=3.0).contains(value)),
+                "{op}"
+            );
+            assert!((mean - 0.5).abs() < 0.15, "{op}: mean {mean}");
+        }
+
+        let (graph, id) = common::build_graph(op, "", version, &inputs, &outputs, &attrs);
+        let shapes = inputs
+            .iter()
+            .map(|input| input.shape.clone())
+            .collect::<Vec<_>>();
+        let kernel = ep.get_kernel(graph.node(id), &shapes, version).unwrap();
+        let support = kernel.capture_support();
+        assert!(
+            support
+                .reason()
+                .is_some_and(|reason| reason.contains("RNG state")),
+            "{op}"
+        );
+        if dtype == DataType::BFloat16 {
+            let claim = ep.supports_op(
+                graph.node(id),
+                21,
+                &[onnx_runtime_ir::static_shape([COUNT])],
+                &[DataType::Int32],
+                &[],
+            );
+            assert!(
+                claim
+                    .reason()
+                    .is_some_and(|reason| reason.contains("BF16 starting at opset 22"))
+            );
+        }
+        if op.ends_with("Like") {
+            let claim = ep.supports_op(
+                graph.node(id),
+                version,
+                &[onnx_runtime_ir::static_shape([COUNT])],
+                &[DataType::String],
+                &[],
+            );
+            assert!(
+                claim
+                    .reason()
+                    .is_some_and(|reason| reason.contains("no CUDA representation"))
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Profile model
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3868,6 +3974,18 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "opset24_ops_gpu.rs",
         "fill from shape",
     ));
+    for op in [
+        "RandomNormal",
+        "RandomNormalLike",
+        "RandomUniform",
+        "RandomUniformLike",
+    ] {
+        p.push(dedicated(
+            op,
+            "cuda_conformance_gpu.rs",
+            "native RNG distribution, seed, dtype and capture contract",
+        ));
+    }
     p.push(dedicated("OneHot", "opset24_ops_gpu.rs", "one-hot encode"));
 
     // Structural data-movement.

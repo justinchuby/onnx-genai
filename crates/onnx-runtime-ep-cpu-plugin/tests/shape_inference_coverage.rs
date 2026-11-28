@@ -287,16 +287,22 @@ fn registered_ops() -> Vec<(String, String)> {
 
 #[test]
 fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
+    use onnx_runtime_ep_plugin::ep::{NATIVE_RANDOM_EXCLUSIONS, first_excluded_revision};
+
     let (_, descriptors) = onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors();
     let raw_abi_ops: std::collections::BTreeSet<_> = descriptors
         .iter()
         .filter(|descriptor| descriptor.supports_raw_tensor_abi)
         .map(|descriptor| (descriptor.domain.clone(), descriptor.op_type.clone()))
         .collect();
-    // Managed host kernels never enter the raw plugin's shape filter.
+    // Managed host kernels and operators excluded at every revision never
+    // reach the raw plugin's shape filter.
     let actual: Vec<(String, String)> = registered_ops()
         .into_iter()
         .filter(|key| raw_abi_ops.contains(key))
+        .filter(|(domain, op)| {
+            first_excluded_revision(NATIVE_RANDOM_EXCLUSIONS, domain, op) != Some(0)
+        })
         .filter(|(domain, op)| declines(op, domain))
         .collect();
 

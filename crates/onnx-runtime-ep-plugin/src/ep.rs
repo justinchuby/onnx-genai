@@ -193,7 +193,42 @@ pub const STANDALONE_RNN_EXCLUSION: OperatorExclusions = &[OperatorExclusion {
 pub const STANDALONE_CAUSAL_CONV_AND_RNN: OperatorExclusions =
     &[STANDALONE_CAUSAL_CONV[0], STANDALONE_RNN_EXCLUSION[0]];
 
-pub(crate) fn first_excluded_revision(
+/// Native RNG needs node-owned run state, which the ORT plugin does not bind.
+pub const NATIVE_RANDOM_EXCLUSIONS: OperatorExclusions = &{
+    use onnx_runtime_ep_api::random::OPS;
+    let mut rules = [OperatorExclusion {
+        domain: "",
+        op_type: "",
+        since_version: 0,
+    }; OPS.len()];
+    let mut i = 0;
+    while i < OPS.len() {
+        rules[i].op_type = OPS[i];
+        i += 1;
+    }
+    rules
+};
+
+/// Apply the CPU and CUDA factory exclusions together; updates replace the slice.
+pub const STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM: OperatorExclusions = &{
+    let existing = STANDALONE_CAUSAL_CONV_AND_RNN;
+    let mut rules =
+        [existing[0]; STANDALONE_CAUSAL_CONV_AND_RNN.len() + NATIVE_RANDOM_EXCLUSIONS.len()];
+    let mut i = 0;
+    while i < existing.len() {
+        rules[i] = existing[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < NATIVE_RANDOM_EXCLUSIONS.len() {
+        rules[i + j] = NATIVE_RANDOM_EXCLUSIONS[j];
+        j += 1;
+    }
+    rules
+};
+
+/// Earliest excluded schema revision for the normalized operator name.
+pub fn first_excluded_revision(
     exclusions: OperatorExclusions,
     domain: &str,
     op_type: &str,
@@ -2650,6 +2685,135 @@ mod tests {
                     allowed,
                     "ORT CastLike-{opset} eligibility for {source:?} -> {target:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn native_random_is_excluded_before_plugin_partitioning() {
+        use onnx_runtime_ep_api::{
+            Cost, DeviceBuffer, DeviceId, EpConfig, Fence, Kernel, KernelMatch, Result,
+            WorkspacePlanning,
+        };
+        use onnx_runtime_ir::{
+            Graph, GraphView, GraphViewCache, Node, NodeId, Shape, TensorLayout,
+        };
+
+        struct ClaimingEp(Option<NodeId>);
+
+        impl ExecutionProvider for ClaimingEp {
+            fn name(&self) -> &str {
+                "claiming_test_ep"
+            }
+            fn device_type(&self) -> DeviceType {
+                DeviceType::Cpu
+            }
+            fn device_id(&self) -> DeviceId {
+                DeviceId::cpu()
+            }
+            fn initialize(&mut self, _: &EpConfig) -> Result<()> {
+                unreachable!()
+            }
+            fn shutdown(&mut self) -> Result<()> {
+                unreachable!()
+            }
+            fn supports_op(
+                &self,
+                _: &Node,
+                _: u64,
+                _: &[Shape],
+                _: &[DataType],
+                _: &[TensorLayout],
+            ) -> KernelMatch {
+                KernelMatch::Supported {
+                    workspace_planning: WorkspacePlanning::Metadata,
+                    cost: Cost::ZERO,
+                    required_input_layouts: None,
+                    output_layouts: vec![],
+                }
+            }
+            fn claim_graph(&self, _: &Graph) -> Result<Vec<NodeId>> {
+                Ok(self.0.into_iter().collect())
+            }
+            fn get_kernel(&self, _: &Node, _: &[Vec<usize>], _: u64) -> Result<Box<dyn Kernel>> {
+                unreachable!()
+            }
+            fn allocate(&self, _: usize, _: usize) -> Result<DeviceBuffer> {
+                unreachable!()
+            }
+            fn deallocate(&self, _: DeviceBuffer) -> Result<()> {
+                unreachable!()
+            }
+            fn copy(&self, _: &DeviceBuffer, _: &mut DeviceBuffer, _: usize) -> Result<()> {
+                unreachable!()
+            }
+            fn copy_async(
+                &self,
+                _: &DeviceBuffer,
+                _: &mut DeviceBuffer,
+                _: usize,
+            ) -> Result<Fence> {
+                unreachable!()
+            }
+            fn sync(&self) -> Result<()> {
+                unreachable!()
+            }
+        }
+
+        for (domain, version, excluded) in [
+            ("", Some(1), true),
+            ("ai.onnx", Some(22), true),
+            ("", None, true),
+            ("test.custom", Some(22), false),
+        ] {
+            let (mut graph, random) = graph_with_node(
+                "RandomUniformLike",
+                domain,
+                &[DataType::Float32],
+                &[DataType::Float32],
+            );
+            graph.node_mut(random).version = version;
+            let random_input = graph.node(random).inputs[0].unwrap();
+            let random_output = graph.node(random).outputs[0];
+            graph.inputs.push(random_input);
+            let output = graph.create_named_value("neighbor", DataType::Float32, Shape::default());
+            let neighbor = graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![random_output],
+                vec![output],
+            ));
+            graph.outputs.push(output);
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+
+            for graph_kernel in [false, true] {
+                let ep = ClaimingEp(graph_kernel.then_some(random));
+                let baseline = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
+                assert_eq!(baseline.len(), 1);
+                assert_eq!(baseline[0].node_ids, [random, neighbor]);
+
+                let mut saw_random = false;
+                let claims = query_plugin_capabilities(
+                    &view,
+                    &ep,
+                    NATIVE_RANDOM_EXCLUSIONS,
+                    |node, via_graph| {
+                        if view.node(node).id == random {
+                            assert_eq!(via_graph, graph_kernel);
+                            saw_random = true;
+                        }
+                        true
+                    },
+                )
+                .unwrap();
+                assert_eq!(saw_random, !excluded);
+                assert_eq!(claims.len(), 1);
+                if excluded {
+                    assert_eq!(claims[0].node_ids, [neighbor]);
+                } else {
+                    assert_eq!(claims[0].node_ids, [random, neighbor]);
+                }
             }
         }
     }
