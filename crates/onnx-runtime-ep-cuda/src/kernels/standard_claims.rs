@@ -120,6 +120,9 @@ pub(crate) fn unsupported_reason_at_opset(
             )
         }
         "InstanceNormalization" => instance_normalization(node, opset, input_dtypes),
+        "ReduceMax" | "ReduceMin" if input_dtypes.first() == Some(&DataType::Bool) => {
+            super::reduce::require_bool_extrema_opset(opset)
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result

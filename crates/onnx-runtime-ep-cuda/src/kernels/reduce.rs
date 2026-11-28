@@ -41,7 +41,8 @@
 //! present. `keepdims` (default 1) retains reduced dims as size-1.
 //! `noop_with_empty_axes` (default 0) makes an explicitly-empty axis set an
 //! identity (per-element groups) instead of reduce-all. Negative axes wrap.
-//! `Max`/`Min` propagate NaN (numpy semantics), matching the CPU EP.
+//! `Max`/`Min` propagate floating-point NaNs and support byte-backed BOOL
+//! tensors from opset 20.
 //!
 //! ## Limits (actionable errors — RULES.md #1)
 //!
@@ -321,6 +322,42 @@ DEFINE_REDUCE_EXT(float, f32)
 DEFINE_REDUCE_EXT(__half, f16)
 DEFINE_REDUCE_EXT(__nv_bfloat16, bf16)
 
+extern "C" __global__ void reduce_bool(
+    const unsigned char* x,
+    unsigned char* y,
+    const long long* base_off,
+    const long long* delta_off,
+    const int out_count,
+    const int reduce_count,
+    const int op,
+    const unsigned int* capture_error)
+{
+    if (capture_error && *capture_error) return;
+    const int o = blockIdx.x;
+    if (o >= out_count) return;
+
+    // False < True: max is OR and min is AND.
+    const bool is_min = op == 2;
+    bool acc = is_min;
+    const size_t base = (size_t)base_off[o];
+    for (size_t r = threadIdx.x; r < (size_t)reduce_count; r += blockDim.x) {
+        const bool v = x[base + (size_t)delta_off[r]] != 0;
+        acc = is_min ? acc && v : acc || v;
+    }
+    extern __shared__ unsigned char red_bool[];
+    const int tid = threadIdx.x;
+    red_bool[tid] = acc;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+        if (tid < off) {
+            const unsigned char a = red_bool[tid], b = red_bool[tid + off];
+            red_bool[tid] = is_min ? a & b : a | b;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) y[o] = red_bool[0];
+}
+
 extern "C" __global__ void reduce_i64(
     const long long* x,
     long long*       y,
@@ -415,8 +452,20 @@ const REDUCE_LOGSUMEXP_F16_ENTRY: &str = "reduce_logsumexp_f16";
 const REDUCE_LOGSUMEXP_BF16_ENTRY: &str = "reduce_logsumexp_bf16";
 const REDUCE_I64_ENTRY: &str = "reduce_i64";
 const REDUCE_I32_ENTRY: &str = "reduce_i32";
+const REDUCE_BOOL_ENTRY: &str = "reduce_bool";
 const REDUCE_VALIDATE_AXES_ENTRY: &str = "validate_reduce_axes_i64";
 pub const REDUCE_CAPTURE_ERROR_AXES: u32 = 128;
+pub(crate) const BOOL_EXTREMA_OPSET: u64 = 20;
+
+pub(crate) fn require_bool_extrema_opset(opset: u64) -> std::result::Result<(), String> {
+    if opset < BOOL_EXTREMA_OPSET {
+        return Err(format!(
+            "BOOL data requires ONNX opset {BOOL_EXTREMA_OPSET} or newer; \
+             got opset {opset}. Export at opset {BOOL_EXTREMA_OPSET} or newer or use numeric data."
+        ));
+    }
+    Ok(())
+}
 
 /// Threads per block for the reduction (power of two → exact tree reduce).
 const REDUCE_BLOCK: u32 = 256;
@@ -793,6 +842,10 @@ macro_rules! reduce_factory {
                     != 0;
                 Ok(Box::new(ReduceKernel {
                     op: $variant,
+                    opset: node
+                        .version
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(1),
                     axes_attr,
                     keepdims,
                     noop_with_empty_axes,
@@ -822,6 +875,7 @@ reduce_factory!(ReduceLogSumExpFactory, ReduceOp::LogSumExp);
 #[derive(Debug)]
 pub struct ReduceKernel {
     op: ReduceOp,
+    opset: u64,
     axes_attr: Option<Vec<i64>>,
     keepdims: bool,
     noop_with_empty_axes: bool,
@@ -1192,6 +1246,9 @@ impl ReduceKernel {
             )));
         }
         let n = axes.numel();
+        if n == 0 && matches!(axes.dtype, DataType::Int64 | DataType::Int32) {
+            return Ok(Vec::new());
+        }
         let src = cuptr(axes.data_ptr::<u8>() as *const c_void);
         match axes.dtype {
             DataType::Int64 => {
@@ -1225,8 +1282,11 @@ impl ReduceKernel {
         inputs: &[TensorView],
         capturing: bool,
     ) -> Result<Option<Vec<i64>>> {
-        if inputs.len() == 2 && capturing {
-            if inputs[1].dtype != DataType::Int64 {
+        let Some(axes) = inputs.get(1).filter(|axes| !axes.is_absent()) else {
+            return Ok(self.axes_attr.clone());
+        };
+        if capturing {
+            if axes.dtype != DataType::Int64 {
                 return Err(EpError::KernelFailed(
                     "cuda_ep ReduceSum: captured axes input must be Int64".into(),
                 ));
@@ -1252,10 +1312,8 @@ impl ReduceKernel {
                 }
             };
             Ok(Some(axes))
-        } else if inputs.len() == 2 {
-            self.read_axes_input(op, &inputs[1]).map(Some)
         } else {
-            Ok(self.axes_attr.clone())
+            self.read_axes_input(op, axes).map(Some)
         }
     }
 
@@ -1449,7 +1507,7 @@ impl ReduceKernel {
         {
             return Ok(WorkspaceRequirement::NONE);
         }
-        let axes_raw = if inputs.len() == 2 {
+        let axes_raw = if inputs.get(1).is_some_and(|axes| axes.present) {
             self.capture_ready
                 .lock()
                 .map_err(|_| {
@@ -1532,7 +1590,16 @@ impl ReduceKernel {
         }
         let x = &inputs[0];
         let cudnn_op = self.op.cudnn_op();
-        let supported_dtype = if matches!(self.op, ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min)
+        let bool_identity = match (x.dtype, self.op) {
+            (DataType::Bool, ReduceOp::Max) => Some(0),
+            (DataType::Bool, ReduceOp::Min) => Some(1),
+            _ => None,
+        };
+        let supported_dtype = if bool_identity.is_some() {
+            require_bool_extrema_opset(self.opset)
+                .map_err(|reason| not_implemented(format!("{op}: {reason}")))?;
+            true
+        } else if matches!(self.op, ReduceOp::Sum | ReduceOp::Max | ReduceOp::Min)
             && matches!(x.dtype, DataType::Int32 | DataType::Int64)
         {
             true
@@ -1551,8 +1618,9 @@ impl ReduceKernel {
         };
         if !supported_dtype {
             return Err(not_implemented(format!(
-                "{op} with input dtype {:?} (sum/max/min support i32/i64/f32; sum/mean and \
-                 extended reductions support f32/f16/bf16)",
+                "{op} with input dtype {:?} (sum/max/min support i32/i64/f32; max/min also \
+                 support BOOL from opset {BOOL_EXTREMA_OPSET}; sum/mean and extended \
+                 reductions support f32/f16/bf16)",
                 x.dtype
             )));
         }
@@ -1606,6 +1674,22 @@ impl ReduceKernel {
                 )));
             }
             self.publish_capture_unsupported()?;
+            if let Some(identity) = bool_identity.filter(|_| prepared.geometry.out_count != 0) {
+                self.runtime.bind()?;
+                let dst = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+                // SAFETY: BOOL uses one byte per element and output shape,
+                // dtype and contiguous layout were validated above.
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        dst,
+                        identity,
+                        prepared.geometry.out_count,
+                        self.runtime.stream_ptr(),
+                    )
+                }
+                .map_err(|error| driver_err(&format!("fill empty {op} BOOL groups"), error))?;
+                self.runtime.synchronize()?;
+            }
             return Ok(());
         }
 
@@ -1763,13 +1847,13 @@ impl ReduceKernel {
         if let Some(captured) = &captured {
             self.validate_captured_resources(captured, &resources)?;
         }
-        // Only the Int64 DATA reduce reads the axes device buffer, so it alone
-        // validates the captured axes against the warmed metadata. The float/
-        // bf16 block reduce bakes the reduce mask into base/delta and never reads
-        // the axes buffer, and any axes change flips the cache key (rejected by
-        // `prepare` above during capture), so it needs no device validation.
-        if capturing && inputs.len() == 2 && matches!(x.dtype, DataType::Int32 | DataType::Int64) {
-            self.validate_captured_axes(&inputs[1], expected_axes)?;
+        // Integer and BOOL routes check that runtime axes still match the
+        // warmed device offsets before replay consumes them.
+        if capturing
+            && matches!(x.dtype, DataType::Int32 | DataType::Int64 | DataType::Bool)
+            && let Some(axes) = inputs.get(1).filter(|axes| !axes.is_absent())
+        {
+            self.validate_captured_axes(axes, expected_axes)?;
         }
         self.launch(
             x,
@@ -1862,6 +1946,8 @@ impl ReduceKernel {
             REDUCE_I64_ENTRY
         } else if x.dtype == DataType::Int32 {
             REDUCE_I32_ENTRY
+        } else if x.dtype == DataType::Bool {
+            REDUCE_BOOL_ENTRY
         } else if is_logsumexp {
             match x.dtype {
                 DataType::Float32 => REDUCE_LOGSUMEXP_F32_ENTRY,
@@ -1886,10 +1972,9 @@ impl ReduceKernel {
         let func = self
             .runtime
             .nvrtc_function(REDUCE_MODULE, REDUCE_SRC, entry)?;
-        let bytes_per_thread = if matches!(x.dtype, DataType::Int32 | DataType::Int64) {
-            x.dtype.byte_size() as u32
-        } else {
-            std::mem::size_of::<f32>() as u32
+        let bytes_per_thread = match x.dtype {
+            DataType::Int32 | DataType::Int64 | DataType::Bool => x.dtype.byte_size() as u32,
+            _ => std::mem::size_of::<f32>() as u32,
         };
         let cfg =
             self.runtime
@@ -1904,7 +1989,7 @@ impl ReduceKernel {
             .arg(&out_i)
             .arg(&red_i);
         let (pre, combine, post) = ext_tags.unwrap_or((0, 0, 0));
-        if matches!(x.dtype, DataType::Int32 | DataType::Int64) {
+        if matches!(x.dtype, DataType::Int32 | DataType::Int64 | DataType::Bool) {
             builder.arg(&op_tag).arg(&capture_error);
         } else if is_logsumexp {
             // Dedicated two-pass kernel (max, then exp-sum); no pre/combine/post.
@@ -2352,7 +2437,7 @@ mod claim_probes {
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, Kernel, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId};
 
-    use super::{ReduceKernel, ReduceOp, ReductionMetadataCache};
+    use super::{BOOL_EXTREMA_OPSET, ReduceKernel, ReduceOp, ReductionMetadataCache};
     use crate::runtime::CudaRuntime;
 
     fn maybe_runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
@@ -2362,6 +2447,7 @@ mod claim_probes {
     fn kernel(runtime: &Arc<CudaRuntime>, op: ReduceOp) -> ReduceKernel {
         ReduceKernel {
             op,
+            opset: BOOL_EXTREMA_OPSET,
             axes_attr: Some(vec![1]),
             keepdims: false,
             noop_with_empty_axes: false,
