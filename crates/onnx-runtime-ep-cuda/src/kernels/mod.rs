@@ -2035,6 +2035,8 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    // Keep the ORT plugin descriptors unchanged. Native BOOL admission uses
+    // the node's effective opset, independently of the factory's start version.
     reg.register(
         OpKey::new("ReduceMax", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,

@@ -184,8 +184,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `ReduceSum` | `` | ✅ | **cuDNN** `cudnnReduceTensor` (ADD) | Arbitrary axes (attribute or opset-13+ input), `keepdims`, `noop_with_empty_axes`, negative axes; f32/f16/bf16. RAII workspace, no indices. Falls back to the prior NVRTC f32 kernel when cuDNN is unavailable. |
 | `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` (AVG) | Same shape/axis handling and fallback as `ReduceSum`. |
-| `ReduceMax` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating (numpy / CPU-EP semantics). |
-| `ReduceMin` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating. |
+| `ReduceMax` | `` | ✅ | **NVRTC block reduction** (cub-class) | Arbitrary axes and `keepdims`; f32 (NaN-propagating), f16, bf16, i32, and i64. Native CUDA supports BOOL from opset 20; the ORT plugin does not advertise BOOL. BOOL reduces by OR and yields `false` for empty groups. |
+| `ReduceMin` | `` | ✅ | **NVRTC block reduction** (cub-class) | Same dtype and axes support as `ReduceMax`, including native-only BOOL. BOOL reduces by AND and yields `true` for empty groups. |
 | `ReduceProd` | `` | ✅ | **NVRTC block reduction** (f32) | Product over the reduced group; shares the offset-table plumbing (`reduce.rs`). |
 | `ReduceSumSquare` | `` | ✅ | **NVRTC block reduction** (f32) | Sum of squares (`x²`) over the group. |
 | `ReduceL1` | `` | ✅ | **NVRTC block reduction** (f32) | Sum of `abs(x)` over the group. |

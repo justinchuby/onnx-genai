@@ -59,7 +59,9 @@ use common::{
     require_cuda, run_cpu, run_cuda, try_run_cuda,
 };
 use onnx_runtime_ep_api::ExecutionProvider;
-use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
+use onnx_runtime_ep_cuda::{
+    CUDA_COVERED_OPS, CudaExecutionProvider, build_cuda_registry_descriptors,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, static_shape};
 
 #[test]
@@ -1990,8 +1992,232 @@ fn reduction_f32(op: &'static str) -> Vec<Case> {
         .collect()
 }
 
-/// Extended floating-point reductions widen every input dtype to f32 for the
-/// accumulator and post-op, then narrow once to the output dtype.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA with gpu-tests enabled"
+)]
+#[test]
+fn bool_extrema_cuda_version_admission() {
+    let ep = require_cuda();
+    let descriptors = build_cuda_registry_descriptors(ep.registry());
+    let legacy_plugin_dtypes = [
+        DataType::Float32,
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Uint8,
+        DataType::Uint16,
+        DataType::Uint32,
+        DataType::Uint64,
+    ];
+    for (op, numeric_expected, bool_expected) in [
+        ("ReduceMax", [3i64, 5], [1u8, 1]),
+        ("ReduceMin", [1i64, -1], [1u8, 0]),
+    ] {
+        let inputs = [
+            input(DataType::Bool, &[2, 3], &[1u8, 1, 1, 0, 1, 0]),
+            input(DataType::Int64, &[1], &[1i64]),
+        ];
+        let bool_outputs = [(DataType::Bool, vec![2, 1])];
+        let (graph, id) = build_graph(op, "", 19, &inputs, &bool_outputs, &[]);
+        let claim = ep.supports_op(
+            graph.node(id),
+            19,
+            &[],
+            &[DataType::Bool, DataType::Int64],
+            &[],
+        );
+        let reason = claim.reason().expect("CUDA must decline pre-opset-20 BOOL");
+        assert!(
+            reason.contains(op)
+                && reason.contains("BOOL")
+                && reason.contains("19")
+                && reason.contains("20"),
+            "{reason}"
+        );
+        let output = run_cuda(&ep, op, "", 20, &inputs, &bool_outputs, &[]);
+        assert_eq!(output[0], bool_expected, "{op} native BOOL opset 20");
+
+        let mut entries = descriptors
+            .iter()
+            .filter(|desc| desc.op_type == op && desc.domain.is_empty());
+        let entry = entries.next().expect("legacy CUDA plugin entry");
+        assert!(entries.next().is_none(), "{op} ORT range was split");
+        assert_eq!((entry.since_version, entry.end_version), (1, u64::MAX));
+        assert_eq!(entry.supported_dtypes, legacy_plugin_dtypes.as_slice());
+
+        let axes = &inputs[1];
+        let fp16_data = [1., 2., 3., 0., 5., -1.].map(half::f16::from_f32);
+        let fp16_expected = numeric_expected.map(|value| half::f16::from_f32(value as f32));
+        for opset in [19, 20] {
+            let output = run_cuda(
+                &ep,
+                op,
+                "",
+                opset,
+                &[
+                    input(DataType::Int64, &[2, 3], &[1i64, 2, 3, 0, 5, -1]),
+                    axes.clone(),
+                ],
+                &[(DataType::Int64, vec![2, 1])],
+                &[],
+            );
+            assert_eq!(
+                output[0],
+                common::raw(&numeric_expected),
+                "{op} INT64 opset {opset}"
+            );
+            let output = run_cuda(
+                &ep,
+                op,
+                "",
+                opset,
+                &[input(DataType::Float16, &[2, 3], &fp16_data), axes.clone()],
+                &[(DataType::Float16, vec![2, 1])],
+                &[],
+            );
+            assert_eq!(
+                output[0],
+                common::raw(&fp16_expected),
+                "{op} FP16 opset {opset}"
+            );
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA with gpu-tests enabled"
+)]
+#[test]
+fn bool_extrema_cuda_matches_onnx() {
+    let ep = require_cuda();
+    // `run_cuda` requires a CUDA claim and calls the kernel on device buffers
+    // directly; there is no session partitioner or CPU fallback.
+    for (op, pair, nonadjacent, empty_identity) in [
+        ("ReduceMax", [1u8, 1, 1, 0], [1u8, 1, 0], 0u8),
+        ("ReduceMin", [1, 0, 0, 0], [1, 0, 0], 1),
+    ] {
+        // Truth table and empty-group shape from ONNX's pinned extrema fixtures.
+        let data = input(DataType::Bool, &[4, 2], &[1u8, 1, 1, 0, 0, 1, 0, 0]);
+        let empty_axes = input(DataType::Int64, &[0], &[] as &[i64]);
+        let cases = [
+            (
+                "truth table",
+                vec![data.clone(), input(DataType::Int64, &[1], &[1i64])],
+                1,
+                0,
+                vec![4, 1],
+                pair.to_vec(),
+            ),
+            (
+                "negative nonadjacent axes",
+                vec![
+                    input(
+                        DataType::Bool,
+                        &[2, 3, 2],
+                        &[1u8, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0],
+                    ),
+                    input(DataType::Int64, &[2], &[-1i64, 0]),
+                ],
+                0,
+                0,
+                vec![3],
+                nonadjacent.to_vec(),
+            ),
+            (
+                "omitted axes",
+                vec![data.clone()],
+                0,
+                0,
+                vec![],
+                vec![pair[1]],
+            ),
+            (
+                "omitted positional axes noop",
+                vec![data.clone(), absent_input(DataType::Int64)],
+                0,
+                1,
+                vec![4, 2],
+                data.bytes.clone(),
+            ),
+            (
+                "explicit empty axes",
+                vec![data.clone(), empty_axes.clone()],
+                0,
+                0,
+                vec![],
+                vec![pair[1]],
+            ),
+            (
+                "explicit empty axes noop",
+                vec![data.clone(), empty_axes],
+                0,
+                1,
+                vec![4, 2],
+                data.bytes.clone(),
+            ),
+            (
+                "empty groups",
+                vec![
+                    input(DataType::Bool, &[2, 0, 4], &[] as &[u8]),
+                    input(DataType::Int64, &[1], &[1i64]),
+                ],
+                1,
+                0,
+                vec![2, 1, 4],
+                vec![empty_identity; 8],
+            ),
+            (
+                "empty output",
+                vec![
+                    input(DataType::Bool, &[0, 2], &[] as &[u8]),
+                    input(DataType::Int64, &[1], &[1i64]),
+                ],
+                1,
+                0,
+                vec![0, 1],
+                vec![],
+            ),
+        ];
+        for (name, inputs, keepdims, noop, shape, expected) in cases {
+            let output = run_cuda(
+                &ep,
+                op,
+                "",
+                20,
+                &inputs,
+                &[(DataType::Bool, shape)],
+                &[
+                    ("keepdims", Attribute::Int(keepdims)),
+                    ("noop_with_empty_axes", Attribute::Int(noop)),
+                ],
+            );
+            assert_eq!(output[0], expected, "{op}: {name}");
+        }
+        // Exceeds the preferred CUDA block width; the last lane must contribute.
+        let mut wide = vec![empty_identity; 513];
+        wide[512] ^= 1;
+        let output = run_cuda(
+            &ep,
+            op,
+            "",
+            20,
+            &[input(DataType::Bool, &[513], &wide)],
+            &[(DataType::Bool, vec![1])],
+            &[],
+        );
+        assert_eq!(
+            output[0],
+            [empty_identity ^ 1],
+            "{op}: multi-iteration block"
+        );
+    }
+}
+
 fn extended_reduction_float(op: &'static str) -> Vec<Case> {
     let in_shape = vec![2usize, 3, 4];
     let count: usize = in_shape.iter().product();
