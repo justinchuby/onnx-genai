@@ -505,7 +505,7 @@ mod tests {
         let line = [static_shape([1, 2, 3]), static_shape([1, 4, 1])];
         let image = [static_shape([1, 2, 3, 4]), static_shape([1, 4, 5, 2])];
         let volume = [static_shape([1, 2, 3, 4, 5]), static_shape([1, 4, 5, 6, 3])];
-        let reason = |mode: &str, opset, shapes: &[Shape], dtypes| {
+        let reason = |mode: &str, opset, shapes: &[Shape], dtypes: [DataType; 2]| {
             crate::kernels::standard_claims::unsupported_reason_at_opset(
                 &node(mode),
                 opset,

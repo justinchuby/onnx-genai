@@ -1082,7 +1082,7 @@ impl CudaDropNormalizationCasts {
             ("RMSNormalization", "" | "ai.onnx")
                 if node
                     .attr("stash_type")
-                    .map_or(true, |attribute| attribute.as_int() == Some(1)) =>
+                    .is_none_or(|attribute| attribute.as_int() == Some(1)) =>
             {
                 Some(&[0])
             }

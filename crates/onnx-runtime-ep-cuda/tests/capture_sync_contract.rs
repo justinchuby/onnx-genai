@@ -421,6 +421,9 @@ fn reviewed_dynamic_output_syncs() -> [ReviewedDynamicOutputSync; 2] {
 fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
     BTreeSet::from([
         "attention.rs::run_attention_blas_softmax".to_string(),
+        // Det returns step-scoped scratch only after the launch completes, and
+        // its capture_support declaration rejects graph capture accordingly.
+        "det.rs::execute_with_workspace".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
         // MHA declares CaptureSupport::unsupported for the existing cuBLASLt/softmax,

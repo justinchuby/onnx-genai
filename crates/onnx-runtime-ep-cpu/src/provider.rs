@@ -1646,10 +1646,27 @@ mod tests {
     fn get_kernel_dispatches_phase1_ops() {
         let ep = CpuExecutionProvider::new();
         for (i, op) in crate::kernels::PHASE1_OPS.iter().enumerate() {
-            let mut node = Node::new(onnx_runtime_ir::NodeId(i as u32), *op, vec![], vec![]);
+            let random = matches!(
+                *op,
+                "RandomNormal" | "RandomNormalLike" | "RandomUniform" | "RandomUniformLike"
+            );
+            let random_like = matches!(*op, "RandomNormalLike" | "RandomUniformLike");
+            let inputs = if random_like {
+                vec![Some(onnx_runtime_ir::ValueId(0))]
+            } else {
+                Vec::new()
+            };
+            let outputs = if random {
+                vec![onnx_runtime_ir::ValueId(1)]
+            } else {
+                Vec::new()
+            };
+            let mut node = Node::new(onnx_runtime_ir::NodeId(i as u32), *op, inputs, outputs);
             let shapes = if *op == "Einsum" {
                 node.attributes
                     .insert("equation".into(), Attribute::String(b"i->i".to_vec()));
+                vec![vec![2]]
+            } else if random_like {
                 vec![vec![2]]
             } else {
                 Vec::new()
@@ -1661,6 +1678,10 @@ mod tests {
                 }
                 "Pack" | "Unpack" => {
                     node.attributes.insert("bits".into(), Attribute::Int(3));
+                }
+                "RandomNormal" | "RandomUniform" => {
+                    node.attributes
+                        .insert("shape".into(), Attribute::Ints(vec![2]));
                 }
                 _ => {}
             }
