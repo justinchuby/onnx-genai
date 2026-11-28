@@ -865,6 +865,45 @@ pub extern "C" fn nxrt_cuda_reset_dsa_launch_stats() {
 mod tests {
     use std::panic::AssertUnwindSafe;
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+    #[test]
+    fn cuda_factory_advertises_linear_attention_only_through_28() {
+        use onnx_genai_ort_sys as ort;
+        use std::ptr;
+
+        let host = onnx_runtime_ort_testkit::ort_test_process().expect("pinned ORT test host");
+        let get_api_base: libloading::Symbol<'_, unsafe extern "C" fn() -> *const ort::OrtApiBase> =
+            unsafe { host.library().get(b"OrtGetApiBase") }.expect("ORT exports OrtGetApiBase");
+        let mut factory = ptr::null_mut();
+        let mut count = 0;
+        let status = unsafe {
+            super::CreateEpFactories(
+                ptr::null(),
+                get_api_base(),
+                ptr::null(),
+                &mut factory,
+                1,
+                &mut count,
+            )
+        };
+        assert!(status.is_null(), "CUDA factory creation must succeed");
+        assert_eq!(count, 1, "the test requires a real CUDA factory");
+        assert!(!factory.is_null());
+        // The Rust-linked export returns this adapter's ExportedFactory.
+        let entries = unsafe {
+            &(*factory.cast::<onnx_runtime_ep_plugin::factory::ExportedFactory>())
+                .kernel_registry_entries
+        };
+        let ranges: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.domain.is_empty() && entry.op_type == "LinearAttention")
+            .map(|entry| (entry.since_version, entry.end_version))
+            .collect();
+        let status = unsafe { super::ReleaseEpFactory(factory) };
+        assert!(status.is_null());
+        assert_eq!(ranges, [(27, 28)]);
+    }
+
     /// Verify that a panicking constructor is caught at the macro guard boundary.
     #[test]
     fn panicking_constructor_caught_and_zero_factories_returned() {

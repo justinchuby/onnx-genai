@@ -23,6 +23,45 @@
 use onnx_runtime_ep_plugin::compute::ShapeInference;
 use onnx_runtime_ir::{Attribute, Node, NodeId, ValueId};
 
+#[test]
+fn linear_attention_plugin_shape_admission_uses_resolved_schema_revision() {
+    let input_shapes = vec![vec![Some(1), Some(2), Some(4)]; 3];
+    for domain in ["", "ai.onnx"] {
+        let mut node = Node::new(
+            NodeId(0),
+            "LinearAttention",
+            vec![Some(ValueId(0)), Some(ValueId(1)), Some(ValueId(2))],
+            vec![ValueId(3), ValueId(4)],
+        );
+        node.domain = domain.into();
+        node.attributes
+            .insert("q_num_heads".into(), Attribute::Int(1));
+        node.attributes
+            .insert("kv_num_heads".into(), Attribute::Int(1));
+        node.attributes
+            .insert("update_rule".into(), Attribute::String(b"linear".to_vec()));
+
+        for revision in [26, 27, 28, 29, 30] {
+            // ORT's node reader stores the resolved schema revision here,
+            // not the graph's opset import.
+            node.version = Some(revision);
+            let strategy = ShapeInference::for_node(&node, &input_shapes, 2);
+            if matches!(revision, 27 | 28) {
+                assert!(
+                    matches!(strategy, ShapeInference::NativeRegistry { shape_operands, .. }
+                        if shape_operands.is_empty()),
+                    "{domain:?} LinearAttention-{revision} must retain native shape admission",
+                );
+            } else {
+                assert!(
+                    matches!(strategy, ShapeInference::Declined { .. }),
+                    "{domain:?} LinearAttention-{revision} must not enter plugin shape dispatch",
+                );
+            }
+        }
+    }
+}
+
 /// Ops that resolve to `Declined` under the probe below, and therefore reach
 /// ORT's CPU EP rather than ours when they appear in a graph.
 ///

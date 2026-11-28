@@ -1471,6 +1471,13 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
+    if standalone {
+        rec.register(
+            OpKey::new("LinearAttention", "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(linear_attention::LinearAttentionFactory),
+        );
+    }
     // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
     // (the Qwen3.5 `embed_tokens` table is uint8 with `bits = 8`). Shape-driven,
     // dequantizes on the fly to the graph's activation dtype.
@@ -3778,11 +3785,12 @@ mod tests {
         // Opset-28 Cast and standalone Mod each add one registration.
         // MeanVarianceNormalization-29 adds one registration.
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
+        // Opset-29 LinearAttention adds one standalone registration.
         // Standalone QLinearMatMul-21 adds one registration.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 136
+                + 137
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
@@ -3899,8 +3907,7 @@ mod tests {
         for op in ["LinearAttention", "CausalConvWithState"] {
             assert!(!reg.supports(op, "", 26));
             assert!(reg.supports(op, "ai.onnx", 28));
-            assert!(!reg.supports(op, "", 29));
-            assert!(reg.lookup(op, "", 29).is_none());
+            assert_eq!(reg.supports(op, "", 29), op == "LinearAttention");
         }
         assert!(
             reg.lookup("GatherBlockQuantized", "com.microsoft", 1)
@@ -4095,18 +4102,20 @@ mod tests {
             })
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        let expected: std::collections::BTreeSet<_> =
-            [("Mod", "", onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE)]
+        let expected: std::collections::BTreeSet<_> = [
+            ("Mod", "", onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE),
+            ("LinearAttention", "", 29),
+        ]
+        .into_iter()
+        .chain(
+            onnx_runtime_ir::roi_align::VERSIONS
                 .into_iter()
-                .chain(
-                    onnx_runtime_ir::roi_align::VERSIONS
-                        .into_iter()
-                        .map(|version| ("RoiAlign", "", version))
-                        .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
-                        .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)])
-                        .filter(|_| cfg!(feature = "ops-cnn")),
-                )
-                .collect();
+                .map(|version| ("RoiAlign", "", version))
+                .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
+                .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)])
+                .filter(|_| cfg!(feature = "ops-cnn")),
+        )
+        .collect();
         assert_eq!(missing, expected);
         assert_eq!(
             descriptors.len() + missing.len(),

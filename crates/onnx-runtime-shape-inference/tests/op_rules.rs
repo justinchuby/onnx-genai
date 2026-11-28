@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        304,
+        305,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -2557,7 +2557,75 @@ fn opset27_recurrent_outputs_infer_carry_without_past_state() {
     for op in ["LinearAttention", "CausalConvWithState"] {
         assert!(registry.get("", op, 26).is_none());
         assert!(registry.get("", op, 28).is_some());
-        assert!(registry.get("", op, 29).is_none());
+        assert_eq!(registry.get("", op, 29).is_some(), op == "LinearAttention");
+    }
+}
+
+#[test]
+fn linear_attention_29_infers_independent_state_heads_and_trajectory() {
+    let t = |dt, shape: &[i64]| tin(dt, shape.iter().copied().map(c).collect());
+    let f16 = DataType::Float16;
+    let f32 = DataType::Float32;
+    let linear = with_attr(
+        with_attr(
+            with_attr(
+                node("LinearAttention", 6, 3),
+                "q_num_heads",
+                Attribute::Int(2),
+            ),
+            "kv_num_heads",
+            Attribute::Int(2),
+        ),
+        "v_num_heads",
+        Attribute::Int(6),
+    );
+    let inputs = || {
+        vec![
+            t(f16, &[2, 0, 8]),
+            t(f16, &[2, 0, 8]),
+            t(f16, &[2, 0, 30]),
+            t(f32, &[2, 6, 4, 5]),
+            t(f16, &[2, 0, 24]),
+            t(f16, &[2, 0, 1]),
+        ]
+    };
+    let outputs = run(&linear, inputs(), 29);
+    for (i, (dtype, shape)) in [
+        (f16, vec![2, 0, 30]),
+        (f32, vec![2, 6, 4, 5]),
+        (f32, vec![2, 0, 6, 4, 5]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = outputs[i].type_info.as_ref().unwrap();
+        assert_eq!(output.dtype, dtype);
+        assert_eq!(output.shape, shape.into_iter().map(c).collect::<Vec<_>>());
+    }
+    let mut omitted = linear.clone();
+    omitted.outputs[2] = None;
+    assert!(run(&omitted, inputs(), 29)[2].type_info.is_none());
+    assert!(try_run(&linear, inputs(), 28).is_err());
+    for (attr, n) in [("v_num_heads", -1), ("v_num_heads", 5), ("q_num_heads", 4)] {
+        let err = try_run(
+            &with_attr(linear.clone(), attr, Attribute::Int(n)),
+            inputs(),
+            29,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("v_num_heads"), "{err}");
+    }
+    for (slot, shape, label) in [
+        (1, vec![2, 0, 6], "key head dimension"),
+        (2, vec![2, 0, 0], "value packed width"),
+        (3, vec![2, 2, 4, 5], "past_state"),
+        (4, vec![2, 0, 8], "decay last dimension"),
+        (5, vec![2, 0, 2], "beta last dimension"),
+    ] {
+        let mut bad = inputs();
+        bad[slot] = t(f16, &shape);
+        let err = try_run(&linear, bad, 29).unwrap_err();
+        assert!(err.to_string().contains(label), "{err}");
     }
 }
 
@@ -7693,6 +7761,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Less", 1),
     ("", "LessOrEqual", 12),
     ("", "LinearAttention", 27),
+    ("", "LinearAttention", 29),
     ("", "Log", 1),
     ("", "Log1p", 29),
     ("", "LogCumSumExp", 29),

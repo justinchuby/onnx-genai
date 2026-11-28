@@ -1495,6 +1495,19 @@ pub(crate) fn build_cuda_registry_for_contract(
             runtime: runtime.clone(),
         }),
     );
+    // Both operators use the registry profile selected by the CUDA provider constructor.
+    if matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
+    ) {
+        reg.register(
+            OpKey::new("LinearAttention", "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(linear_attention::LinearAttentionFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("QMoE", "com.microsoft", 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,

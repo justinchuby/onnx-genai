@@ -4,10 +4,19 @@ mod common;
 
 #[path = "fixtures/deform_conv.rs"]
 mod deform_conv;
+#[path = "fixtures/linear_attention29.rs"]
+mod linear_attention29;
 #[path = "fixtures/packed_validation_workspace.rs"]
 mod packed_validation_workspace;
 #[path = "fixtures/standard_attention_windows.rs"]
 mod standard_attention_windows;
+
+#[test]
+fn linear_attention_29_cpu_onnx_conformance() {
+    linear_attention29::check_opset29_cases(|inputs, outputs, attrs| {
+        common::run_cpu("LinearAttention", "", 29, inputs, outputs, attrs)
+    });
+}
 
 #[test]
 fn deform_conv_cpu_matches_fixtures() {

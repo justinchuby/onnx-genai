@@ -526,6 +526,136 @@ fn linear_attention_v27(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
     Ok(())
 }
 
+fn linear_attention_v29(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    use onnx_runtime_ir::linear_attention::{Heads, gate_error};
+
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "LinearAttention".into(),
+        detail,
+    };
+    if !(2..=3).contains(&ctx.num_outputs()) || ctx.node.outputs[..2].iter().any(Option::is_none) {
+        return Err(invalid(
+            "output and present_state are required; only states is optional".into(),
+        ));
+    }
+    let mode = ctx
+        .node
+        .attr("update_rule")
+        .and_then(Attribute::as_str)
+        .unwrap_or("gated_delta");
+    if let Some(detail) = gate_error(mode, ctx.has_input(4), ctx.has_input(5)) {
+        return Err(invalid(detail));
+    }
+    let heads = Heads::from_node(ctx.node, Some(29)).map_err(invalid)?;
+    let (hq, hk, hs, ho) = (
+        heads.query as i64,
+        heads.key as i64,
+        heads.state as i64,
+        heads.output as i64,
+    );
+    let shapes = [
+        rank_shape(ctx, 0, 3)?,
+        rank_shape(ctx, 1, 3)?,
+        rank_shape(ctx, 2, 3)?,
+        rank_shape(ctx, 3, 4)?,
+        rank_shape(ctx, 4, 3)?,
+        rank_shape(ctx, 5, 3)?,
+    ];
+    let dim = |i: usize, axis: usize| shapes[i].as_ref().map(|s| s[axis].clone());
+    let merge = |name, dims: [Option<DimExpr>; 3]| {
+        let mut selected: Option<DimExpr> = None;
+        for dim in dims.into_iter().flatten() {
+            if let Some(actual) = dim.as_const() {
+                if let Some(expected) = selected.as_ref().and_then(DimExpr::as_const)
+                    && actual != expected
+                {
+                    return Err(invalid(format!(
+                        "{name} must agree across inputs, got {expected} and {actual}"
+                    )));
+                }
+                selected = Some(dim);
+            } else if selected.is_none() {
+                selected = Some(dim);
+            }
+        }
+        Ok(selected)
+    };
+    let unpack = |i, name, heads| -> Result<Option<DimExpr>, ShapeInferError> {
+        let Some(packed) = dim(i, 2) else {
+            return Ok(None);
+        };
+        if packed.as_const().is_some_and(|d| d <= 0 || d % heads != 0) {
+            return Err(invalid(format!(
+                "{name} packed width {packed:?} must be positive and divisible by {heads} heads"
+            )));
+        }
+        Ok(packed.checked_div(&c(heads)))
+    };
+    let batch = merge("batch", [dim(0, 0), dim(1, 0), dim(2, 0)])?;
+    let batch = merge("batch", [batch, dim(3, 0), dim(4, 0)])?;
+    let batch = merge("batch", [batch, dim(5, 0), None])?.unwrap_or_else(|| ctx.fresh_dim());
+    let seq = merge("sequence length", [dim(0, 1), dim(1, 1), dim(2, 1)])?;
+    let seq =
+        merge("sequence length", [seq, dim(4, 1), dim(5, 1)])?.unwrap_or_else(|| ctx.fresh_dim());
+    let dk = merge(
+        "key head dimension",
+        [unpack(0, "query", hq)?, unpack(1, "key", hk)?, dim(3, 2)],
+    )?
+    .unwrap_or_else(|| ctx.fresh_dim());
+    let dv = merge(
+        "value head dimension",
+        [unpack(2, "value", hs)?, dim(3, 3), None],
+    )?
+    .unwrap_or_else(|| ctx.fresh_dim());
+    if dk.as_const().is_some_and(|v| v <= 0) || dv.as_const().is_some_and(|v| v <= 0) {
+        return Err(invalid(format!(
+            "key and value head dimensions must be positive, got {dk:?} and {dv:?}"
+        )));
+    }
+    if let Some(actual) = dim(3, 1).and_then(|d| d.as_const())
+        && actual != hs
+    {
+        return Err(invalid(format!(
+            "past_state has {actual} heads; expected {hs}"
+        )));
+    }
+    if let Some(width) = dim(4, 2).and_then(|d| d.as_const())
+        && (width <= 0
+            || (width != hs
+                && match dk.as_const() {
+                    Some(dk) => hs.checked_mul(dk) != Some(width),
+                    None => width % hs != 0,
+                }))
+    {
+        return Err(invalid(format!(
+            "decay last dimension {width} must be {hs} or {hs} times the key head dimension {dk:?}"
+        )));
+    }
+    if let Some(width) = dim(5, 2).and_then(|d| d.as_const())
+        && width != hs
+        && width != 1
+    {
+        return Err(invalid(format!(
+            "beta last dimension {width} must be 1 or {hs}"
+        )));
+    }
+    if let Some(dtype) = ctx.input_dtype(0) {
+        let output_width = if hs == ho {
+            dim(2, 2).unwrap_or_else(|| dv.mul(&c(ho)))
+        } else {
+            dv.mul(&c(ho))
+        };
+        ctx.set_output(0, dtype, vec![batch.clone(), seq.clone(), output_width]);
+    }
+    if let Some(dtype) = ctx.input_dtype(if ctx.has_input(3) { 3 } else { 0 }) {
+        ctx.set_output(1, dtype, vec![batch.clone(), c(hs), dk.clone(), dv.clone()]);
+        if ctx.node.outputs.get(2).is_some_and(Option::is_some) {
+            ctx.set_output(2, dtype, vec![batch, seq, c(hs), dk, dv]);
+        }
+    }
+    Ok(())
+}
+
 /// `com.microsoft::RotaryEmbedding`: the rotation is shape-preserving, so the
 /// output mirrors the `X` activation (input 0).
 pub fn rotary_embedding(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -585,6 +715,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     );
     reg.register("com.microsoft", "LinearAttention", 1, linear_attention);
     reg.register_through("", "LinearAttention", 27, 28, linear_attention_v27);
+    reg.register("", "LinearAttention", 29, linear_attention_v29);
     reg.register_through(
         "",
         "CausalConvWithState",
